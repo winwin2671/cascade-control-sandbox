@@ -10,13 +10,28 @@ agent to IA2.
 
 ## Architecture (goal flow)
 
-```
- RL agent ──(Gym API)──▶ aio_bridge_env.py ──(HTTP /api/runtime/*)──▶ IA2
-                                                                 │
-                                                                 ▼
-            mock_cabinet.py ◀──(Modbus TCP 127.0.0.1:5020)── iomap (ThreeTank)
-            (3-tank plant)
-```
+      +-------------------------------------------+
+      |        RL Agent / AIO-Gym (Strategy)      |
+      +-------------------------------------------+
+                            |
+                     (Gymnasium API)
+                            |
+      +-------------------------------------------+
+      |         aio_bridge_env.py (Bridge)        |
+      +-------------------------------------------+
+                            |
+                     (HTTP /api/runtime)
+                            |
+      +-------------------------------------------+
+      |     IA2 Automation Engine (Execution)     |
+      +-------------------------------------------+
+                            |
+               (Modbus TCP 127.0.0.1:5020)
+                            |
+      +-------------------------------------------+
+      |       mock_cabinet.py (Process Plant)     |
+      +-------------------------------------------+
+
 
 This mirrors the project goal diagram node-for-node:
 
@@ -51,24 +66,32 @@ contract is [`ia2_config.json`](ia2_config.json).
 ## Repository layout
 
 ```
-mock_cabinet.py       Phase 3 — pymodbus TCP server, 3-tank physics, :5020
-ia2_config.json       Phase 4 — register ⇄ engineering-variable contract
-aio_bridge_env.py     Phase 5 — Gymnasium env (IA2 HTTP backend + Modbus fallback)
-ia2_project/          Phase 5 — IA2 project (PLC program + device + iomap + tasks)
-  project.toml
-  devices/mock_cabinet.toml   Modbus TCP device, 8 holding-register channels
-  iomap.toml                  variable ⇄ channel bindings (input sensors / output actuators)
-  tasks.toml                  50 ms cyclic task running ThreeTank
-  pous/threetank.st           IEC 61131-3 ST PROGRAM declaring the 8 variables
-ia2/                  Vendored IA2 engine (own repo; built here, source unmodified)
-requirements.txt      Python deps (pymodbus, gymnasium, numpy)
-run_demo.sh           Boot everything + run a random-policy rollout
+cascade-control-sandbox/
+│
+├── mock_cabinet.py        # Phase 3 · pymodbus TCP server — 3-tank physics on :5020
+├── ia2_config.json        # Phase 4 · register ⇄ engineering-variable contract
+├── aio_bridge_env.py      # Phase 5 · Gymnasium env (IA2 HTTP backend + Modbus fallback)
+├── ia2_project/           # Phase 5 · IA2 project (PLC + device + iomap + tasks)
+│   ├── project.toml
+│   ├── devices/
+│   │   └── mock_cabinet.toml   # Modbus TCP device, 8 holding-register channels
+│   ├── iomap.toml              # variable ⇄ channel bindings (sensors in / actuators out)
+│   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
+│   └── pous/
+│       └── threetank.st        # IEC 61131-3 ST PROGRAM declaring the 8 variables
+├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
+├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
+├── run_demo.sh            # Boot everything + run a random-policy rollout
+├── .gitignore
+└── README.md
 ```
 
 ## Setup (WSL2 / Linux)
 
 ```bash
-# 1. build IA2 (one-time; ~10–15 min)
+# 1. clone + build IA2 (one-time; build ~10–15 min). ia2/ is gitignored, so a
+#    fresh checkout of THIS repo won't include it — vendor it explicitly:
+git clone --recursive https://github.com/supcon-international/ia2 ia2
 cd ia2 && cargo build --release && cd ..
 ls ia2/target/release/cs ia2/target/release/server    # verify binaries
 
