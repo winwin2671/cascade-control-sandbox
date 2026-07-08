@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+
+# Vendored upstream repos cloned into the working tree (each keeps its own .git).
+# They're part of the environment, not source we maintain here.
+ia2/
+AIO-Gym/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+*.swp

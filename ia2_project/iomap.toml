@@ -1,0 +1,58 @@
+# Bind PROGRAM ThreeTank variables to mock_cabinet channels.
+# The runtime matches by variable name (lowercase, unqualified);
+# `application` names the POU. direction = input (cabinet -> POU) | output (POU -> cabinet).
+
+# --- sensors: cabinet holding registers -> POU variables ---
+[[mappings]]
+application = "ThreeTank"
+variable = "tank1_level"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank1_level"
+[[mappings]]
+application = "ThreeTank"
+variable = "tank1_temp"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank1_temp"
+[[mappings]]
+application = "ThreeTank"
+variable = "tank2_level"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank2_level"
+[[mappings]]
+application = "ThreeTank"
+variable = "tank2_temp"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank2_temp"
+[[mappings]]
+application = "ThreeTank"
+variable = "tank3_level"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank3_level"
+[[mappings]]
+application = "ThreeTank"
+variable = "tank3_temp"
+direction = "input"
+device = "mock_cabinet"
+channel = "tank3_temp"
+
+# --- actuators: POU variables -> cabinet holding registers ---
+# The RL agent writes these POU variables via the IA2 runtime write API
+# (POST /api/runtime/variables/{name}); the PLC body does NOT assign them,
+# so the agent's value is what the iomap forwards to the cabinet each scan.
+[[mappings]]
+application = "ThreeTank"
+variable = "actuator1"
+direction = "output"
+device = "mock_cabinet"
+channel = "actuator1"
+[[mappings]]
+application = "ThreeTank"
+variable = "actuator2"
+direction = "output"
+device = "mock_cabinet"
+channel = "actuator2"

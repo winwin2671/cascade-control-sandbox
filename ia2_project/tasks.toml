@@ -1,0 +1,10 @@
+# One cyclic task at 50 ms (20 Hz) running the ThreeTank PROGRAM instance.
+[[tasks]]
+name = "io"
+interval_ms = 50
+priority = 1
+
+[[programs]]
+instance = "threetank_inst"
+program = "ThreeTank"
+task = "io"

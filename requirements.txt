@@ -1,0 +1,5 @@
+# Python runtime deps for the cascade-control sandbox.
+# Install (no sudo):  pip3 install --user -r requirements.txt
+pymodbus>=3.13
+gymnasium>=1.0
+numpy>=1.24

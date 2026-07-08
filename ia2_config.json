@@ -1,0 +1,98 @@
+{
+  "$schema": "cascade-control-sandbox/ia2_config/v1",
+  "project": "cascade_control_sandbox",
+  "description": "Register <-> engineering-variable map for the 3-tank decoupled process. This is the single contract shared by mock_cabinet.py (encoder), the IA2 Modbus iomap (ia2_project/), and aio_bridge_env.py (decoder). engineering_value = raw_register * scale.",
+
+  "modbus": {
+    "transport": "tcp",
+    "host": "127.0.0.1",
+    "port": 5020,
+    "unit_id": 1,
+    "timeout_s": 2.0,
+    "byte_order": "big",
+    "word_order": "big"
+  },
+
+  "ia2": {
+    "server_url": "http://127.0.0.1:3001",
+    "health_path": "/api/health",
+    "project_name": "cascade_control_sandbox",
+    "application_pou": "ThreeTank",
+    "device_name": "mock_cabinet"
+  },
+
+  "registers": [
+    {
+      "name": "tank1_level", "plc": 40001, "address": 0, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "read", "group": "tank1",
+      "ia2_variable": "ThreeTank.tank1_level"
+    },
+    {
+      "name": "tank1_temp", "plc": 40002, "address": 1, "table": "holding",
+      "type": "uint16", "units": "degC", "scale": 0.01,
+      "min": 0.0, "max": 100.0, "direction": "read", "group": "tank1",
+      "ia2_variable": "ThreeTank.tank1_temp"
+    },
+    {
+      "name": "tank2_level", "plc": 40003, "address": 2, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "read", "group": "tank2",
+      "ia2_variable": "ThreeTank.tank2_level"
+    },
+    {
+      "name": "tank2_temp", "plc": 40004, "address": 3, "table": "holding",
+      "type": "uint16", "units": "degC", "scale": 0.01,
+      "min": 0.0, "max": 100.0, "direction": "read", "group": "tank2",
+      "ia2_variable": "ThreeTank.tank2_temp"
+    },
+    {
+      "name": "tank3_level", "plc": 40005, "address": 4, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "read", "group": "tank3_decoupled",
+      "ia2_variable": "ThreeTank.tank3_level"
+    },
+    {
+      "name": "tank3_temp", "plc": 40006, "address": 5, "table": "holding",
+      "type": "uint16", "units": "degC", "scale": 0.01,
+      "min": 0.0, "max": 100.0, "direction": "read", "group": "tank3_decoupled",
+      "ia2_variable": "ThreeTank.tank3_temp"
+    },
+    {
+      "name": "actuator1", "plc": 40007, "address": 6, "table": "holding",
+      "type": "uint16", "units": "fraction", "scale": 0.0001,
+      "min": 0.0, "max": 1.0, "direction": "write", "group": "actuators",
+      "physical": "pump1_flow_fraction", "ia2_variable": "ThreeTank.actuator1"
+    },
+    {
+      "name": "actuator2", "plc": 40008, "address": 7, "table": "holding",
+      "type": "uint16", "units": "fraction", "scale": 0.0001,
+      "min": 0.0, "max": 1.0, "direction": "write", "group": "actuators",
+      "physical": "pump2_flow_fraction", "ia2_variable": "ThreeTank.actuator2"
+    }
+  ],
+
+  "sensors": [
+    "tank1_level", "tank1_temp",
+    "tank2_level", "tank2_temp",
+    "tank3_level", "tank3_temp"
+  ],
+  "actuators": ["actuator1", "actuator2"],
+
+  "process": {
+    "q_max_m3s": 0.0002,
+    "h_max_m": 0.60,
+    "t_supply_c": 20.0,
+    "topology": "tank1 --a1--> tank2 --a3--> tank3 ; pump1->tank1, pump2->tank3, tank2->drain"
+  },
+
+  "control": {
+    "setpoints_m": {
+      "tank1_level": 0.45,
+      "tank2_level": 0.30,
+      "tank3_level": 0.40
+    },
+    "objective": "Decoupling control: hold Tank1 and Tank3 levels at their setpoints despite hydraulic coupling through Tank2.",
+    "reward": "-sum((level_i - setpoint_i)^2) - 0.01*sum(action) per step (maximize)"
+  }
+}
