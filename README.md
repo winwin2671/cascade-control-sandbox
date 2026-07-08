@@ -135,3 +135,20 @@ python3 aio_bridge_env.py --backend ia2          # RL rollout
   `/api/runtime/snapshot` and writes `/api/runtime/variables/{name}`; IA2's iomap
   bridges to the cabinet over Modbus TCP; the agent's actions move the levels and
   the reward climbs toward the setpoints.
+
+## Workflow integration & deployment
+
+- **Agent tooling** — the IA2 agent skill is bundled at
+  [`.claude/skills/industrial-automation-skill`](.claude/skills/industrial-automation-skill);
+  load it into Claude Code / Cursor to drive the whole stack — author/compile/run
+  PLC programs, force variables, debug — through `cs` and the HTTP API.
+- **End-to-end testing** — the validated data flow is:
+  `Agent decision → AIO-Gym (Gymnasium) call → IA2 runtime → Modbus TCP →
+  simulated tank response` (see *Architecture* and *Verification* above).
+- **Deployment readiness (sim → hardware)** — the simulation is *hardware-ready*.
+  IA2 fronts the plant through the device config rather than in code, so moving
+  from the local simulator to a physical PLC is a configuration change: repoint
+  `ia2_project/devices/mock_cabinet.toml` at the PLC's IP **and** align its
+  register addresses/scales to the real I/O map (e.g. the LT101/201, TT101/201
+  sensors and valve/pump/SSR actuators). The PLC program, iomap, and
+  `aio_bridge_env.py` then run unchanged against real hardware.
