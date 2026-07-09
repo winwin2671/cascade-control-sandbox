@@ -4,24 +4,25 @@ cascade plant via IA2 (and falls back to direct Modbus).
 
 Architecture (matches the project goal flow):
 
-    RL agent  --(Gym API)-->  CascadeBridgeEnv  --(HTTP /api/runtime/...)-->  IA2
+    RL agent  --(Gym API)-->  CascadeBridgeEnv  --(HTTP /api/...)-->  IA2
         IA2  --(iomap)-->  Modbus TCP 127.0.0.1:5020  -->  mock_cabinet.py (plant)
 
 This is the cascade-control-sandbox counterpart of AIO-Gym's
 ``aiogym/env.py`` (AIOGymNativeEnv): same Gymnasium contract — Box
 observation (3 levels + 3 temperatures, engineering units) and Box action
-(two pump fractions in [0, 1]) — but the plant is the *external* IA2 +
+(pump fractions in [0, 1]) — but the plant is the *external* IA2 +
 mock_cabinet instead of an in-process numpy model.
 
-Two interchangeable backends (selected via ``backend=`` / ``--backend``):
-  * ``ia2``    — reads observations from ``GET /api/runtime/snapshot`` and
-                 writes actions with ``POST /api/runtime/variables/{name}``
-                 (the "data endpoints" the plan calls for).  Requires IA2 to
-                 be running with the ``ia2_project/`` project loaded and the
-                 PROGRAM started (``cs run``).  This is the real bridge.
-  * ``modbus`` — talks straight to mock_cabinet.py (pymodbus).  Used for
-                 standalone testing without IA2 in the loop.
-  * ``auto``   — use ``ia2`` when its /api/health answers, else ``modbus``.
+Backends (selected via ``backend=`` / ``--backend``):
+  * ``ia2``          — dev server: GET /api/runtime/snapshot (obs) +
+                       POST /api/runtime/variables/{name} (actions).
+  * ``edge[:name]``  — edge runtime (G4): GET /api/edges/{name}/status
+                       (obs via .last_snapshot.vars) + POST
+                       /api/edges/{name}/runtime/write body {name,value}
+                       (the edge's body-addressed write, proxied by the dev
+                       server over SSH).  Needs a registered, deployed edge.
+  * ``modbus``       — talks straight to mock_cabinet.py (no IA2 in the loop).
+  * ``auto``         — ``ia2`` when /api/health answers, else ``modbus``.
 
 All register names, addresses, scales, and setpoints come from
 ia2_config.json — the single contract shared with mock_cabinet.py and the
@@ -79,6 +80,31 @@ def _http_json(method: str, url: str, body=None, headers: dict | None = None,
         raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {detail}") from None
 
 
+def _suffix(name: str) -> str:
+    """Lowercased unqualified variable name (handles POU/instance qualifiers)."""
+    low = name.lower()
+    return low.rsplit(".", 1)[-1] if "." in low else low
+
+
+def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict[str, int]:
+    """Shared ``VarSnapshot.vars`` parser used by the IA2 and edge backends.
+
+    Returns ``{suffix: int value}`` and fills ``full_names`` (suffix -> the
+    exact name the runtime reported) so writes address what IA2 expects.
+    Values are strings in the snapshot ("3370") -> int here.
+    """
+    out: dict[str, int] = {}
+    for v in vars_list:
+        full = v["name"]
+        suf = _suffix(full)
+        full_names[suf] = full
+        try:
+            out[suf] = int(str(v["value"]).strip())
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Backends
 # --------------------------------------------------------------------------- #
@@ -122,16 +148,8 @@ class ModbusBackend(Backend):
         self.client.close()
 
 
-class IA2Backend(Backend):
-    """IA2 HTTP data-endpoint backend.
-
-    Observations: GET /api/runtime/snapshot  -> VarSnapshot
-        {timestamp_us, scan_count, vars: [{name, type_name, value(str)}]}
-    Actions: POST /api/runtime/variables/{name}  body {"value": <i32>}
-        (a between-scan variable write; the iomap forwards it to the cabinet).
-    Variable-name format from IA2 is learned from the snapshot itself so we
-    write back with whatever qualified name IA2 uses.
-    """
+class _IA2HttpBase(Backend):
+    """Shared HTTP plumbing for the IA2 dev-server and edge backends."""
 
     def __init__(self, server_url: str, project: str | None):
         self.base = server_url.rstrip("/")
@@ -144,7 +162,31 @@ class IA2Backend(Backend):
     def _hdr(self) -> dict:
         return {"X-IA2-Project": self.project} if self.project else {}
 
-    def _snapshot_vars(self) -> list[dict]:
+    def write_actuator(self, name: str, value: int) -> None:
+        full = self._full_names.get(name, name)
+        self._post_write(full, int(value))
+
+    def close(self) -> None:
+        pass
+
+    # subclasses supply the variable-source + write-route specifics:
+    def _vars(self) -> list[dict]: ...
+    def _post_write(self, full_name: str, value: int) -> None: ...
+
+    def read_raw(self) -> dict[str, int]:
+        return _parse_vars(self._vars(), self._full_names)
+
+
+class IA2Backend(_IA2HttpBase):
+    """Dev-server backend.
+
+    Observations: GET /api/runtime/snapshot  -> VarSnapshot
+        {timestamp_us, scan_count, vars: [{name, type_name, value(str)}]}
+    Actions: POST /api/runtime/variables/{name}  body {"value": <i32>}
+        (a between-scan variable write; the iomap forwards it to the cabinet).
+    """
+
+    def _vars(self) -> list[dict]:
         snap = _http_json("GET", f"{self.base}/api/runtime/snapshot",
                           headers=self._hdr(), timeout=2.0)
         if not snap or not snap.get("vars"):
@@ -154,31 +196,50 @@ class IA2Backend(Backend):
             )
         return snap["vars"]
 
-    @staticmethod
-    def _suffix(name: str) -> str:
-        low = name.lower()
-        return low.rsplit(".", 1)[-1] if "." in low else low
-
-    def read_raw(self) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for v in self._snapshot_vars():
-            full = v["name"]
-            self._full_names[self._suffix(full)] = full
-            try:
-                out[self._suffix(full)] = int(str(v["value"]).strip())
-            except ValueError:
-                continue
-        return out
-
-    def write_actuator(self, name: str, value: int) -> None:
-        full = self._full_names.get(name, name)
+    def _post_write(self, full_name: str, value: int) -> None:
         url = (f"{self.base}/api/runtime/variables/"
-               f"{urllib.parse.quote(full, safe='')}")
-        _http_json("POST", url, body={"value": int(value)},
+               f"{urllib.parse.quote(full_name, safe='')}")
+        _http_json("POST", url, body={"value": value},
                    headers=self._hdr(), timeout=2.0)
 
-    def close(self) -> None:
-        pass
+
+class EdgeBackend(_IA2HttpBase):
+    """Edge-runtime backend via the dev server's SSH proxy (addresses G4).
+
+    For deployments where the project runs on a remote edge (``ia2-runtime``)
+    rather than the local dev server. The edge runtime exposes a
+    body-addressed write route (vs the dev server's path-addressed one); the
+    dev server proxies it over SSH.
+
+    Observations: GET /api/edges/{name}/status -> .last_snapshot.vars
+                  (same VarSnapshot.vars shape as the dev server's snapshot).
+    Actions:      POST /api/edges/{name}/runtime/write body {"name", "value"}
+                  (the edge's body-addressed write).
+
+    Cannot be exercised without a registered, deployed edge (``cs edge`` +
+    ``cs deploy``); the route shapes above are verified against the IA2
+    source (crates/server/src/edges.rs, crates/runtime/src/main.rs).
+    """
+
+    def __init__(self, server_url: str, project: str | None, edge_name: str):
+        super().__init__(server_url, project)
+        self.edge = edge_name
+
+    def _vars(self) -> list[dict]:
+        status = _http_json("GET", f"{self.base}/api/edges/{self.edge}/status",
+                            headers=self._hdr(), timeout=4.0)
+        snap = (status or {}).get("last_snapshot")
+        if not snap or not snap.get("vars"):
+            raise RuntimeError(
+                f"edge '{self.edge}' /status has no last_snapshot — is the project "
+                f"deployed and running on the edge? (cs edge create / cs deploy)"
+            )
+        return snap["vars"]
+
+    def _post_write(self, full_name: str, value: int) -> None:
+        _http_json("POST", f"{self.base}/api/edges/{self.edge}/runtime/write",
+                   body={"name": full_name, "value": value},
+                   headers=self._hdr(), timeout=4.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +271,6 @@ class CascadeBridgeEnv(gym.Env):
         self.scales = {r["name"]: float(r["scale"]) for r in regs}
         self.setpoints = {k: float(v) for k, v in
                           self.config["control"]["setpoints_m"].items()}
-        self._actuator_max_raw = 10000  # ACT_MAX in mock_cabinet.py
 
         self.backend: Backend = self._make_backend(backend)
 
@@ -225,6 +285,18 @@ class CascadeBridgeEnv(gym.Env):
 
     # ---- backend selection ----
     def _make_backend(self, kind: str) -> Backend:
+        # "edge" or "edge:<name>" -> edge-runtime backend via dev-server proxy.
+        if kind.startswith("edge"):
+            ia2 = self.config["ia2"]
+            edge_name = kind.split(":", 1)[1] if ":" in kind else ia2.get("edge_name")
+            if not edge_name:
+                raise RuntimeError(
+                    "--backend edge requires a name: use 'edge:<name>' or set "
+                    "ia2.edge_name in ia2_config.json"
+                )
+            be = EdgeBackend(ia2["server_url"], ia2.get("project_name"), edge_name)
+            LOG.info("backend = Edge (%s, edge=%s)", ia2["server_url"], edge_name)
+            return be
         if kind in ("ia2", "auto"):
             try:
                 ia2 = self.config["ia2"]
@@ -257,8 +329,9 @@ class CascadeBridgeEnv(gym.Env):
         a = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
         out = {}
         for i, name in enumerate(self.actuator_names):
+            mx = round(1.0 / self.scales[name])  # raw full-scale (= ACT_MAX)
             raw = int(round(a[i] / self.scales[name]))
-            out[name] = max(0, min(raw, self._actuator_max_raw))
+            out[name] = max(0, min(raw, mx))
         return out
 
     def _reward(self, action, obs) -> tuple[float, dict]:
@@ -320,7 +393,8 @@ def _demo(backend: str, steps: int, control_dt: float):
 
 def main():
     ap = argparse.ArgumentParser(description="AIO bridge Gym env (3-tank cascade).")
-    ap.add_argument("--backend", choices=("auto", "ia2", "modbus"), default="auto")
+    ap.add_argument("--backend", default="auto",
+                    help="auto | ia2 | modbus | edge | edge:<name> (default: auto)")
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--control-dt", type=float, default=0.5)
     ap.add_argument("-v", "--verbose", action="store_true")

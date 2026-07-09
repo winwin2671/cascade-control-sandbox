@@ -68,17 +68,19 @@ contract is [`ia2_config.json`](ia2_config.json).
 ```
 cascade-control-sandbox/
 │
-├── mock_cabinet.py        # Phase 3 · pymodbus TCP server — 3-tank physics on :5020
-├── ia2_config.json        # Phase 4 · register ⇄ engineering-variable contract
-├── aio_bridge_env.py      # Phase 5 · Gymnasium env (IA2 HTTP backend + Modbus fallback)
+├── ia2_config.json        # the single contract — register map, scales, setpoints
+├── mock_cabinet.py        # Phase 3 · pymodbus TCP plant on :5020 (reads the contract)
+├── aio_bridge_env.py      # Phase 5 · Gymnasium env (ia2 / edge / modbus backends)
+├── tools/
+│   └── gen_ia2_artifacts.py   # contract -> ia2_project device/iomap TOMLs (+ ST VAR check)
 ├── ia2_project/           # Phase 5 · IA2 project (PLC + device + iomap + tasks)
 │   ├── project.toml
 │   ├── devices/
-│   │   └── mock_cabinet.toml   # Modbus TCP device, 8 holding-register channels
-│   ├── iomap.toml              # variable ⇄ channel bindings (sensors in / actuators out)
+│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 8 channels
+│   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
 │   └── pous/
-│       └── threetank.st        # IEC 61131-3 ST PROGRAM declaring the 8 variables
+│       └── threetank.st        # IEC 61131-3 ST PROGRAM (hand-written; names checked by codegen)
 ├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
 ├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
 ├── run_demo.sh            # Boot everything + run a random-policy rollout
@@ -97,6 +99,11 @@ ls ia2/target/release/cs ia2/target/release/server    # verify binaries
 
 # 2. Python deps (no sudo needed)
 pip3 install --user -r requirements.txt
+
+# 3. The IA2 device/iomap TOMLs are generated from ia2_config.json. Regenerate
+#    after any contract edit (also used as a CI drift check):
+python3 tools/gen_ia2_artifacts.py          # regenerate
+python3 tools/gen_ia2_artifacts.py --check  # exit 1 if committed TOMLs are stale
 ```
 
 ## Run
@@ -107,6 +114,9 @@ pip3 install --user -r requirements.txt
 
 # Direct Modbus backend (skip IA2; for quick standalone tests)
 ./run_demo.sh modbus
+
+# Edge backend (project deployed on a remote edge runtime — G4 route shape):
+python3 aio_bridge_env.py --backend edge:<edge_name>   # needs a registered, deployed edge (cs edge / cs deploy)
 ```
 
 Manually, the pieces are:
@@ -135,6 +145,15 @@ python3 aio_bridge_env.py --backend ia2          # RL rollout
   `/api/runtime/snapshot` and writes `/api/runtime/variables/{name}`; IA2's iomap
   bridges to the cabinet over Modbus TCP; the agent's actions move the levels and
   the reward climbs toward the setpoints.
+- **Contract codegen (review item 5)** — `tools/gen_ia2_artifacts.py` regenerates
+  the IA2 device/iomap TOMLs from `ia2_config.json` (`--check` is drift-clean), and
+  `mock_cabinet.py` is config-driven too — so the register map is single-sourced
+  across the cabinet, the iomap, the ST, and the env.
+- **Edge backend (review item 4 / G4)** — `--backend edge:<name>` targets an
+  edge-deployed project via the dev-server proxy (`GET /api/edges/{name}/status`,
+  `POST /api/edges/{name}/runtime/write` body `{name,value}`). Route shapes
+  verified against the IA2 source and confirmed by a route-hit; live end-to-end
+  validation is pending a real edge deployment.
 
 ## Workflow integration & deployment
 
