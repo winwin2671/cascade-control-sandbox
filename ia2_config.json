@@ -69,6 +69,30 @@
       "type": "uint16", "units": "fraction", "scale": 0.0001,
       "min": 0.0, "max": 1.0, "direction": "write", "group": "actuators",
       "physical": "pump2_flow_fraction", "ia2_variable": "ThreeTank.actuator2"
+    },
+    {
+      "name": "reset_cmd", "plc": 40009, "address": 8, "table": "holding",
+      "type": "uint16", "units": "nonce", "scale": 1.0,
+      "min": 0.0, "max": 65535.0, "direction": "write", "group": "reset",
+      "ia2_variable": "ThreeTank.reset_cmd"
+    },
+    {
+      "name": "init_h1", "plc": 40010, "address": 9, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "write", "group": "reset",
+      "ia2_variable": "ThreeTank.init_h1"
+    },
+    {
+      "name": "init_h2", "plc": 40011, "address": 10, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "write", "group": "reset",
+      "ia2_variable": "ThreeTank.init_h2"
+    },
+    {
+      "name": "init_h3", "plc": 40012, "address": 11, "table": "holding",
+      "type": "uint16", "units": "m", "scale": 0.0001,
+      "min": 0.0, "max": 0.60, "direction": "write", "group": "reset",
+      "ia2_variable": "ThreeTank.init_h3"
     }
   ],
 
@@ -78,6 +102,13 @@
     "tank3_level", "tank3_temp"
   ],
   "actuators": ["actuator1", "actuator2"],
+
+  "reset": {
+    "command_register": "reset_cmd",
+    "init_levels": ["init_h1", "init_h2", "init_h3"],
+    "init_level_range_m": [0.10, 0.50],
+    "mechanism": "value-change: env writes a fresh nonzero nonce to reset_cmd each reset; cabinet snaps state to init_h* on any change and HOLDS while reset_cmd != 0; writing 0 resumes stepping"
+  },
 
   "process": {
     "q_max_m3s": 0.0002,

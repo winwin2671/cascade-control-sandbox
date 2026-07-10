@@ -24,6 +24,13 @@ PROGRAM ThreeTank
     (* actuators (iomap output; driven externally by the RL agent) *)
     actuator1 : UINT;
     actuator2 : UINT;
+    (* episode reset (iomap output; driven by the env between episodes).
+       reset_cmd is a rising-edge pulse; init_h1/2/3 the requested initial
+       levels. The PLC body does NOT assign these. *)
+    reset_cmd : UINT;
+    init_h1 : UINT;
+    init_h2 : UINT;
+    init_h3 : UINT;
     (* heartbeat *)
     scan_count : UDINT;
   END_VAR

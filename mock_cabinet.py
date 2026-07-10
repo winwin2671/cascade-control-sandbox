@@ -68,6 +68,12 @@ TEMP_ATTR = {"tank1_temp": "T1", "tank2_temp": "T2", "tank3_temp": "T3"}
 # Actuator-name -> pump index (order of the q tuple passed to step()).
 ACTUATOR_Q = {"actuator1": 0, "actuator2": 1}
 
+# Episode reset (driven by the env between episodes via reset_cmd + init_h*).
+RESET_CMD = "reset_cmd"
+INIT_LEVEL_ATTR = {"init_h1": "h1", "init_h2": "h2", "init_h3": "h3"}
+LEVEL_DEFAULTS = {"h1": 0.30, "h2": 0.18, "h3": 0.24}  # when an init_h* register is 0
+RESET_TEMP_C = 24.0  # warm-start temperature after a reset
+
 LOG = logging.getLogger("mock_cabinet")
 
 
@@ -201,6 +207,21 @@ def sensor_registers(proc: TankProcess, layout: Layout, params: PhysicsParams) -
     return [encode_sensor(s, proc, layout.scale[s], params.h_max) for s in layout.sensors]
 
 
+def apply_reset(proc: TankProcess, regval: dict, layout: Layout, params: PhysicsParams) -> None:
+    """Snap the process to the requested initial state (episode reset).
+
+    Levels come from the init_h* registers (raw -> m via the contract scale); a
+    zero/missing init register falls back to the default. Temps return to a warm
+    start. Triggered by the rising edge of reset_cmd in physics_loop.
+    """
+    for reg, attr in INIT_LEVEL_ATTR.items():
+        raw = regval.get(reg, 0)
+        val = (raw * layout.scale[reg]) if raw and reg in layout.scale else LEVEL_DEFAULTS[attr]
+        setattr(proc, attr, max(0.0, min(val, params.h_max)))
+    for attr in ("T1", "T2", "T3"):
+        setattr(proc, attr, RESET_TEMP_C)
+
+
 def build_server(host: str, port: int, unit_id: int, proc: TankProcess,
                  layout: Layout, params: PhysicsParams) -> ModbusTcpServer:
     """Create the pymodbus TCP server; initial regs = encoded state + actuators off."""
@@ -226,20 +247,33 @@ async def physics_loop(
     """
     sensor_base = min(layout.addr[s] for s in layout.sensors)
     tick = 0
+    prev_reset_val = 0
     while True:
         all_vals = await server.async_getValues(unit_id, 3, layout.base, layout.n)
         regval = {name: int(v) for name, v in zip(layout.names, all_vals)}
-        cmd1 = regval.get("actuator1", 0)
-        cmd2 = regval.get("actuator2", 0)
 
-        proc.step(cmd1, cmd2, dt, params)
+        # Episode reset: a CHANGE to a new nonzero reset_cmd value snaps state
+        # to init_h*; while reset_cmd stays nonzero the plant HOLDS that state
+        # (no step) so the env can read clean init levels; writing 0 resumes
+        # stepping. Value-change (not boolean edge) so back-to-back resets with
+        # only a brief 0 between them still trigger — the env writes a fresh
+        # nonce each reset.
+        reset_val = int(regval.get(RESET_CMD, 0))
+        if reset_val != 0 and reset_val != prev_reset_val:
+            apply_reset(proc, regval, layout, params)
+            LOG.info("reset applied -> %s", proc.snapshot())
+        if reset_val == 0:
+            proc.step(regval.get("actuator1", 0), regval.get("actuator2", 0), dt, params)
+        prev_reset_val = reset_val
+
         await server.async_setValues(
             unit_id, 16, sensor_base, sensor_registers(proc, layout, params)
         )
 
         tick += 1
         if log_every and tick % log_every == 0:
-            LOG.info("act=[%5d %5d]  %s", cmd1, cmd2, proc.snapshot())
+            LOG.info("act=[%5d %5d]  %s", regval.get("actuator1", 0),
+                     regval.get("actuator2", 0), proc.snapshot())
         await asyncio.sleep(dt)
 
 

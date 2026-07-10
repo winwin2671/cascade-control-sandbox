@@ -59,7 +59,16 @@ through the middle Tank 2 → the *decoupling* control problem). Holding registe
 | 40006 | 5 | Tank 3 (Decoupled) Temperature | °C | ×1e-2 |
 | 40007 | 6 | Actuator 1 (pump 1 drive) | frac 0–1 | ×1e-4 |
 | 40008 | 7 | Actuator 2 (pump 2 drive) | frac 0–1 | ×1e-4 |
+| 40009 | 8 | Reset command (nonce) | — | ×1 |
+| 40010 | 9 | Init level — Tank 1 | m | ×1e-4 |
+| 40011 | 10 | Init level — Tank 2 | m | ×1e-4 |
+| 40012 | 11 | Init level — Tank 3 | m | ×1e-4 |
 
+Sensors (40001–40006) are read by IA2 from the cabinet; actuators (40007–40008)
+are written by the agent each step. The reset block (40009–40012) is written by
+the env between episodes: a fresh nonzero value in `reset_cmd` snaps the plant to
+the `init_h*` levels (sampled per episode) and holds them until `reset_cmd`
+returns to 0 — giving RL training a controllable initial-state distribution.
 Engineering value = raw register × scale. The single source of truth for this
 contract is [`ia2_config.json`](ia2_config.json).
 
@@ -76,7 +85,7 @@ cascade-control-sandbox/
 ├── ia2_project/           # Phase 5 · IA2 project (PLC + device + iomap + tasks)
 │   ├── project.toml
 │   ├── devices/
-│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 8 channels
+│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 12 channels
 │   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
 │   └── pous/
@@ -154,6 +163,11 @@ python3 aio_bridge_env.py --backend ia2          # RL rollout
   `POST /api/edges/{name}/runtime/write` body `{name,value}`). Route shapes
   verified against the IA2 source and confirmed by a route-hit; live end-to-end
   validation is pending a real edge deployment.
+- **Episode reset (review item 1 / G1)** — `reset_cmd` (40009) + `init_h1/2/3`
+  (40010–40012) give the env a controllable initial-state distribution: `reset()`
+  samples levels, writes them, and pulses a nonce on `reset_cmd`; the cabinet
+  snaps to the init levels and holds. Verified end-to-end through IA2 (3 episodes,
+  randomized init levels applied exactly) and via direct Modbus.
 
 ## Workflow integration & deployment
 

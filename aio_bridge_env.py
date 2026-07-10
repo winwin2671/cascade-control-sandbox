@@ -109,11 +109,11 @@ def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict[str, 
 # Backends
 # --------------------------------------------------------------------------- #
 class Backend:
-    """Read all registers (raw uint16, keyed by register name) and write one
-    actuator register (by register name)."""
+    """Read all registers (raw uint16, keyed by register name) and write any
+    register/variable (actuators, reset_cmd, init_h*) by name."""
 
     def read_raw(self) -> dict[str, int]: ...
-    def write_actuator(self, name: str, value: int) -> None: ...
+    def write_register(self, name: str, value: int) -> None: ...
     def close(self) -> None: ...
 
 
@@ -137,7 +137,7 @@ class ModbusBackend(Backend):
             raise RuntimeError(f"Modbus read error: {r}")
         return {n: int(v) for n, v in zip(self.addr_names, r.registers)}
 
-    def write_actuator(self, name: str, value: int) -> None:
+    def write_register(self, name: str, value: int) -> None:
         idx = self.addr_names.index(name)
         r = self.client.write_registers(self.addr_base + idx, [int(value)],
                                         device_id=self.unit)
@@ -162,7 +162,7 @@ class _IA2HttpBase(Backend):
     def _hdr(self) -> dict:
         return {"X-IA2-Project": self.project} if self.project else {}
 
-    def write_actuator(self, name: str, value: int) -> None:
+    def write_register(self, name: str, value: int) -> None:
         full = self._full_names.get(name, name)
         self._post_write(full, int(value))
 
@@ -271,6 +271,7 @@ class CascadeBridgeEnv(gym.Env):
         self.scales = {r["name"]: float(r["scale"]) for r in regs}
         self.setpoints = {k: float(v) for k, v in
                           self.config["control"]["setpoints_m"].items()}
+        self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
 
@@ -349,16 +350,42 @@ class CascadeBridgeEnv(gym.Env):
 
     # ---- Gym API ----
     def reset(self, *, seed=None, options=None):
+        """Reset the plant to a sampled initial state (RL init-state distribution).
+
+        Writes sampled initial levels to the init_h* registers, then pulses
+        reset_cmd (rising edge). The cabinet snaps to init_h* and HOLDS while
+        reset_cmd is asserted, so the obs read here are exactly the init levels.
+        Releasing reset_cmd (-> 0) lets the cabinet resume stepping for step().
+        """
         super().reset(seed=seed)
-        for name in self.actuator_names:
-            self.backend.write_actuator(name, 0)
+        for name in self.actuator_names:                 # neutral actuators first
+            self.backend.write_register(name, 0)
+        info: dict = {}
+        rcfg = self.config.get("reset")
+        if rcfg:
+            lo, hi = rcfg.get("init_level_range_m", [0.10, 0.50])
+            init_levels: dict[str, float] = {}
+            for name in rcfg.get("init_levels", []):
+                level = float(self.np_random.uniform(lo, hi))
+                mx = round(1.0 / self.scales[name])
+                init_levels[name] = level
+                self.backend.write_register(
+                    name, max(0, min(int(round(level / self.scales[name])), mx)))
+            info["init_levels_m"] = init_levels
+            cmd = rcfg.get("command_register")
+            if cmd:
+                self._reset_nonce = (self._reset_nonce + 1) % 65536
+                self.backend.write_register(cmd, self._reset_nonce)  # fresh nonce -> snap + hold
+                time.sleep(self.control_dt)
+                obs = self._decode_obs(self.backend.read_raw())
+                self.backend.write_register(cmd, 0)                   # release -> resume
+                return obs, info
         time.sleep(self.control_dt)
-        obs = self._decode_obs(self.backend.read_raw())
-        return obs, {"note": "actuators zeroed; plant state continues (no hardware reset)"}
+        return self._decode_obs(self.backend.read_raw()), info
 
     def step(self, action):
         for name, value in self._action_to_raw(action).items():
-            self.backend.write_actuator(name, value)
+            self.backend.write_register(name, value)
         time.sleep(self.control_dt)
         obs = self._decode_obs(self.backend.read_raw())
         reward, info = self._reward(action, obs)
