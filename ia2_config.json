@@ -93,6 +93,24 @@
       "type": "uint16", "units": "m", "scale": 0.0001,
       "min": 0.0, "max": 0.60, "direction": "write", "group": "reset",
       "ia2_variable": "ThreeTank.init_h3"
+    },
+    {
+      "name": "heater1", "plc": 40013, "address": 12, "table": "holding",
+      "type": "uint16", "units": "fraction", "scale": 0.0001,
+      "min": 0.0, "max": 1.0, "direction": "write", "group": "heaters",
+      "physical": "heater1_ssr_duty", "ia2_variable": "ThreeTank.heater1"
+    },
+    {
+      "name": "heater2", "plc": 40014, "address": 13, "table": "holding",
+      "type": "uint16", "units": "fraction", "scale": 0.0001,
+      "min": 0.0, "max": 1.0, "direction": "write", "group": "heaters",
+      "physical": "heater2_ssr_duty", "ia2_variable": "ThreeTank.heater2"
+    },
+    {
+      "name": "heater3", "plc": 40015, "address": 14, "table": "holding",
+      "type": "uint16", "units": "fraction", "scale": 0.0001,
+      "min": 0.0, "max": 1.0, "direction": "write", "group": "heaters",
+      "physical": "heater3_ssr_duty", "ia2_variable": "ThreeTank.heater3"
     }
   ],
 
@@ -101,7 +119,7 @@
     "tank2_level", "tank2_temp",
     "tank3_level", "tank3_temp"
   ],
-  "actuators": ["actuator1", "actuator2"],
+  "actuators": ["actuator1", "actuator2", "heater1", "heater2", "heater3"],
 
   "reset": {
     "command_register": "reset_cmd",
@@ -114,7 +132,13 @@
     "q_max_m3s": 0.0002,
     "h_max_m": 0.60,
     "t_supply_c": 20.0,
-    "topology": "tank1 --a1--> tank2 --a3--> tank3 ; pump1->tank1, pump2->tank3, tank2->drain"
+    "topology": "tank1 --a1--> tank2 --a3--> tank3 ; pump1->tank1, pump2->tank3, tank2->drain",
+    "cp_j_per_kgk": 4180.0,
+    "rho_kg_per_m3": 1000.0,
+    "q_heat_max_w": 25000.0,
+    "ua_w_per_k": 8.0,
+    "t_ambient_c": 20.0,
+    "_heater_note": "Q_heat_max is tuned for a controllable problem, not physically scaled: the tank turnover (q/V) is fast, so the heater must be large to hold temp against the cold supply inflow."
   },
 
   "control": {
@@ -123,7 +147,13 @@
       "tank2_level": 0.30,
       "tank3_level": 0.40
     },
-    "objective": "Decoupling control: hold Tank1 and Tank3 levels at their setpoints despite hydraulic coupling through Tank2.",
-    "reward": "-sum((level_i - setpoint_i)^2) - 0.01*sum(action) per step (maximize)"
+    "setpoints_c": {
+      "tank1_temp": 45.0,
+      "tank2_temp": 45.0,
+      "tank3_temp": 45.0
+    },
+    "objective": "Cascade / decoupling control: hold Tank1/Tank3 levels AND all three temperatures at setpoint despite hydraulic coupling through Tank2 and the level->thermal-mass coupling (fuller tank = slower to heat).",
+    "reward": "-(w_level*sum((level_i-sp)^2) + w_temp*sum((temp_i-Tsp)^2) + w_action*sum(action)) per step (maximize)",
+    "reward_weights": {"level": 1.0, "temp": 0.002, "action": 0.01}
   }
 }

@@ -271,6 +271,14 @@ class CascadeBridgeEnv(gym.Env):
         self.scales = {r["name"]: float(r["scale"]) for r in regs}
         self.setpoints = {k: float(v) for k, v in
                           self.config["control"]["setpoints_m"].items()}
+        self.temp_setpoints = {k: float(v) for k, v in
+                               self.config["control"].get("setpoints_c", {}).items()}
+        rw = self.config["control"].get("reward_weights", {})
+        self.reward_weights = {
+            "level": float(rw.get("level", 1.0)),
+            "temp": float(rw.get("temp", 0.002)),
+            "action": float(rw.get("action", 0.01)),
+        }
         self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
@@ -337,13 +345,18 @@ class CascadeBridgeEnv(gym.Env):
 
     def _reward(self, action, obs) -> tuple[float, dict]:
         sidx = {n: i for i, n in enumerate(self.sensor_names)}
-        levels = {n: float(obs[sidx[n]]) for n in self.setpoints}  # level names
-        track = sum((levels[n] - self.setpoints[n]) ** 2 for n in levels)
-        energy = 0.01 * float(np.sum(np.asarray(action)))
-        reward = float(-(track + energy))
+        levels = {n: float(obs[sidx[n]]) for n in self.setpoints}            # level sensors
+        temps = {n: float(obs[sidx[n]]) for n in self.temp_setpoints}        # temp sensors
+        w = self.reward_weights
+        track_l = sum((levels[n] - self.setpoints[n]) ** 2 for n in levels)
+        track_t = sum((temps[n] - self.temp_setpoints[n]) ** 2 for n in temps)
+        action_cost = w["action"] * float(np.sum(np.asarray(action)))
+        reward = float(-(w["level"] * track_l + w["temp"] * track_t + action_cost))
         info = {
             "levels_m": levels,
-            "track_mse": track,
+            "temps_c": temps,
+            "track_level_mse": track_l,
+            "track_temp_mse": track_t,
             "action": np.asarray(action, dtype=np.float32).tolist(),
         }
         return reward, info
@@ -409,11 +422,16 @@ def _demo(backend: str, steps: int, control_dt: float):
         rewards.append(reward)
         if k % 4 == 0 or k == steps - 1:
             lv = info["levels_m"]
-            LOG.info("step %3d  act=%s  levels(m) h1=%.3f h2=%.3f h3=%.3f  r=%.4f",
+            tp = info.get("temps_c", {})
+            LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  "
+                     "temps(C)=%.1f/%.1f/%.1f  r=%.4f",
                      k, np.round(action, 2),
                      lv.get("tank1_level", float("nan")),
                      lv.get("tank2_level", float("nan")),
-                     lv.get("tank3_level", float("nan")), reward)
+                     lv.get("tank3_level", float("nan")),
+                     tp.get("tank1_temp", float("nan")),
+                     tp.get("tank2_temp", float("nan")),
+                     tp.get("tank3_temp", float("nan")), reward)
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), steps)
 

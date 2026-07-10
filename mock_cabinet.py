@@ -19,9 +19,10 @@ Process topology — canonical three-tank benchmark (Amira DTS200-style):
 
     pump q1 --> Tank 1
     pump q2 --> Tank 3
-    Tank 1 --(valve a1)--> Tank 2 --(valve a3)--> Tank 3   (hydraulic coupling
-                                                          through the middle tank)
+    Tank 1 --(valve a1)--> Tank 2     (Tank 1 & Tank 3 both couple into the
+    Tank 3 --(valve a3)--> Tank 2      middle Tank 2 -> the decoupling problem)
     Tank 2 --(valve a2)--> reservoir (drain)
+    heater i --> Tank i   (SSR, 0..Q_heat_max W; thermal mass m = rho.A.h_i)
 
 Tank 1 and Tank 3 are each fed by their own pump, but their levels are
 hydraulically coupled through Tank 2.  Driving Tank 1 / Tank 3 levels
@@ -59,14 +60,30 @@ S_PIPE = 5.0e-5  # connecting-pipe cross-section, m^2
 A1 = 0.5  # outflow coefficient, Tank1<->Tank2 coupling
 A2 = 0.5  # outflow coefficient, Tank2 -> reservoir drain
 A3 = 0.5  # outflow coefficient, Tank3<->Tank2 coupling
-TAU_T = 60.0  # baseline thermal time constant, s
-K_MIX = 6.0  # inflow-mixing gain on thermal response
+# Thermal params (cp, rho, Q_heat_max, UA, T_ambient) come from ia2_config.json.
 
 # Register-name -> physics-state attribute (the cabinet's domain semantics).
 LEVEL_ATTR = {"tank1_level": "h1", "tank2_level": "h2", "tank3_level": "h3"}
 TEMP_ATTR = {"tank1_temp": "T1", "tank2_temp": "T2", "tank3_temp": "T3"}
 # Actuator-name -> pump index (order of the q tuple passed to step()).
 ACTUATOR_Q = {"actuator1": 0, "actuator2": 1}
+# Heater register names, in tank order (heater1->Tank1, ...).
+HEATER_REG = ["heater1", "heater2", "heater3"]
+
+
+def _pos(x: float) -> float:
+    """Positive part: max(x, 0)."""
+    return x if x > 0.0 else 0.0
+
+
+def _neg(x: float) -> float:
+    """Negative part: max(-x, 0)."""
+    return -x if x < 0.0 else 0.0
+
+
+def _frac(raw: int, act_max: int) -> float:
+    """Raw actuator/heater drive (0..act_max) -> [0, 1] fraction."""
+    return max(0.0, min(float(raw), float(act_max))) / float(act_max)
 
 # Episode reset (driven by the env between episodes via reset_cmd + init_h*).
 RESET_CMD = "reset_cmd"
@@ -122,15 +139,25 @@ class PhysicsParams:
     q_max: float       # max pump flow, m^3/s
     h_max: float       # tank height (overflow), m
     t_supply: float    # inlet/supply temperature, degC
-    act_max: int       # raw full-scale actuator drive (= round(1/scale))
+    act_max: int       # raw full-scale actuator/heater drive (= round(1/scale))
+    cp: float          # specific heat capacity, J/(kg.K)
+    rho: float         # water density, kg/m^3
+    q_heat_max: float  # max electrical heater power per tank, W
+    ua: float          # overall heat-loss coefficient, W/K
+    t_ambient: float   # ambient (heat-sink) temperature, degC
 
     @classmethod
     def from_contract(cls, contract: dict) -> "PhysicsParams":
         p = contract["process"]
         act_scale = next(r["scale"] for r in contract["registers"]
                          if r["name"] in ACTUATOR_Q)
-        return cls(q_max=float(p["q_max_m3s"]), h_max=float(p["h_max_m"]),
-                   t_supply=float(p["t_supply_c"]), act_max=round(1.0 / act_scale))
+        return cls(
+            q_max=float(p["q_max_m3s"]), h_max=float(p["h_max_m"]),
+            t_supply=float(p["t_supply_c"]), act_max=round(1.0 / act_scale),
+            cp=float(p["cp_j_per_kgk"]), rho=float(p["rho_kg_per_m3"]),
+            q_heat_max=float(p["q_heat_max_w"]), ua=float(p["ua_w_per_k"]),
+            t_ambient=float(p["t_ambient_c"]),
+        )
 
 
 def _flow(h_from: float, h_to: float, coeff: float) -> float:
@@ -152,14 +179,29 @@ class TankProcess:
     T2: float = 24.0
     T3: float = 24.0
 
-    def step(self, cmd1: int, cmd2: int, dt: float, p: PhysicsParams) -> None:
-        """Advance one Euler step of `dt` seconds given actuator commands."""
-        q1 = max(0.0, min(float(cmd1), p.act_max)) / p.act_max * p.q_max
-        q2 = max(0.0, min(float(cmd2), p.act_max)) / p.act_max * p.q_max
+    def step(self, cmd1: int, cmd2: int, heat1: int, heat2: int, heat3: int,
+             dt: float, p: PhysicsParams) -> None:
+        """Advance one Euler step of `dt` seconds given pump + heater commands.
 
-        q_12 = _flow(self.h1, self.h2, A1)  # Tank1 -> Tank2
-        q_32 = _flow(self.h3, self.h2, A3)  # Tank3 -> Tank2
-        q_drain = _flow(self.h2, 0.0, A2)  # Tank2 -> reservoir
+        Hydraulics: Torricelli inter-tank flows + mass balance (levels).
+        Thermal: first law on each tank (control volume = the water in it),
+
+            m.cp.dT/dt = Q_heat - Q_loss + (advective enthalpy in - out)
+
+        where m = rho.A.h (level-coupled thermal mass), Q_heat = SSR duty *
+        Q_heat_max, Q_loss = UA.(T - T_amb), and the advective term is the sum
+        of rho.cp.q.T over the pipe flows (cold supply water in, warm tank
+        water out). A fuller tank has more mass -> heats/cools more slowly,
+        which is the level -> temperature coupling that makes this cascade.
+        """
+        # --- pumps: raw drive -> volumetric inflow (m^3/s) ---
+        q1 = _frac(cmd1, p.act_max) * p.q_max   # pump1 -> Tank1
+        q2 = _frac(cmd2, p.act_max) * p.q_max   # pump2 -> Tank3
+
+        # --- hydraulic coupling: signed Torricelli flows between levels ---
+        q_12 = _flow(self.h1, self.h2, A1)      # Tank1 <-> Tank2 (+ = T1->T2)
+        q_32 = _flow(self.h3, self.h2, A3)      # Tank3 <-> Tank2 (+ = T3->T2)
+        q_drain = _flow(self.h2, 0.0, A2)       # Tank2 -> reservoir
 
         self.h1 += (q1 - q_12) * dt / A_TANK
         self.h3 += (q2 - q_32) * dt / A_TANK
@@ -167,18 +209,41 @@ class TankProcess:
         for attr in ("h1", "h2", "h3"):
             setattr(self, attr, max(0.0, min(getattr(self, attr), p.h_max)))
 
-        # First-order thermal: relax toward t_supply, faster with pump inflow.
-        self.T1 += self._dtemp(self.T1, self.h1, q1, dt, p.t_supply)
-        self.T2 += self._dtemp(self.T2, self.h2, max(q_12 + q_32, 0.0), dt, p.t_supply)
-        self.T3 += self._dtemp(self.T3, self.h3, q2, dt, p.t_supply)
-        for attr in ("T1", "T2", "T3"):
-            setattr(self, attr, max(0.0, min(getattr(self, attr), 100.0)))
+        # --- heaters: SSR duty fraction -> electrical power (W) ---
+        Qh1 = p.q_heat_max * _frac(heat1, p.act_max)
+        Qh2 = p.q_heat_max * _frac(heat2, p.act_max)
+        Qh3 = p.q_heat_max * _frac(heat3, p.act_max)
 
-    @staticmethod
-    def _dtemp(temp: float, level: float, q_in: float, dt: float, t_supply: float) -> float:
-        vol = A_TANK * max(level, 0.02)
-        turnover = max(q_in, 0.0) / vol
-        return (t_supply - temp) * (1.0 / TAU_T + K_MIX * turnover) * dt
+        # --- advective mixing: sum over INFLOWS of q_in*(T_source - T_tank)
+        # (the well-mixed-tank term; outflow drops out because it removes
+        # tank-temperature water, which cannot change T). Split each inter-tank
+        # flow into forward/backward parts so an inflow always carries its
+        # upstream temperature. ---
+        f12, b12 = _pos(q_12), _neg(q_12)       # T1->T2 forward, T2->T1 back
+        f32, b32 = _pos(q_32), _neg(q_32)       # T3->T2 forward, T2->T3 back
+        adv1 = q1 * (p.t_supply - self.T1) + b12 * (self.T2 - self.T1)
+        adv2 = f12 * (self.T1 - self.T2) + f32 * (self.T3 - self.T2)
+        adv3 = q2 * (p.t_supply - self.T3) + b32 * (self.T2 - self.T3)
+
+        self._step_thermal("T1", "h1", Qh1, adv1, dt, p)
+        self._step_thermal("T2", "h2", Qh2, adv2, dt, p)
+        self._step_thermal("T3", "h3", Qh3, adv3, dt, p)
+
+    def _step_thermal(self, t_attr: str, h_attr: str, q_heat: float,
+                      adv: float, dt: float, p: PhysicsParams) -> None:
+        """One Euler step of the energy balance for one tank.
+
+        q_heat: heater power (W). adv: sum over INFLOWS of q_in*(T_source - T)
+                (m^3.K/s) -- the well-mixed-tank mixing term (outflow drops
+                out). m = rho.A.h is the thermal mass, so the response slows as
+                the level rises.
+        """
+        T = getattr(self, t_attr)
+        h = max(getattr(self, h_attr), 0.02)        # guard against empty-tank /0
+        m_cp = p.rho * A_TANK * h * p.cp            # thermal capacitance, J/K
+        q_loss = p.ua * (T - p.t_ambient)           # Newton cooling, W
+        dT = (q_heat - q_loss) / m_cp * dt + adv / (A_TANK * h) * dt
+        setattr(self, t_attr, max(0.0, min(T + dT, 100.0)))
 
     def snapshot(self) -> dict:
         return {
@@ -263,7 +328,9 @@ async def physics_loop(
             apply_reset(proc, regval, layout, params)
             LOG.info("reset applied -> %s", proc.snapshot())
         if reset_val == 0:
-            proc.step(regval.get("actuator1", 0), regval.get("actuator2", 0), dt, params)
+            proc.step(regval.get("actuator1", 0), regval.get("actuator2", 0),
+                      regval.get("heater1", 0), regval.get("heater2", 0),
+                      regval.get("heater3", 0), dt, params)
         prev_reset_val = reset_val
 
         await server.async_setValues(
@@ -272,8 +339,10 @@ async def physics_loop(
 
         tick += 1
         if log_every and tick % log_every == 0:
-            LOG.info("act=[%5d %5d]  %s", regval.get("actuator1", 0),
-                     regval.get("actuator2", 0), proc.snapshot())
+            LOG.info("pump=[%5d %5d] heat=[%5d %5d %5d]  %s",
+                     regval.get("actuator1", 0), regval.get("actuator2", 0),
+                     regval.get("heater1", 0), regval.get("heater2", 0),
+                     regval.get("heater3", 0), proc.snapshot())
         await asyncio.sleep(dt)
 
 

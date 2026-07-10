@@ -31,6 +31,11 @@ PROGRAM ThreeTank
     init_h1 : UINT;
     init_h2 : UINT;
     init_h3 : UINT;
+    (* heaters (iomap output; driven by the agent each step). SSR duty 0..10000.
+       The PLC body does NOT assign these. *)
+    heater1 : UINT;
+    heater2 : UINT;
+    heater3 : UINT;
     (* heartbeat *)
     scan_count : UDINT;
   END_VAR

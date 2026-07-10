@@ -45,8 +45,9 @@ This mirrors the project goal diagram node-for-node:
 
 ## Process & register map
 
-Canonical three-tank benchmark (Tank 1 & Tank 3 independently pumped, coupled
-through the middle Tank 2 → the *decoupling* control problem). Holding registers
+Canonical three-tank benchmark: Tank 1 & Tank 3 are independently pumped
+(levels) and each tank has an SSR heater (temperatures), coupled through the
+middle Tank 2 → the *cascade / decoupling* control problem. Holding registers
 (PLC `4xxxx` → 0-based address):
 
 | Register | Addr | Variable | Units | Scale |
@@ -63,14 +64,20 @@ through the middle Tank 2 → the *decoupling* control problem). Holding registe
 | 40010 | 9 | Init level — Tank 1 | m | ×1e-4 |
 | 40011 | 10 | Init level — Tank 2 | m | ×1e-4 |
 | 40012 | 11 | Init level — Tank 3 | m | ×1e-4 |
+| 40013 | 12 | Heater 1 (SSR duty, Tank 1) | frac 0–1 | ×1e-4 |
+| 40014 | 13 | Heater 2 (SSR duty, Tank 2) | frac 0–1 | ×1e-4 |
+| 40015 | 14 | Heater 3 (SSR duty, Tank 3) | frac 0–1 | ×1e-4 |
 
-Sensors (40001–40006) are read by IA2 from the cabinet; actuators (40007–40008)
-are written by the agent each step. The reset block (40009–40012) is written by
-the env between episodes: a fresh nonzero value in `reset_cmd` snaps the plant to
-the `init_h*` levels (sampled per episode) and holds them until `reset_cmd`
-returns to 0 — giving RL training a controllable initial-state distribution.
-Engineering value = raw register × scale. The single source of truth for this
-contract is [`ia2_config.json`](ia2_config.json).
+Sensors (40001–40006) are read by IA2 from the cabinet. **Actuators** are written
+by the agent each step: pumps (40007–40008) for levels and heaters (40013–40015,
+SSR duty) for temperatures — together they form the **cascade** problem (outer
+temperature loop ↔ inner level/flow loop), coupled because the thermal mass
+`m = ρ·A·h` depends on level and cold pump inflow disturbs temperature. The reset
+block (40009–40012) is written by the env between episodes: a fresh nonzero value
+in `reset_cmd` snaps the plant to the `init_h*` levels (sampled per episode) and
+holds them until `reset_cmd` returns to 0 — giving RL training a controllable
+initial-state distribution. Engineering value = raw register × scale. The single
+source of truth for this contract is [`ia2_config.json`](ia2_config.json).
 
 ## Repository layout
 
@@ -82,10 +89,15 @@ cascade-control-sandbox/
 ├── aio_bridge_env.py      # Phase 5 · Gymnasium env (ia2 / edge / modbus backends)
 ├── tools/
 │   └── gen_ia2_artifacts.py   # contract -> ia2_project device/iomap TOMLs (+ ST VAR check)
+├── tests/                # smoke tests — ./tests/run_smoke.sh boots the cabinet + runs them
+│   ├── smoke_reset.py        # reset_cmd + init_h* snap levels to targets
+│   ├── smoke_heater.py       # heater raises temp; cold pump inflow slows it
+│   ├── smoke_env.py          # env reset/step/reward over the modbus backend
+│   └── run_smoke.sh          # one-command runner
 ├── ia2_project/           # Phase 5 · IA2 project (PLC + device + iomap + tasks)
 │   ├── project.toml
 │   ├── devices/
-│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 12 channels
+│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 15 channels
 │   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
 │   └── pous/
@@ -143,6 +155,22 @@ python3 aio_bridge_env.py --backend ia2          # RL rollout
 > starts IA2 (which owns the actuator registers via the iomap); the Modbus
 > backend talks to the cabinet directly — don't run both writes simultaneously.
 
+## Smoke tests
+
+Self-contained checks that the simulated components behave — for CI and for
+anyone cloning the repo. They read register addresses/scales from the contract
+(no hardcoding) and need only `mock_cabinet.py`:
+
+```bash
+./tests/run_smoke.sh          # boots the cabinet, runs all three, tears down
+```
+
+- `tests/smoke_reset.py` — `reset_cmd` + `init_h*` snap tank levels to requested targets (two different targets).
+- `tests/smoke_heater.py` — a heater raises its tank's temperature; cold pump inflow slows it (the cascade disturbance).
+- `tests/smoke_env.py` — the Gym env resets (randomized init levels), steps, and rewards over the Modbus backend.
+
+(The full IA2-in-the-loop chain is exercised by [`./run_demo.sh`](run_demo.sh).)
+
 ## Verification
 
 - **Phase 2** — `cs 0.0.1` and `ia2-server` built (`ia2/target/release/`).
@@ -168,6 +196,13 @@ python3 aio_bridge_env.py --backend ia2          # RL rollout
   samples levels, writes them, and pulses a nonce on `reset_cmd`; the cabinet
   snaps to the init levels and holds. Verified end-to-end through IA2 (3 episodes,
   randomized init levels applied exactly) and via direct Modbus.
+- **Heated tanks / cascade loop (review item 2 / G2)** — `heater1/2/3`
+  (40013–40015, SSR duty) + a first-law thermal model
+  `m·c_p·dT/dt = Q_heat − Q_loss + Σq_in·(T_src − T)` with level-coupled thermal
+  mass (`m = ρ·A·h`) make the repo name true: the agent controls 2 pumps (levels)
+  + 3 heaters (temps) against the level→temp coupling, and the reward tracks
+  both. Verified: a heater raises its tank's temperature and a cold pump inflow
+  slows it (the cascade disturbance); a full 5-action rollout runs through IA2.
 
 ## Workflow integration & deployment
 
