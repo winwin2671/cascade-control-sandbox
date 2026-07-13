@@ -102,6 +102,26 @@ The sandbox assumes the project's 5-layer safety architecture:
   efficiency layer: it reduces how often L2–L4 trip (and need manual reset)
   during RL exploration; it is **not** the safety backstop itself.
 
+## Control modes
+
+`aio_bridge_env.py --mode {manual,pid,mpc,rl}` selects the controller (IA2
+backend only; the Modbus training backend drives actuators directly). `mode` is
+a PLC-internal variable the `threetank.st` body `CASE`-switches on to pick each
+actuator's request source; the L5 shield then clamps/intercepts it regardless of
+mode:
+
+| Mode | Controller | Agent writes | PLC body |
+|---|---|---|---|
+| `manual` | `FB_MANSTATION` (in PLC) | `manual_*` (0–100 %) | passes manual out, bumpless to auto |
+| `pid` | `FB_PID` ×5 (in PLC) | `*_sp` setpoints | PID tracks the setpoint → actuator |
+| `mpc` | external supervisor | `actuator*_req` | passes the request through |
+| `rl` | external (`aio_bridge_env`) | `actuator*_req` | passes the request through |
+
+Manual/PID run natively in the PLC (IA2 `library/process-control` FBs); MPC/RL
+are external supervisors. `FB_MANSTATION` is always in the chain so mode
+switches are bumpless. (The `mpc` supervisor + the vectorized training track are
+Phase-3 steps 3b/3c.)
+
 ## Repository layout
 
 ```
@@ -124,7 +144,9 @@ cascade-control-sandbox/
 │   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
 │   └── pous/
-│       └── threetank.st        # IEC 61131-3 ST: L5 software shield (req -> mapped); names checked by codegen
+│       ├── threetank.st        # IEC 61131-3 ST: mode selector (CASE) + L5 shield
+│       ├── fb_pid.st           # vendored from ia2/library/process-control (FB_PID)
+│       └── fb_manstation.st    # vendored from ia2/library/process-control (FB_MANSTATION)
 ├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
 ├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
 ├── run_demo.sh            # Boot everything + run a random-policy rollout
@@ -236,6 +258,12 @@ anyone cloning the repo. They read register addresses/scales from the contract
   heater cutoff) before assigning the mapped outputs. Verified: driving pump1 full
   past the 0.55 m cutoff forces `actuator1 = 0` while `actuator1_req` stays 10000
   (preempts the L3 hardware trip).
+- **Control-mode selector (Phase 3 / 3a)** — `--mode {manual,pid,mpc,rl}` selects
+  the controller via a PLC `mode` variable; `threetank.st` `CASE`-switches the
+  request source (Manual/PID via vendored `FB_PID`/`FB_MANSTATION`; MPC/RL via
+  `actuator*_req`) and the L5 shield clamps it. Verified: PID tracks the config
+  setpoints (reward −2.6→−0.6), manual follows the operator output; the smoke
+  suite still passes. (MPC supervisor + vectorized training track = 3b/3c.)
 
 ## Workflow integration & deployment
 

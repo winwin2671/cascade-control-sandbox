@@ -262,7 +262,7 @@ class CascadeBridgeEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, config: dict | str | Path | None = None,
-                 backend: str = "auto", control_dt: float = 0.5):
+                 backend: str = "auto", control_dt: float = 0.5, mode: str = "rl"):
         super().__init__()
         self.config = load_config(config) if not isinstance(config, dict) else config
         self.control_dt = float(control_dt)
@@ -286,9 +286,14 @@ class CascadeBridgeEnv(gym.Env):
         self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
-        # PLC backends route actuator writes through the L5 software shield: the
-        # agent writes the *_req vars; the PLC body clamps/interlocks -> mapped.
-        self._req_suffix = "_req" if self.backend.writes_via_plc else ""
+        self.mode = mode.lower()
+        self._mode_int = {"manual": 0, "pid": 1, "mpc": 2, "rl": 3}.get(self.mode, 3)
+        # PLC-mode write targets (what the agent writes each step). Modbus backend
+        # has no PLC -> drives the cabinet registers directly (mode ignored).
+        self._write_names, self._write_max = self._write_targets()
+        if self.backend.writes_via_plc:
+            self.backend.write_register("mode", self._mode_int)  # PLC CASE selector
+            LOG.info("mode = %s (%d)", self.mode, self._mode_int)
 
         sreg = {r["name"]: r for r in regs}
         obs_lo = np.array([sreg[n]["min"] for n in self.sensor_names], dtype=np.float32)
@@ -341,14 +346,36 @@ class CascadeBridgeEnv(gym.Env):
             vals.append(raw[name] * self.scales[name])
         return np.asarray(vals, dtype=np.float32)
 
-    def _action_to_raw(self, action) -> dict[str, int]:
+    def _write_targets(self) -> tuple[list[str], list[int]]:
+        """Var names + raw maxima the agent writes each step, by mode/backend."""
+        if not self.backend.writes_via_plc:                      # modbus -> direct
+            return list(self.actuator_names), [10000] * len(self.actuator_names)
+        if self.mode == "manual":
+            return (["manual_p1", "manual_p2", "manual_h1", "manual_h2", "manual_h3"],
+                    [10000] * 5)
+        if self.mode == "pid":
+            return (["tank1_level_sp", "tank3_level_sp",
+                     "tank1_temp_sp", "tank2_temp_sp", "tank3_temp_sp"],
+                    [6000, 6000, 10000, 10000, 10000])
+        return ([f"{n}_req" for n in self.actuator_names],       # mpc / rl
+                [10000] * len(self.actuator_names))
+
+    def _action_to_writes(self, action) -> dict[str, int]:
         a = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
-        out = {}
-        for i, name in enumerate(self.actuator_names):
-            mx = round(1.0 / self.scales[name])  # raw full-scale (= ACT_MAX)
-            raw = int(round(a[i] / self.scales[name]))
-            out[name] = max(0, min(raw, mx))
-        return out
+        return {name: max(0, min(int(round(a[i] * mx)), mx))
+                for i, (name, mx) in enumerate(zip(self._write_names, self._write_max))}
+
+    def setpoint_action(self) -> np.ndarray:
+        """Config setpoints as a normalized [0,1] action (for the PID-mode demo)."""
+        sp = self.config["control"]
+        h_max = float(self.config["process"]["h_max_m"])
+        return np.array([
+            sp["setpoints_m"]["tank1_level"] / h_max,
+            sp["setpoints_m"]["tank3_level"] / h_max,
+            sp["setpoints_c"]["tank1_temp"] / 100.0,
+            sp["setpoints_c"]["tank2_temp"] / 100.0,
+            sp["setpoints_c"]["tank3_temp"] / 100.0,
+        ], dtype=np.float32)
 
     def _reward(self, action, obs) -> tuple[float, dict]:
         sidx = {n: i for i, n in enumerate(self.sensor_names)}
@@ -378,8 +405,8 @@ class CascadeBridgeEnv(gym.Env):
         Releasing reset_cmd (-> 0) lets the cabinet resume stepping for step().
         """
         super().reset(seed=seed)
-        for name in self.actuator_names:                 # neutral actuators first
-            self.backend.write_register(name + self._req_suffix, 0)
+        for name in self._write_names:                   # neutral the mode's write vars
+            self.backend.write_register(name, 0)
         info: dict = {}
         rcfg = self.config.get("reset")
         if rcfg:
@@ -404,8 +431,8 @@ class CascadeBridgeEnv(gym.Env):
         return self._decode_obs(self.backend.read_raw()), info
 
     def step(self, action):
-        for name, value in self._action_to_raw(action).items():
-            self.backend.write_register(name + self._req_suffix, value)
+        for name, value in self._action_to_writes(action).items():
+            self.backend.write_register(name, value)
         time.sleep(self.control_dt)
         obs = self._decode_obs(self.backend.read_raw())
         reward, info = self._reward(action, obs)
@@ -418,13 +445,14 @@ class CascadeBridgeEnv(gym.Env):
 # --------------------------------------------------------------------------- #
 # Demo: random-policy rollout to exercise the full loop end to end.
 # --------------------------------------------------------------------------- #
-def _demo(backend: str, steps: int, control_dt: float):
-    env = CascadeBridgeEnv(backend=backend, control_dt=control_dt)
+def _demo(backend: str, steps: int, control_dt: float, mode: str):
+    env = CascadeBridgeEnv(backend=backend, control_dt=control_dt, mode=mode)
     obs, info = env.reset()
-    LOG.info("reset obs = %s", np.round(obs, 3))
+    LOG.info("reset obs = %s  mode=%s", np.round(obs, 3), mode)
     rewards = []
+    pid_act = env.setpoint_action() if mode == "pid" else None
     for k in range(steps):
-        action = env.action_space.sample()
+        action = pid_act if pid_act is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
         if k % 4 == 0 or k == steps - 1:
@@ -449,6 +477,8 @@ def main():
                     help="auto | ia2 | modbus | edge | edge:<name> (default: auto)")
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--control-dt", type=float, default=0.5)
+    ap.add_argument("--mode", default="rl",
+                    help="control mode: manual | pid | mpc | rl (default rl; IA2 backend only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(
@@ -457,7 +487,7 @@ def main():
     )
     if not args.verbose:
         logging.getLogger("pymodbus").setLevel(logging.WARNING)
-    _demo(args.backend, args.steps, args.control_dt)
+    _demo(args.backend, args.steps, args.control_dt, args.mode)
 
 
 if __name__ == "__main__":
