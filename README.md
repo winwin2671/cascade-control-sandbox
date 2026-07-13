@@ -114,13 +114,14 @@ mode:
 |---|---|---|---|
 | `manual` | `FB_MANSTATION` (in PLC) | `manual_*` (0–100 %) | passes manual out, bumpless to auto |
 | `pid` | `FB_PID` ×5 (in PLC) | `*_sp` setpoints | PID tracks the setpoint → actuator |
-| `mpc` | external supervisor | `actuator*_req` | passes the request through |
+| `mpc` | external supervisor (`controllers/run_mpc.py`) | `actuator*_req` | passes the request through |
 | `rl` | external (`aio_bridge_env`) | `actuator*_req` | passes the request through |
 
 Manual/PID run natively in the PLC (IA2 `library/process-control` FBs); MPC/RL
 are external supervisors. `FB_MANSTATION` is always in the chain so mode
-switches are bumpless. (The `mpc` supervisor + the vectorized training track are
-Phase-3 steps 3b/3c.)
+switches are bumpless. The numpy MPC supervisor (`controllers/run_mpc.py`,
+AIO-Gym's `MPCAgent` + a 3-tank prediction model) is done; the CasADi NMPC and
+the vectorized training track are the remaining 3b/3c work.
 
 ### Trying the modes
 
@@ -138,7 +139,7 @@ ia2/target/release/cs run                           # compile + start the scan l
 python3 aio_bridge_env.py --backend ia2 --mode pid     --steps 20   # PLC FB_PID tracks the config setpoints
 python3 aio_bridge_env.py --backend ia2 --mode manual  --steps 20   # operator manual_* -> FB_MANSTATION -> actuators
 python3 aio_bridge_env.py --backend ia2 --mode rl      --steps 20   # direct actuator*_req through the L5 shield (default)
-python3 aio_bridge_env.py --backend ia2 --mode mpc     --steps 20   # external MPC supervisor (Phase 3b, not yet)
+python3 controllers/run_mpc.py                                   # external MPC supervisor (sets --mode mpc, loops MPCAgent)
 ```
 
 What to watch in the log:
@@ -163,6 +164,10 @@ cascade-control-sandbox/
 ├── aio_bridge_env.py      # Phase 5 · Gymnasium env (ia2 / edge / modbus backends)
 ├── tools/
 │   └── gen_ia2_artifacts.py   # contract -> ia2_project device/iomap TOMLs (+ ST VAR check)
+├── controllers/           # Phase 3b · external supervisors (MPC; NMPC pending)
+│   ├── threetank_model.py     # numpy 3-tank plant (MPCAgent interface; mirrors mock_cabinet)
+│   ├── mpc_agent.py           # MPCAgent (copied from AIO-Gym) — numpy box-QP MPC
+│   └── run_mpc.py             # supervisor: IA2 snapshot -> MPC -> actuator*_req
 ├── tests/                # smoke tests — ./tests/run_smoke.sh boots the cabinet + runs them
 │   ├── smoke_reset.py        # reset_cmd + init_h* snap levels to targets
 │   ├── smoke_heater.py       # heater raises temp; cold pump inflow slows it
@@ -295,6 +300,12 @@ anyone cloning the repo. They read register addresses/scales from the contract
   `actuator*_req`) and the L5 shield clamps it. Verified: PID tracks the config
   setpoints (reward −2.6→−0.6), manual follows the operator output; the smoke
   suite still passes. (MPC supervisor + vectorized training track = 3b/3c.)
+- **MPC supervisor (Phase 3 / 3b, numpy)** — `controllers/run_mpc.py` runs AIO-Gym's
+  `MPCAgent` (copied) against the live IA2 plant with a 3-tank prediction model
+  (`controllers/threetank_model.py`, mirroring `mock_cabinet`). Verified: it drives
+  levels + temps to the config setpoints — reward −2.75 → −0.03 over 40 steps,
+  predictively backing off the actuators as it nears the target. (CasADi NMPC and
+  the vectorized training track remain.)
 
 ## Workflow integration & deployment
 
