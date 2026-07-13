@@ -122,6 +122,37 @@ are external supervisors. `FB_MANSTATION` is always in the chain so mode
 switches are bumpless. (The `mpc` supervisor + the vectorized training track are
 Phase-3 steps 3b/3c.)
 
+### Trying the modes
+
+The modes need the full IA2 chain up (cabinet + ia2-server + the project
+running). Boot the first three once, then run the env per mode:
+
+```bash
+# 1. boot the chain (once)
+python3 mock_cabinet.py &                           # plant on 127.0.0.1:5020
+ia2/target/release/server --bind 127.0.0.1:3001 &  # IA2 HTTP API
+ia2/target/release/cs project open ia2_project
+ia2/target/release/cs run                           # compile + start the scan loop
+
+# 2. run the env in a mode (pick one):
+python3 aio_bridge_env.py --backend ia2 --mode pid     --steps 20   # PLC FB_PID tracks the config setpoints
+python3 aio_bridge_env.py --backend ia2 --mode manual  --steps 20   # operator manual_* -> FB_MANSTATION -> actuators
+python3 aio_bridge_env.py --backend ia2 --mode rl      --steps 20   # direct actuator*_req through the L5 shield (default)
+python3 aio_bridge_env.py --backend ia2 --mode mpc     --steps 20   # external MPC supervisor (Phase 3b, not yet)
+```
+
+What to watch in the log:
+- `--mode pid` writes the setpoints from `ia2_config.json` (`control.setpoints_m`
+  / `setpoints_c`); the PLC `FB_PID` loops track them — `levels(m)` and `temps(C)`
+  converge toward the setpoints and the reward climbs (e.g. −2.6 → −0.6).
+- `--mode manual` writes (random, in the demo) `manual_*` operator outputs
+  through `FB_MANSTATION`; the actuators follow them directly.
+- `--mode rl` is the direct-actuator path — the agent writes `actuator*_req`,
+  which the L5 shield clamps before the cabinet.
+
+`--backend modbus` bypasses IA2 entirely (talks to the cabinet directly) and
+ignores `--mode` — it's the fast training path, not for mode testing.
+
 ## Repository layout
 
 ```
