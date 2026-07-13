@@ -58,6 +58,14 @@ class ThreeTankModel:
         self.q_heat_max = float(p["q_heat_max_w"])
         self.ua = float(p["ua_w_per_k"])
         self.t_ambient = float(p["t_ambient_c"])
+        # params dict + micro-step for the CasADi symbolic dynamics (nmpc_oracle).
+        self.p = {
+            "q_max": self.q_max, "A_TANK": A_TANK, "q_heat_max": self.q_heat_max,
+            "ua": self.ua, "cp": self.cp, "rho": self.rho, "S_PIPE": S_PIPE,
+            "A1": A1, "A2": A2, "A3": A3, "G": G, "t_supply": self.t_supply,
+            "t_ambient": self.t_ambient, "h_floor": 0.02, "h_max": self.h_max,
+        }
+        self.dt_micro = 0.05
 
     # ---- MPCAgent interface ----
     def actuator_counts(self):

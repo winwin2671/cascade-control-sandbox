@@ -3,3 +3,4 @@
 pymodbus>=3.13
 gymnasium>=1.0
 numpy>=1.24
+casadi>=3.6   # only for the NMPC oracle (controllers/nmpc_oracle.py); not needed for MPC/RL
