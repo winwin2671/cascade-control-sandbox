@@ -124,8 +124,20 @@ CasADi NMPC (`run_nmpc.py`); the vectorized training track is the remaining 3c.
 
 ### Trying the modes
 
-The modes need the full IA2 chain up (cabinet + ia2-server + the project
-running). Boot the first three once, then run the env per mode:
+The easy way — `run_mode.sh` boots the cabinet + IA2 + the PLC program, runs the
+chosen controller, and tears down on exit (one command per mode):
+
+```bash
+./run_mode.sh pid       # PLC FB_PID tracks the config setpoints
+./run_mode.sh manual    # operator manual_* -> FB_MANSTATION -> actuators
+./run_mode.sh rl        # direct actuator*_req through the L5 shield (default)
+./run_mode.sh mpc       # external numpy MPC supervisor
+./run_mode.sh nmpc      # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
+STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl; mpc/nmpc run 40)
+```
+
+Under the hood (to keep the services up across several runs), boot the chain
+once, then run the env per mode:
 
 ```bash
 # 1. boot the chain (once)
@@ -135,11 +147,11 @@ ia2/target/release/cs project open ia2_project
 ia2/target/release/cs run                           # compile + start the scan loop
 
 # 2. run the env in a mode (pick one):
-python3 aio_bridge_env.py --backend ia2 --mode pid     --steps 20   # PLC FB_PID tracks the config setpoints
-python3 aio_bridge_env.py --backend ia2 --mode manual  --steps 20   # operator manual_* -> FB_MANSTATION -> actuators
-python3 aio_bridge_env.py --backend ia2 --mode rl      --steps 20   # direct actuator*_req through the L5 shield (default)
-python3 controllers/run_mpc.py                                   # external MPC supervisor (numpy MPCAgent; sets --mode mpc)
-python3 controllers/run_nmpc.py                                  # CasADi+IPOPT NMPC supervisor (slower; sets --mode mpc)
+python3 aio_bridge_env.py --backend ia2 --mode pid     --steps 20
+python3 aio_bridge_env.py --backend ia2 --mode manual  --steps 20
+python3 aio_bridge_env.py --backend ia2 --mode rl      --steps 20
+python3 controllers/run_mpc.py                          # numpy MPC
+python3 controllers/run_nmpc.py                         # CasADi NMPC
 ```
 
 What to watch in the log:
@@ -187,7 +199,7 @@ cascade-control-sandbox/
 │       └── fb_manstation.st    # vendored from ia2/library/process-control (FB_MANSTATION)
 ├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
 ├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
-├── run_demo.sh            # Boot everything + run a random-policy rollout
+├── run_mode.sh            # Boot + run one controller (pid/manual/mpc/nmpc/rl/modbus) + teardown
 ├── .gitignore
 └── README.md
 ```
@@ -214,11 +226,12 @@ python3 tools/gen_ia2_artifacts.py --check  # exit 1 if committed TOMLs are stal
 
 ```bash
 # Full chain — IA2 backend (RL agent -> Gym -> IA2 -> iomap -> Modbus -> plant)
-./run_demo.sh                 # or:  STEPS=40 ./run_demo.sh ia2
+./run_mode.sh rl              # or:  STEPS=40 ./run_mode.sh rl
 
 # Direct Modbus backend (skip IA2; for quick standalone tests)
-./run_demo.sh modbus
+./run_mode.sh modbus
 
+# All control modes (pid/manual/mpc/nmpc): see "Control modes" below.
 # Edge backend (project deployed on a remote edge runtime — G4 route shape):
 python3 aio_bridge_env.py --backend edge:<edge_name>   # needs a registered, deployed edge (cs edge / cs deploy)
 ```
@@ -252,7 +265,7 @@ anyone cloning the repo. They read register addresses/scales from the contract
 - `tests/smoke_heater.py` — a heater raises its tank's temperature; cold pump inflow slows it (the cascade disturbance).
 - `tests/smoke_env.py` — the Gym env resets (randomized init levels), steps, and rewards over the Modbus backend.
 
-(The full IA2-in-the-loop chain is exercised by [`./run_demo.sh`](run_demo.sh).)
+(The full IA2-in-the-loop chain is exercised by [`./run_mode.sh rl`](run_mode.sh).)
 
 ## Verification
 

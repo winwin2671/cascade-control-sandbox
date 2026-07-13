@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# run_mode.sh — boot the sandbox and run one controller end-to-end.
+#
+# Boots mock_cabinet (+ ia2-server + the ThreeTank PLC program for the IA2
+# modes), runs the chosen controller, then tears everything down on exit.
+# One entry point for every run path.
+#
+# Usage:
+#   ./run_mode.sh                # RL (direct actuator*_req through IA2) — default
+#   ./run_mode.sh pid            # PLC FB_PID tracks the config setpoints
+#   ./run_mode.sh manual         # operator manual_* -> FB_MANSTATION
+#   ./run_mode.sh mpc            # external numpy MPC supervisor (run_mpc.py)
+#   ./run_mode.sh nmpc           # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
+#   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
+#   STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+#
+# pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
+# cabinet directly (the fast training path). See README "Control modes".
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IA2="$ROOT/ia2/target/release"
+MODE="${1:-rl}"
+STEPS="${STEPS:-20}"
+
+case "$MODE" in
+  pid|manual|rl|mpc|nmpc|modbus) ;;
+  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus]  (got: $MODE)"; exit 2 ;;
+esac
+
+CAB_PID=""; SRV_PID=""
+cleanup() {
+  echo
+  echo "==> tearing down (cabinet + ia2-server)"
+  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
+  [ -n "$CAB_PID" ] && kill "$CAB_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo "==> starting mock_cabinet (Modbus TCP plant on :5020)"
+python3 -u "$ROOT/mock_cabinet.py" --log-every 0 &
+CAB_PID=$!
+sleep 2
+
+if [ "$MODE" != "modbus" ]; then
+  echo "==> starting ia2-server (:3001)"
+  "$IA2/server" --bind 127.0.0.1:3001 &
+  SRV_PID=$!
+  for _ in $(seq 1 40); do
+    curl -sf -m 1 http://127.0.0.1:3001/api/health >/dev/null && break
+    sleep 0.5
+  done
+  curl -sf -m 1 http://127.0.0.1:3001/api/health >/dev/null \
+    || { echo "ERROR: ia2-server did not become healthy"; exit 1; }
+  echo "==> opening ia2_project and starting ThreeTank"
+  "$IA2/cs" project open "$ROOT/ia2_project"
+  "$IA2/cs" run
+fi
+
+echo "==> running mode=$MODE" $([ "$MODE" = mpc ] || [ "$MODE" = nmpc ] || echo "(steps=$STEPS)")
+case "$MODE" in
+  modbus)
+    python3 -u "$ROOT/aio_bridge_env.py" --backend modbus --steps "$STEPS" ;;
+  pid|manual|rl)
+    python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
+  mpc)
+    python3 -u "$ROOT/controllers/run_mpc.py" ;;
+  nmpc)
+    python3 -u "$ROOT/controllers/run_nmpc.py" ;;
+esac
