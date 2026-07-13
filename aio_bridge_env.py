@@ -262,10 +262,12 @@ class CascadeBridgeEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, config: dict | str | Path | None = None,
-                 backend: str = "auto", control_dt: float = 0.5, mode: str = "rl"):
+                 backend: str = "auto", control_dt: float = 0.5, mode: str = "rl",
+                 port: int | None = None):
         super().__init__()
         self.config = load_config(config) if not isinstance(config, dict) else config
         self.control_dt = float(control_dt)
+        self._port_override = port
 
         regs = _registers_by_address(self.config)
         self.addr_base = int(regs[0]["address"])
@@ -329,9 +331,10 @@ class CascadeBridgeEnv(gym.Env):
                     raise
                 LOG.warning("IA2 backend unavailable (%s); using Modbus", e)
         m = self.config["modbus"]
-        be = ModbusBackend(m["host"], int(m["port"]), int(m["unit_id"]),
+        port = int(self._port_override) if self._port_override else int(m["port"])
+        be = ModbusBackend(m["host"], port, int(m["unit_id"]),
                            self.addr_base, self.addr_names)
-        LOG.info("backend = Modbus (%s:%s)", m["host"], m["port"])
+        LOG.info("backend = Modbus (%s:%s)", m["host"], port)
         return be
 
     # ---- conversions ----

@@ -166,22 +166,45 @@ What to watch in the log:
 `--backend modbus` bypasses IA2 entirely (talks to the cabinet directly) and
 ignores `--mode` — it's the fast training path, not for mode testing.
 
+## Training track (G3/G5)
+
+For RL **training** (not validation), bypass IA2 and run many plant-seconds per
+wall-second: time-scale the cabinet (G3) + run N cabinets in parallel (G5).
+
+```bash
+# one cabinet kx faster than real-time (G3) — physics dt unchanged, just a shorter sleep
+python3 mock_cabinet.py --time-scale 10
+
+# N cabinets on N ports in an AsyncVectorEnv (G5) — ~kN x real-time
+python3 controllers/train_rl.py --n-envs 4 --time-scale 10 --steps 200      # random policy (throughput check)
+python3 controllers/train_rl.py --algo ppo --total-timesteps 20000          # SB3 PPO (pip install stable_baselines3)
+```
+
+`aio_vec_env.py` spawns N cabinet subprocesses (ports 5020..5020+N-1) + an
+`AsyncVectorEnv` (one worker process per env, so the per-step sleeps overlap).
+The env's wall-clock step is `plant_dt / time_scale`, keeping the plant-time
+control interval at `plant_dt` (same as real-time deployment). Verified: 4 envs ×
+10x ≈ 37x real-time (800 plant-steps in ~11s wall). The IA2 validation track
+(the control modes above) stays single-instance — one PROGRAM per IA2 server.
+
 ## Repository layout
 
 ```
 cascade-control-sandbox/
 │
 ├── ia2_config.json        # the single contract — register map, scales, setpoints
-├── mock_cabinet.py        # Phase 3 · pymodbus TCP plant on :5020 (reads the contract)
+├── mock_cabinet.py        # Phase 3 · pymodbus TCP plant on :5020 (--time-scale k for training)
 ├── aio_bridge_env.py      # Phase 5 · Gymnasium env (ia2 / edge / modbus backends)
+├── aio_vec_env.py         # Phase 3c · vectorized training env (N cabinets, AsyncVectorEnv)
 ├── tools/
 │   └── gen_ia2_artifacts.py   # contract -> ia2_project device/iomap TOMLs (+ ST VAR check)
-├── controllers/           # Phase 3b · external supervisors (MPC + NMPC)
+├── controllers/           # Phase 3b/3c · external supervisors + RL training
 │   ├── threetank_model.py     # numpy 3-tank plant (MPCAgent/NMPC interface; mirrors mock_cabinet)
 │   ├── mpc_agent.py           # MPCAgent (copied from AIO-Gym) — numpy box-QP MPC
 │   ├── run_mpc.py             # supervisor: IA2 snapshot -> MPC -> actuator*_req
 │   ├── nmpc_oracle.py         # NMPCOracle (CasADi+IPOPT) + symbolic _f_threetank plant
-│   └── run_nmpc.py            # supervisor: IA2 snapshot -> NMPC -> actuator*_req
+│   ├── run_nmpc.py            # supervisor: IA2 snapshot -> NMPC -> actuator*_req
+│   └── train_rl.py            # Phase 3c · vectorized + time-scaled RL training (random / SB3 PPO)
 ├── tests/                # smoke tests — ./tests/run_smoke.sh boots the cabinet + runs them
 │   ├── smoke_reset.py        # reset_cmd + init_h* snap levels to targets
 │   ├── smoke_heater.py       # heater raises temp; cold pump inflow slows it
@@ -329,6 +352,10 @@ anyone cloning the repo. They read register addresses/scales from the contract
   so the NMPC's prediction `dt` is set to the loop time (~2 s) to avoid overshoot;
   it's the slow oracle baseline, not for real-time training (use the numpy MPC for
   that). (The vectorized training track = 3c.)
+- **Training track (Phase 3 / 3c, G3+G5)** — `mock_cabinet.py --time-scale k` (G3,
+  verified ~12x at k=10) + `aio_vec_env.py` (N cabinets on N ports, AsyncVectorEnv,
+  G5). `controllers/train_rl.py` runs a random policy or SB3 PPO. Verified: 4 envs ×
+  10x ≈ 37x real-time (800 plant-steps in ~11s wall).
 
 ## Workflow integration & deployment
 

@@ -304,8 +304,15 @@ def build_server(host: str, port: int, unit_id: int, proc: TankProcess,
 async def physics_loop(
     server: ModbusTcpServer, unit_id: int, proc: TankProcess,
     layout: Layout, params: PhysicsParams, dt: float, log_every: int,
+    time_scale: float = 1.0,
 ) -> None:
     """Tick: read actuator regs, integrate physics, write sensor regs.
+
+    `dt` is the plant-seconds integrated per tick (kept small for Euler
+    accuracy). `time_scale` > 1 runs faster than real-time (training): the
+    wall-clock sleep per tick is `dt/time_scale`, so the plant advances
+    time_scale x per wall-second. The physics step itself is unchanged, so
+    accuracy doesn't degrade with speed.
 
     Assumes the register block is contiguous from `layout.base` (true for the
     current contract; revisit if future registers fragment the address space).
@@ -343,7 +350,7 @@ async def physics_loop(
                      regval.get("actuator1", 0), regval.get("actuator2", 0),
                      regval.get("heater1", 0), regval.get("heater2", 0),
                      regval.get("heater3", 0), proc.snapshot())
-        await asyncio.sleep(dt)
+        await asyncio.sleep(dt / time_scale)
 
 
 def _install_signals(loop: asyncio.AbstractEventLoop, server: ModbusTcpServer) -> None:
@@ -362,7 +369,9 @@ async def main(argv: list[str] | None = None) -> None:
                         help="path to ia2_config.json (the register contract)")
     parser.add_argument("--host", default=None, help="bind host (default: contract)")
     parser.add_argument("--port", type=int, default=None, help="bind port (default: contract)")
-    parser.add_argument("--dt", type=float, default=0.05, help="physics step, seconds")
+    parser.add_argument("--dt", type=float, default=0.05, help="physics step, seconds (plant time)")
+    parser.add_argument("--time-scale", type=float, default=1.0,
+                        help="run this many x faster than real-time (training; default 1)")
     parser.add_argument("--log-every", type=int, default=50, help="log every N ticks (0=off)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -386,12 +395,13 @@ async def main(argv: list[str] | None = None) -> None:
     _install_signals(asyncio.get_running_loop(), server)
 
     phys = asyncio.create_task(
-        physics_loop(server, unit_id, proc, layout, params, args.dt, args.log_every),
+        physics_loop(server, unit_id, proc, layout, params, args.dt, args.log_every,
+                     args.time_scale),
         name="physics",
     )
     LOG.info(
-        "listening on %s:%d (device_id=%d, %d regs) — %s",
-        host, port, unit_id, layout.n, proc.snapshot(),
+        "listening on %s:%d (device_id=%d, %d regs, %sx) — %s",
+        host, port, unit_id, layout.n, args.time_scale, proc.snapshot(),
     )
 
     try:
