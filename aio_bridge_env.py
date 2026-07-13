@@ -112,6 +112,8 @@ class Backend:
     """Read all registers (raw uint16, keyed by register name) and write any
     register/variable (actuators, reset_cmd, init_h*) by name."""
 
+    writes_via_plc = False  # True for IA2/edge: writes reach actuators through the PLC
+
     def read_raw(self) -> dict[str, int]: ...
     def write_register(self, name: str, value: int) -> None: ...
     def close(self) -> None: ...
@@ -150,6 +152,8 @@ class ModbusBackend(Backend):
 
 class _IA2HttpBase(Backend):
     """Shared HTTP plumbing for the IA2 dev-server and edge backends."""
+
+    writes_via_plc = True  # writes go to the PLC *_req vars -> through the L5 shield
 
     def __init__(self, server_url: str, project: str | None):
         self.base = server_url.rstrip("/")
@@ -282,6 +286,9 @@ class CascadeBridgeEnv(gym.Env):
         self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
+        # PLC backends route actuator writes through the L5 software shield: the
+        # agent writes the *_req vars; the PLC body clamps/interlocks -> mapped.
+        self._req_suffix = "_req" if self.backend.writes_via_plc else ""
 
         sreg = {r["name"]: r for r in regs}
         obs_lo = np.array([sreg[n]["min"] for n in self.sensor_names], dtype=np.float32)
@@ -372,7 +379,7 @@ class CascadeBridgeEnv(gym.Env):
         """
         super().reset(seed=seed)
         for name in self.actuator_names:                 # neutral actuators first
-            self.backend.write_register(name, 0)
+            self.backend.write_register(name + self._req_suffix, 0)
         info: dict = {}
         rcfg = self.config.get("reset")
         if rcfg:
@@ -398,7 +405,7 @@ class CascadeBridgeEnv(gym.Env):
 
     def step(self, action):
         for name, value in self._action_to_raw(action).items():
-            self.backend.write_register(name, value)
+            self.backend.write_register(name + self._req_suffix, value)
         time.sleep(self.control_dt)
         obs = self._decode_obs(self.backend.read_raw())
         reward, info = self._reward(action, obs)

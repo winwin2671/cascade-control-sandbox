@@ -85,6 +85,23 @@ expect ~200 ms of lag — fine at `control_dt ≥ 0.3 s`; the budget is recorded
 the contract's `timing` block. The device file uses the current
 `[transport] kind = "tcp"` schema.
 
+## Safety model
+
+The sandbox assumes the project's 5-layer safety architecture:
+
+- **L1–L4 are hardware** (not modeled here): 30 mA RCD on heater/pump circuits
+  (L1); a low-level switch per stage wired in series with heater/pump power for
+  dry-fire protection (L2); a high-level switch + passive overflow standpipe
+  (L3); the heater's built-in thermal protector (L4). These are the real,
+  PLC-independent backstop and the precondition for unattended operation.
+- **L5 is the software shield** — what `threetank.st` implements. The agent
+  writes `actuator*_req` / `heater*_req` (PLC-internal, API-written); the PLC
+  body clamps each request and forces the mapped output to 0 when an action
+  would soon trip hardware — pumps OFF above 0.55 m (preempt L3), heaters OFF
+  below 0.05 m (preempt L2 dry-fire) or above 70 °C (preempt L4). L5 is an
+  efficiency layer: it reduces how often L2–L4 trip (and need manual reset)
+  during RL exploration; it is **not** the safety backstop itself.
+
 ## Repository layout
 
 ```
@@ -107,7 +124,7 @@ cascade-control-sandbox/
 │   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
 │   └── pous/
-│       └── threetank.st        # IEC 61131-3 ST PROGRAM (hand-written; names checked by codegen)
+│       └── threetank.st        # IEC 61131-3 ST: L5 software shield (req -> mapped); names checked by codegen
 ├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
 ├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
 ├── run_demo.sh            # Boot everything + run a random-policy rollout
@@ -209,6 +226,16 @@ anyone cloning the repo. They read register addresses/scales from the contract
   + 3 heaters (temps) against the level→temp coupling, and the reward tracks
   both. Verified: a heater raises its tank's temperature and a cold pump inflow
   slows it (the cascade disturbance); a full 5-action rollout runs through IA2.
+- **Timing budget + transport (review item 6 / G6)** — the contract states the
+  observation-lag budget (~200 ms: 50 ms Modbus poll + 50 ms PLC scan + ~10 Hz
+  snapshot cache; `min_control_dt` 0.3 s), and the device TOML uses the current
+  `[transport] kind = "tcp"` schema. Verified: `cs project check` + a full chain run.
+- **L5 software shield (review item 3)** — `threetank.st` is now a safety layer,
+  not pass-through: the agent writes `actuator*_req` / `heater*_req` and the PLC
+  body clamps + interlocks (high-level pump cutoff; low-level dry-fire + high-temp
+  heater cutoff) before assigning the mapped outputs. Verified: driving pump1 full
+  past the 0.55 m cutoff forces `actuator1 = 0` while `actuator1_req` stays 10000
+  (preempts the L3 hardware trip).
 
 ## Workflow integration & deployment
 
