@@ -3,14 +3,17 @@
 #
 # Modbus TCP device for the 15-register mock cabinet. `address` is the 0-based
 # protocol register address (= PLC 4xxxx - 40001). Scale/units live in ia2_config.json.
-# Legacy top-level {host, port} shape — IA2 auto-upgrades it to transport.kind=tcp.
+# Uses the current [transport] kind=tcp schema.
 
 name = "mock_cabinet"
 protocol = "modbus"
-host = "127.0.0.1"
-port = 5020
 slave_id = 1
 poll_interval_ms = 50
+
+[transport]
+kind = "tcp"
+host = "127.0.0.1"
+port = 5020
 
 [[channels]]
 name = "tank1_level"

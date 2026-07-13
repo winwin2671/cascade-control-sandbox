@@ -79,6 +79,12 @@ holds them until `reset_cmd` returns to 0 — giving RL training a controllable
 initial-state distribution. Engineering value = raw register × scale. The single
 source of truth for this contract is [`ia2_config.json`](ia2_config.json).
 
+**Timing budget (review G6):** observations come from the runtime snapshot
+(~10 Hz broadcast cache) on top of the 50 ms Modbus poll and 50 ms PLC scan, so
+expect ~200 ms of lag — fine at `control_dt ≥ 0.3 s`; the budget is recorded in
+the contract's `timing` block. The device file uses the current
+`[transport] kind = "tcp"` schema.
+
 ## Repository layout
 
 ```

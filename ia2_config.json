@@ -155,5 +155,14 @@
     "objective": "Cascade / decoupling control: hold Tank1/Tank3 levels AND all three temperatures at setpoint despite hydraulic coupling through Tank2 and the level->thermal-mass coupling (fuller tank = slower to heat).",
     "reward": "-(w_level*sum((level_i-sp)^2) + w_temp*sum((temp_i-Tsp)^2) + w_action*sum(action)) per step (maximize)",
     "reward_weights": {"level": 1.0, "temp": 0.002, "action": 0.01}
+  },
+
+  "timing": {
+    "modbus_poll_ms": 50,
+    "plc_scan_ms": 50,
+    "snapshot_broadcast_hz": 10,
+    "obs_lag_ms_est": 200,
+    "min_control_dt_s": 0.3,
+    "note": "Observations are read from the runtime snapshot (~10 Hz broadcast cache), on top of the 50 ms Modbus poll and the 50 ms PLC scan, so expect up to ~200 ms of observation lag. Fine at control_dt >= 0.3 s; do not shrink control_dt below the lag budget."
   }
 }
