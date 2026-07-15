@@ -70,6 +70,12 @@ agent to IA2.
 > imports AIO-Gym's battle-tested implementations rather than rewriting them. When
 > IA2 gains native MPC/RL, the AIO-Gym dependency can be dropped.
 
+> **Simulation status:** `mock_cabinet.py` is a **testing prototype** — the
+> physics, register map, and scaling will change to match the real hardware
+> design. Its purpose today is to validate the full connection + workflow
+> end-to-end (agent → IA2 → Modbus → plant → KPI). The final deployment will run
+> on a **Mac mini** connected to the real I/O of the physical 3-tank rig.
+
 ### Process & register map
 
 Three-tank benchmark: Tank 1 & Tank 3 independently pumped, each with an SSR
