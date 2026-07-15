@@ -45,6 +45,7 @@ class ThreeTankModel:
 
     scenario = "threetank"   # not cstr/hvac/heater -> MPCAgent uses the interleaved branch
     n = 3
+    energy_scored = True     # AIO-Gym KPIScorer: score the excess-heater-energy KPI
 
     def __init__(self):
         with open(CONFIG) as fh:
@@ -58,12 +59,22 @@ class ThreeTankModel:
         self.q_heat_max = float(p["q_heat_max_w"])
         self.ua = float(p["ua_w_per_k"])
         self.t_ambient = float(p["t_ambient_c"])
-        # params dict + micro-step for the CasADi symbolic dynamics (nmpc_oracle).
+        # default setpoints (from the contract) for AIOGymNativeEnv.
+        ctrl = cfg["control"]
+        self._hsp = {0: float(ctrl["setpoints_m"]["tank1_level"]),
+                     1: float(ctrl["setpoints_m"]["tank2_level"]),
+                     2: float(ctrl["setpoints_m"]["tank3_level"])}
+        self._tsp = [float(ctrl["setpoints_c"]["tank1_temp"]),
+                     float(ctrl["setpoints_c"]["tank2_temp"]),
+                     float(ctrl["setpoints_c"]["tank3_temp"])]
+        # params dict + micro-step for the CasADi symbolic dynamics (nmpc_oracle)
+        # and the AIO-Gym env (which reads p["t_cold"], p["t_amb"]).
         self.p = {
             "q_max": self.q_max, "A_TANK": A_TANK, "q_heat_max": self.q_heat_max,
             "ua": self.ua, "cp": self.cp, "rho": self.rho, "S_PIPE": S_PIPE,
             "A1": A1, "A2": A2, "A3": A3, "G": G, "t_supply": self.t_supply,
-            "t_ambient": self.t_ambient, "h_floor": 0.02, "h_max": self.h_max,
+            "t_ambient": self.t_ambient, "t_cold": self.t_supply, "t_amb": self.t_ambient,
+            "h_floor": 0.02, "h_max": self.h_max,
         }
         self.dt_micro = 0.05
 
@@ -113,3 +124,30 @@ class ThreeTankModel:
         m_cp = self.rho * A_TANK * h * self.cp
         q_loss = self.ua * (T - t_amb)
         return (q_heat - q_loss) / m_cp + adv / (A_TANK * h)
+
+    # ---- AIO-Gym env / KPIScorer interface (KPI + economic reward) ----
+    def default_setpoints(self):
+        return dict(self._hsp), list(self._tsp)
+
+    @property
+    def height_max(self):
+        return [self.h_max, self.h_max, self.h_max]
+
+    def heater_power(self, act):
+        return sum(u * self.q_heat_max for u in act["heaters"])
+
+    def ideal_power(self, levels, temps, t_sp, env, act):
+        """Steady-state heater power (W) to hold t_sp: warm the cold inflow + cover
+        heat loss. The thermodynamic floor for the excess-energy KPI."""
+        q1 = act["pumps"][0] * self.q_max
+        q2 = act["pumps"][1] * self.q_max
+        rho_cp = self.rho * self.cp
+        t_amb, t_cold = env["t_amb"], env["t_cold"]
+        tot = 0.0
+        tot += max(0.0, rho_cp * q1 * (t_sp[0] - t_cold) + self.ua * (t_sp[0] - t_amb))
+        tot += max(0.0, self.ua * (t_sp[1] - t_amb))            # middle tank: inflow ~ at t_sp
+        tot += max(0.0, rho_cp * q2 * (t_sp[2] - t_cold) + self.ua * (t_sp[2] - t_amb))
+        return tot
+
+    def clamp_state(self, x):
+        return x

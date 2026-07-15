@@ -13,7 +13,10 @@ logs/
 ia2/
 AIO-Gym/
 
+
 # OS / editor cruft
 .DS_Store
 .idea/
 *.swp
+*.zip
+runs/

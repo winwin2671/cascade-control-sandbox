@@ -453,11 +453,16 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
     obs, info = env.reset()
     LOG.info("reset obs = %s  mode=%s", np.round(obs, 3), mode)
     rewards = []
+    steps_data = []
     pid_act = env.setpoint_action() if mode == "pid" else None
     for k in range(steps):
         action = pid_act if pid_act is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
+        steps_data.append({
+            "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
+            "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
+            "action": [float(x) for x in action], "reward": reward})
         if k % 4 == 0 or k == steps - 1:
             lv = info["levels_m"]
             tp = info.get("temps_c", {})
@@ -472,6 +477,11 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
                      tp.get("tank3_temp", float("nan")), reward)
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), steps)
+    try:
+        from controllers.rollout_report import report
+        report(steps_data, tag=mode)
+    except Exception as e:
+        LOG.warning("rollout report skipped: %s", e)
 
 
 def main():

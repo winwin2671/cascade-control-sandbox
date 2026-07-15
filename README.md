@@ -1,4 +1,10 @@
+<div align="center">
+
 # cascade-control-sandbox
+
+</div>
+
+---
 
 A reinforcement-learning sandbox for **cascade / decoupling control of a 3-tank
 process**, built on the [IA2](https://github.com/supcon-international/ia2)
@@ -8,8 +14,33 @@ pattern. The physical "cabinet" is a Python Modbus TCP simulator; IA2 fronts it
 as a real PLC would front real hardware; a Gymnasium environment bridges an RL
 agent to IA2.
 
-## Architecture (goal flow)
+### Highlights
 
+- **Five control modes, one plant.** Manual (tkinter GUI), PID (PLC `FB_PID`),
+  MPC (numpy box-QP), NMPC (CasADi + IPOPT), and RL (trained SAC/PPO) — switch
+  live, compare on the same KPI.
+- **Real PLC, not a toy.** The `threetank.st` IEC 61131-3 program runs in IA2's
+  50 ms scan loop with a 5-layer safety architecture (L5 software shield
+  preempts hardware trips — high-level pump cutoff, dry-fire + over-temp
+  heater cutoff).
+- **AIO-Gym integration for MPC & RL.** IA2 ships native PID + Manual (IEC 61131-3
+  FBs), but does not yet include MPC or RL controllers. This sandbox imports
+  AIO-Gym's implementations (numpy MPC, CasADi NMPC, SAC/PPO/RLPD training)
+  rather than rewriting them — registered as a `threetank` scenario via runtime
+  injection, no AIO-Gym source modification.
+- **Benchmark with KPI reports.** Run PID / MPC / NMPC / RL head-to-head, ranked
+  by the composite KPI score (tracking + energy + safety). Each run produces a
+  KPI table + CSV + matplotlib plot.
+- **Fast training track.** `--time-scale 10` accelerates the physics 10×;
+  `AsyncVectorEnv` runs N cabinets in parallel — ~37× real-time with 4 envs.
+- **Sim-to-real validation gate.** Load a trained policy, run it through the IA2
+  track (real scan + iomap + L5 shield), compare the KPI to the numpy benchmark.
+- **Zero-drag contract.** `ia2_config.json` is the single source of truth — a
+  code generator emits the device/iomap TOMLs + validates the ST declarations.
+
+### Architecture
+
+```
       +-------------------------------------------+
       |        RL Agent / AIO-Gym (Strategy)      |
       +-------------------------------------------+
@@ -31,24 +62,18 @@ agent to IA2.
       +-------------------------------------------+
       |       mock_cabinet.py (Process Plant)     |
       +-------------------------------------------+
+```
 
+> **Why AIO-Gym?** IA2 does not yet ship its own MPC or RL controllers. For PID
+> and Manual it uses its native IEC 61131-3 `FB_PID` / `FB_MANSTATION` function
+> blocks. For MPC (numpy + CasADi NMPC) and RL (SAC / PPO / RLPD), the sandbox
+> imports AIO-Gym's battle-tested implementations rather than rewriting them. When
+> IA2 gains native MPC/RL, the AIO-Gym dependency can be dropped.
 
-This mirrors the project goal diagram node-for-node:
+### Process & register map
 
-| Goal-flow node | This repo |
-| --- | --- |
-| AIO-Gym (Manual / PID / MPC / **RL agent**) | the RL agent + `aio_bridge_env.py` (Gymnasium API) |
-| Coding AI Agent ("API wrapper, connects AIO-gym") | `aio_bridge_env.py` — bridges Gym ⇄ IA2 |
-| IA2 Platform Automation Engine (IronPLC / Rust) | `ia2/target/release/server` on `127.0.0.1:3001` |
-| Control Cabinet Gateway & Modbus I/O | IA2 **iomap** (`ia2_project/`) → Modbus TCP |
-| Physical Cascade Hardware (LT/TT, valves/pump/SSR) | `mock_cabinet.py` (extended to 3 tanks) |
-
-## Process & register map
-
-Canonical three-tank benchmark: Tank 1 & Tank 3 are independently pumped
-(levels) and each tank has an SSR heater (temperatures), coupled through the
-middle Tank 2 → the *cascade / decoupling* control problem. Holding registers
-(PLC `4xxxx` → 0-based address):
+Three-tank benchmark: Tank 1 & Tank 3 independently pumped, each with an SSR
+heater, coupled through the middle Tank 2 → the cascade / decoupling problem.
 
 | Register | Addr | Variable | Units | Scale |
 | --- | --- | --- | --- | --- |
@@ -56,320 +81,232 @@ middle Tank 2 → the *cascade / decoupling* control problem. Holding registers
 | 40002 | 1 | Tank 1 Temperature | °C | ×1e-2 |
 | 40003 | 2 | Tank 2 Level | m | ×1e-4 |
 | 40004 | 3 | Tank 2 Temperature | °C | ×1e-2 |
-| 40005 | 4 | Tank 3 (Decoupled) Level | m | ×1e-4 |
-| 40006 | 5 | Tank 3 (Decoupled) Temperature | °C | ×1e-2 |
-| 40007 | 6 | Actuator 1 (pump 1 drive) | frac 0–1 | ×1e-4 |
-| 40008 | 7 | Actuator 2 (pump 2 drive) | frac 0–1 | ×1e-4 |
+| 40005 | 4 | Tank 3 Level | m | ×1e-4 |
+| 40006 | 5 | Tank 3 Temperature | °C | ×1e-2 |
+| 40007 | 6 | Pump 1 drive | frac 0–1 | ×1e-4 |
+| 40008 | 7 | Pump 2 drive | frac 0–1 | ×1e-4 |
 | 40009 | 8 | Reset command (nonce) | — | ×1 |
-| 40010 | 9 | Init level — Tank 1 | m | ×1e-4 |
-| 40011 | 10 | Init level — Tank 2 | m | ×1e-4 |
-| 40012 | 11 | Init level — Tank 3 | m | ×1e-4 |
-| 40013 | 12 | Heater 1 (SSR duty, Tank 1) | frac 0–1 | ×1e-4 |
-| 40014 | 13 | Heater 2 (SSR duty, Tank 2) | frac 0–1 | ×1e-4 |
-| 40015 | 14 | Heater 3 (SSR duty, Tank 3) | frac 0–1 | ×1e-4 |
+| 40010–12 | 9–11 | Init levels (Tank 1–3) | m | ×1e-4 |
+| 40013–15 | 12–14 | Heaters 1–3 (SSR duty) | frac 0–1 | ×1e-4 |
 
-Sensors (40001–40006) are read by IA2 from the cabinet. **Actuators** are written
-by the agent each step: pumps (40007–40008) for levels and heaters (40013–40015,
-SSR duty) for temperatures — together they form the **cascade** problem (outer
-temperature loop ↔ inner level/flow loop), coupled because the thermal mass
-`m = ρ·A·h` depends on level and cold pump inflow disturbs temperature. The reset
-block (40009–40012) is written by the env between episodes: a fresh nonzero value
-in `reset_cmd` snaps the plant to the `init_h*` levels (sampled per episode) and
-holds them until `reset_cmd` returns to 0 — giving RL training a controllable
-initial-state distribution. Engineering value = raw register × scale. The single
-source of truth for this contract is [`ia2_config.json`](ia2_config.json).
+Engineering value = raw register × scale. The single source of truth is
+[`ia2_config.json`](ia2_config.json).
 
-**Timing budget (review G6):** observations come from the runtime snapshot
-(~10 Hz broadcast cache) on top of the 50 ms Modbus poll and 50 ms PLC scan, so
-expect ~200 ms of lag — fine at `control_dt ≥ 0.3 s`; the budget is recorded in
-the contract's `timing` block. The device file uses the current
-`[transport] kind = "tcp"` schema.
+### Safety model (5 layers)
 
-## Safety model
+| Layer | What | Where |
+| --- | --- | --- |
+| L1–L4 | Hardware (RCD, low/high-level switches, thermal protector) | Physical plant — not modeled |
+| **L5** | **Software shield** — clamps + interlocks every actuator request | **`threetank.st` (this repo)** |
 
-The sandbox assumes the project's 5-layer safety architecture:
+The L5 shield runs in the PLC scan loop. The agent writes `actuator*_req` /
+`heater*_req`; the PLC body clamps each to `[0, 10000]` and forces the mapped
+output to 0 when an action would soon trip hardware:
 
-- **L1–L4 are hardware** (not modeled here): 30 mA RCD on heater/pump circuits
-  (L1); a low-level switch per stage wired in series with heater/pump power for
-  dry-fire protection (L2); a high-level switch + passive overflow standpipe
-  (L3); the heater's built-in thermal protector (L4). These are the real,
-  PLC-independent backstop and the precondition for unattended operation.
-- **L5 is the software shield** — what `threetank.st` implements. The agent
-  writes `actuator*_req` / `heater*_req` (PLC-internal, API-written); the PLC
-  body clamps each request and forces the mapped output to 0 when an action
-  would soon trip hardware — pumps OFF above 0.55 m (preempt L3), heaters OFF
-  below 0.05 m (preempt L2 dry-fire) or above 70 °C (preempt L4). L5 is an
-  efficiency layer: it reduces how often L2–L4 trip (and need manual reset)
-  during RL exploration; it is **not** the safety backstop itself.
+- **Pumps OFF** above 0.55 m (preempts the high-level overflow switch)
+- **Heaters OFF** below 0.05 m (preempts dry-fire) or above 70 °C (preempts the
+  thermal protector)
 
-## Control modes
+### Control modes
 
-`aio_bridge_env.py --mode {manual,pid,mpc,rl}` selects the controller (IA2
-backend only; the Modbus training backend drives actuators directly). `mode` is
-a PLC-internal variable the `threetank.st` body `CASE`-switches on to pick each
-actuator's request source; the L5 shield then clamps/intercepts it regardless of
-mode:
-
-| Mode | Controller | Agent writes | PLC body |
-|---|---|---|---|
-| `manual` | `FB_MANSTATION` (in PLC) | `manual_*` (0–100 %) | passes manual out, bumpless to auto |
-| `pid` | `FB_PID` ×5 (in PLC) | `*_sp` setpoints | PID tracks the setpoint → actuator |
-| `mpc` | external supervisor (`controllers/run_mpc.py`) | `actuator*_req` | passes the request through |
-| `rl` | external (`aio_bridge_env`) | `actuator*_req` | passes the request through |
-
-Manual/PID run natively in the PLC (IA2 `library/process-control` FBs); MPC/RL
-are external supervisors. `FB_MANSTATION` is always in the chain so mode
-switches are bumpless. The MPC supervisors are done — numpy (`run_mpc.py`) and
-CasADi NMPC (`run_nmpc.py`); the vectorized training track is the remaining 3c.
-
-### Trying the modes
-
-The easy way — `run_mode.sh` boots the cabinet + IA2 + the PLC program, runs the
-chosen controller, and tears down on exit (one command per mode):
+`run_mode.sh` boots the cabinet + IA2 + the PLC, runs the chosen controller, and
+tears down on exit — one command per mode:
 
 ```bash
 ./run_mode.sh pid       # PLC FB_PID tracks the config setpoints
-./run_mode.sh manual    # operator manual_* -> FB_MANSTATION -> actuators
-./run_mode.sh rl        # direct actuator*_req through the L5 shield (default)
-./run_mode.sh mpc       # external numpy MPC supervisor
-./run_mode.sh nmpc      # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
-STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl; mpc/nmpc run 40)
+./run_mode.sh manual    # operator manual_* → FB_MANSTATION → actuators
+./run_mode.sh mpc       # numpy MPC (successive-linearization box-QP)
+./run_mode.sh nmpc      # CasADi + IPOPT NMPC (slow; ~1–4 s/step)
+./run_mode.sh rl        # trained SAC/PPO policy (setpoint supervisory mode)
+./run_mode.sh gui       # interactive tkinter GUI (sliders + live plot + KPI)
+./run_mode.sh modbus    # direct Modbus (skip IA2; for quick standalone tests)
 ```
 
-Under the hood (to keep the services up across several runs), boot the chain
-once, then run the env per mode:
+| Mode | Controller | Runs in | Agent writes |
+| --- | --- | --- | --- |
+| Manual | `FB_MANSTATION` | PLC | `manual_*` (0–100 %) |
+| PID | `FB_PID` × 5 | PLC | `*_sp` setpoints |
+| MPC | `MPCAgent` (numpy) | Python supervisor | `actuator*_req` |
+| NMPC | `NMPCOracle` (CasADi) | Python supervisor | `actuator*_req` |
+| RL | Trained SAC/PPO | Python supervisor | setpoints (supervisory) or `actuator*_req` |
+
+### RL training & benchmark (AIO-Gym integration)
+
+The plant is registered as a `threetank` scenario in AIO-Gym via runtime registry
+injection (`controllers/aiogym_register.py`) — so AIO-Gym's env, trainers, scorer,
+and `evaluate()` all work unchanged against our plant.
+
+**Train:**
+```bash
+python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n-envs 8
+```
+
+**Benchmark (compare all controllers on the same KPI):**
+```bash
+python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mode kpi
+# add --nmpc for the CasADi NMPC oracle (slow)
+```
+
+Output (AIO-Gym-style KPI table, ranked):
+```
+=== Benchmark (mode=kpi, 14 eps x 200 steps) ===
+controller     kpi   ±std temp_err  lvl_cm excess_kwh interlock
+---------------------------------------------------------------
+RL-SAC       97.13   0.52     0.56    1.83      0.015      0.00
+MPC          86.75   1.81     3.17    2.74      0.262      0.00
+PID          84.18   2.03     3.80    2.35      0.352      0.00
+```
+
+> NMPC is excluded by default (CasADi + IPOPT is ~1–4 s/step, adding ~20 min to
+> the benchmark). Include it with `--nmpc`:
+> ```bash
+> python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --nmpc --reward-mode kpi
+> ```
+
+**Validate (sim-to-real gate — trained policy on the real IA2 track):**
+```bash
+./run_mode.sh rl     # runs the policy through the 50 ms scan + L5 shield
+```
+
+Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/`.
+
+### Manual control GUI
 
 ```bash
-# 1. boot the chain (once)
-python3 mock_cabinet.py &                           # plant on 127.0.0.1:5020
-ia2/target/release/server --bind 127.0.0.1:3001 &  # IA2 HTTP API
-ia2/target/release/cs project open ia2_project
-ia2/target/release/cs run                           # compile + start the scan loop
-
-# 2. run the env in a mode (pick one):
-python3 aio_bridge_env.py --backend ia2 --mode pid     --steps 20
-python3 aio_bridge_env.py --backend ia2 --mode manual  --steps 20
-python3 aio_bridge_env.py --backend ia2 --mode rl      --steps 20
-python3 controllers/run_mpc.py                          # numpy MPC
-python3 controllers/run_nmpc.py                         # CasADi NMPC
+./run_mode.sh gui
 ```
 
-What to watch in the log:
-- `--mode pid` writes the setpoints from `ia2_config.json` (`control.setpoints_m`
-  / `setpoints_c`); the PLC `FB_PID` loops track them — `levels(m)` and `temps(C)`
-  converge toward the setpoints and the reward climbs (e.g. −2.6 → −0.6).
-- `--mode manual` writes (random, in the demo) `manual_*` operator outputs
-  through `FB_MANSTATION`; the actuators follow them directly.
-- `--mode rl` is the direct-actuator path — the agent writes `actuator*_req`,
-  which the L5 shield clamps before the cabinet.
+Launches a tkinter desktop window (rendered on Windows via WSLg):
 
-`--backend modbus` bypasses IA2 entirely (talks to the cabinet directly) and
-ignores `--mode` — it's the fast training path, not for mode testing.
+- **5 sliders** (pump/heater duty, 0–100 %, with live % readout)
+- **Mode dropdown** — switch between Manual / PID / MPC / RL on the fly
+- **Reset button** — new random init levels
+- **Real-time plot** — levels + temps with setpoint lines
+- **Live KPI readout** — score, temp error, level error
 
-## Training track (G3/G5)
-
-For RL **training** (not validation), bypass IA2 and run many plant-seconds per
-wall-second: time-scale the cabinet (G3) + run N cabinets in parallel (G5).
+### Training track (faster than real-time)
 
 ```bash
-# one cabinet kx faster than real-time (G3) — physics dt unchanged, just a shorter sleep
-python3 mock_cabinet.py --time-scale 10
-
-# N cabinets on N ports in an AsyncVectorEnv (G5) — ~kN x real-time
-python3 controllers/train_rl.py --n-envs 4 --time-scale 10 --steps 200      # random policy (throughput check)
-python3 controllers/train_rl.py --algo ppo --total-timesteps 20000          # SB3 PPO (pip install stable_baselines3)
+python3 mock_cabinet.py --time-scale 10                          # 10× physics
+python3 controllers/train_rl.py --n-envs 4 --time-scale 10        # vectorized (AsyncVectorEnv)
 ```
 
-`aio_vec_env.py` spawns N cabinet subprocesses (ports 5020..5020+N-1) + an
-`AsyncVectorEnv` (one worker process per env, so the per-step sleeps overlap).
-The env's wall-clock step is `plant_dt / time_scale`, keeping the plant-time
-control interval at `plant_dt` (same as real-time deployment). Verified: 4 envs ×
-10x ≈ 37x real-time (800 plant-steps in ~11s wall). The IA2 validation track
-(the control modes above) stays single-instance — one PROGRAM per IA2 server.
+~37× real-time with 4 envs × 10× time-scale. The IA2 validation track stays
+single-instance (one PROGRAM per server).
 
-## Repository layout
+### Repository layout
 
 ```
 cascade-control-sandbox/
-│
-├── ia2_config.json        # the single contract — register map, scales, setpoints
-├── mock_cabinet.py        # Phase 3 · pymodbus TCP plant on :5020 (--time-scale k for training)
-├── aio_bridge_env.py      # Phase 5 · Gymnasium env (ia2 / edge / modbus backends)
-├── aio_vec_env.py         # Phase 3c · vectorized training env (N cabinets, AsyncVectorEnv)
+├── ia2_config.json            # single contract — register map, scales, setpoints
+├── mock_cabinet.py            # pymodbus TCP plant on :5020 (--time-scale k)
+├── aio_bridge_env.py          # Gymnasium env (ia2 / edge / modbus backends; --mode)
+├── aio_vec_env.py             # vectorized training env (N cabinets, AsyncVectorEnv)
+├── run_mode.sh                # boot + run one controller + teardown (one command)
 ├── tools/
-│   └── gen_ia2_artifacts.py   # contract -> ia2_project device/iomap TOMLs (+ ST VAR check)
-├── controllers/           # Phase 3b/3c · external supervisors + RL training
-│   ├── threetank_model.py     # numpy 3-tank plant (MPCAgent/NMPC interface; mirrors mock_cabinet)
-│   ├── mpc_agent.py           # MPCAgent (copied from AIO-Gym) — numpy box-QP MPC
-│   ├── run_mpc.py             # supervisor: IA2 snapshot -> MPC -> actuator*_req
-│   ├── nmpc_oracle.py         # NMPCOracle (CasADi+IPOPT) + symbolic _f_threetank plant
-│   ├── run_nmpc.py            # supervisor: IA2 snapshot -> NMPC -> actuator*_req
-│   └── train_rl.py            # Phase 3c · vectorized + time-scaled RL training (random / SB3 PPO)
-├── tests/                # smoke tests — ./tests/run_smoke.sh boots the cabinet + runs them
-│   ├── smoke_reset.py        # reset_cmd + init_h* snap levels to targets
-│   ├── smoke_heater.py       # heater raises temp; cold pump inflow slows it
-│   ├── smoke_env.py          # env reset/step/reward over the modbus backend
-│   └── run_smoke.sh          # one-command runner
-├── ia2_project/           # Phase 5 · IA2 project (PLC + device + iomap + tasks)
-│   ├── project.toml
-│   ├── devices/
-│   │   └── mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device, 15 channels
-│   ├── iomap.toml              # AUTO-GENERATED — variable ⇄ channel bindings
-│   ├── tasks.toml              # 50 ms cyclic task running ThreeTank
+│   └── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
+├── controllers/
+│   ├── threetank_model.py     # numpy 3-tank plant (AIO-Gym model interface)
+│   ├── mpc_agent.py           # numpy MPC (box-QP)
+│   ├── nmpc_oracle.py         # CasADi+IPOPT NMPC (symbolic plant)
+│   ├── run_mpc.py             # MPC supervisor (IA2 track)
+│   ├── run_nmpc.py            # NMPC supervisor (IA2 track)
+│   ├── run_rl.py              # RL supervisor (trained policy on IA2 track)
+│   ├── train_sb3.py           # SAC/PPO training (AIO-Gym env + SB3)
+│   ├── train_rl.py            # vectorized training (Modbus track)
+│   ├── benchmark.py           # KPI benchmark (PID/MPC/NMPC/RL ranked)
+│   ├── aiogym_register.py     # register "threetank" in AIO-Gym's registries
+│   ├── validate_policy.py     # sim-to-real validation gate
+│   ├── rollout_report.py      # shared KPI table + CSV + PNG plot
+│   └── manual_gui.py          # tkinter manual control GUI
+├── tests/
+│   ├── smoke_reset.py         # reset snaps levels to targets
+│   ├── smoke_heater.py        # heater raises temp; cold pump inflow slows it
+│   ├── smoke_env.py           # env reset/step/reward over Modbus
+│   └── run_smoke.sh           # one-command runner (boots + tests + teardown)
+├── ia2_project/               # IA2 PLC project (IEC 61131-3 ST + device + iomap)
+│   ├── devices/mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device
+│   ├── iomap.toml                  # AUTO-GENERATED — variable ⇄ channel bindings
+│   ├── tasks.toml                  # 50 ms cyclic task
 │   └── pous/
-│       ├── threetank.st        # IEC 61131-3 ST: mode selector (CASE) + L5 shield
-│       ├── fb_pid.st           # vendored from ia2/library/process-control (FB_PID)
-│       └── fb_manstation.st    # vendored from ia2/library/process-control (FB_MANSTATION)
-├── ia2/                   # Vendored IA2 engine — gitignored; clone separately (Setup step 1)
-├── requirements.txt       # Python deps (pymodbus, gymnasium, numpy)
-├── run_mode.sh            # Boot + run one controller (pid/manual/mpc/nmpc/rl/modbus) + teardown
-├── .gitignore
+│       ├── threetank.st            # mode selector (CASE) + L5 software shield
+│       ├── fb_pid.st               # vendored from ia2/library/process-control
+│       └── fb_manstation.st        # vendored from ia2/library/process-control
+├── ia2/                       # vendored IA2 engine (gitignored; clone separately)
+├── requirements.txt
 └── README.md
 ```
 
-## Setup (WSL2 / Linux)
+### Setup
+
+**Common prerequisites (all OS):**
 
 ```bash
-# 1. clone + build IA2 (one-time; build ~10–15 min). ia2/ is gitignored, so a
-#    fresh checkout of THIS repo won't include it — vendor it explicitly:
-git clone --recursive https://github.com/supcon-international/ia2 ia2
-cd ia2 && cargo build --release && cd ..
-ls ia2/target/release/cs ia2/target/release/server    # verify binaries
+# clone this repo
+git clone https://github.com/winwin2671/cascade-control-sandbox
+cd cascade-control-sandbox
 
-# 2. Python deps (no sudo needed)
+# Python deps (no sudo needed)
 pip3 install --user -r requirements.txt
 
-# 3. The IA2 device/iomap TOMLs are generated from ia2_config.json. Regenerate
-#    after any contract edit (also used as a CI drift check):
-python3 tools/gen_ia2_artifacts.py          # regenerate
-python3 tools/gen_ia2_artifacts.py --check  # exit 1 if committed TOMLs are stale
+# clone AIO-Gym as a sibling (imported via sys.path — no pip install needed)
+git clone https://github.com/supcon-international/AIO-Gym ../AIO-Gym
+
+# clone + build IA2 (one-time; ~10–15 min; needs Rust toolchain — rustup.rs)
+git clone --recursive https://github.com/supcon-international/ia2 ia2
+cd ia2 && cargo build --release && cd ..
+
+# regenerate the IA2 device/iomap TOMLs from the contract
+python3 tools/gen_ia2_artifacts.py
 ```
 
-## Run
+**RL training (optional — heavy deps):**
 
 ```bash
-# Full chain — IA2 backend (RL agent -> Gym -> IA2 -> iomap -> Modbus -> plant)
-./run_mode.sh rl              # or:  STEPS=40 ./run_mode.sh rl
-
-# Direct Modbus backend (skip IA2; for quick standalone tests)
-./run_mode.sh modbus
-
-# All control modes (pid/manual/mpc/nmpc): see "Control modes" below.
-# Edge backend (project deployed on a remote edge runtime — G4 route shape):
-python3 aio_bridge_env.py --backend edge:<edge_name>   # needs a registered, deployed edge (cs edge / cs deploy)
+pip3 install --user torch stable_baselines3    # see CUDA notes per-OS below
 ```
 
-Manually, the pieces are:
+**OS-specific notes:**
+
+| OS | IA2 build | CUDA (for RL training) | Manual GUI |
+| --- | --- | --- | --- |
+| **WSL2 (Windows)** | `cargo build --release` in WSL | `pip install torch` (auto-detects CUDA via WSL GPU passthrough — tested on GTX 1650 Ti) | `sudo apt install python3-tk` (renders via WSLg on Windows 11) |
+| **Linux (native)** | `cargo build --release` | `pip install torch` (CUDA if NVIDIA GPU present, else CPU) | `sudo apt install python3-tk` or `python3-tkinter` |
+| **macOS** | `cargo build --release` | `pip install torch` (CPU — MPS per-op overhead dominates small MLPs; use `--device cpu`) | Bundled with system Python (no install needed) |
+
+> The `best_device()` helper in `train_sb3.py` auto-selects CUDA → CPU. Override
+> with `--device mps` if you want to try Apple Silicon.
+
+### Quick start
 
 ```bash
-python3 mock_cabinet.py                          # plant on 127.0.0.1:5020
-ia2/target/release/server --bind 127.0.0.1:3001  # IA2 HTTP API
-ia2/target/release/cs project open ia2_project   # load the PLC project
-ia2/target/release/cs run                        # compile + start the scan loop
-curl -s http://127.0.0.1:3001/api/runtime/snapshot   # live variable values
-python3 aio_bridge_env.py --backend ia2          # RL rollout
+# try PID control (boots everything, runs, tears down)
+./run_mode.sh pid
+
+# benchmark all controllers
+python3 controllers/benchmark.py --rl controllers/sac_threetank.zip
+
+# interactive manual control GUI
+./run_mode.sh gui
+
+# run the smoke tests
+./tests/run_smoke.sh
 ```
 
-> Only **one** controller may drive the cabinet at a time. The IA2 backend
-> starts IA2 (which owns the actuator registers via the iomap); the Modbus
-> backend talks to the cabinet directly — don't run both writes simultaneously.
-
-## Smoke tests
-
-Self-contained checks that the simulated components behave — for CI and for
-anyone cloning the repo. They read register addresses/scales from the contract
-(no hardcoding) and need only `mock_cabinet.py`:
+### Smoke tests
 
 ```bash
-./tests/run_smoke.sh          # boots the cabinet, runs all three, tears down
+./tests/run_smoke.sh     # boots the cabinet, runs all three, tears down
 ```
 
-- `tests/smoke_reset.py` — `reset_cmd` + `init_h*` snap tank levels to requested targets (two different targets).
-- `tests/smoke_heater.py` — a heater raises its tank's temperature; cold pump inflow slows it (the cascade disturbance).
-- `tests/smoke_env.py` — the Gym env resets (randomized init levels), steps, and rewards over the Modbus backend.
+- `smoke_reset.py` — reset snaps tank levels to requested targets
+- `smoke_heater.py` — heater raises temp; cold pump inflow slows it (the cascade)
+- `smoke_env.py` — env resets (randomized), steps, and rewards over Modbus
 
-(The full IA2-in-the-loop chain is exercised by [`./run_mode.sh rl`](run_mode.sh).)
+### Deployment (sim → hardware)
 
-## Verification
-
-- **Phase 2** — `cs 0.0.1` and `ia2-server` built (`ia2/target/release/`).
-- **Phase 3** — `mock_cabinet.py` smoke-tested: writing pump commands raises the
-  levels (Tank1/Tank3) and the coupling fills Tank2; temps relax toward supply.
-- **Phase 5 (Modbus backend)** — `aio_bridge_env.py` Gym loop (reset/step/reward)
-  drives the plant directly; actions → level changes → reward.
-- **Phase 5 (IA2 backend)** — the **full chain** verified: env reads
-  `/api/runtime/snapshot` and writes `/api/runtime/variables/{name}`; IA2's iomap
-  bridges to the cabinet over Modbus TCP; the agent's actions move the levels and
-  the reward climbs toward the setpoints.
-- **Contract codegen (review item 5)** — `tools/gen_ia2_artifacts.py` regenerates
-  the IA2 device/iomap TOMLs from `ia2_config.json` (`--check` is drift-clean), and
-  `mock_cabinet.py` is config-driven too — so the register map is single-sourced
-  across the cabinet, the iomap, the ST, and the env.
-- **Edge backend (review item 4 / G4)** — `--backend edge:<name>` targets an
-  edge-deployed project via the dev-server proxy (`GET /api/edges/{name}/status`,
-  `POST /api/edges/{name}/runtime/write` body `{name,value}`). Route shapes
-  verified against the IA2 source and confirmed by a route-hit; live end-to-end
-  validation is pending a real edge deployment.
-- **Episode reset (review item 1 / G1)** — `reset_cmd` (40009) + `init_h1/2/3`
-  (40010–40012) give the env a controllable initial-state distribution: `reset()`
-  samples levels, writes them, and pulses a nonce on `reset_cmd`; the cabinet
-  snaps to the init levels and holds. Verified end-to-end through IA2 (3 episodes,
-  randomized init levels applied exactly) and via direct Modbus.
-- **Heated tanks / cascade loop (review item 2 / G2)** — `heater1/2/3`
-  (40013–40015, SSR duty) + a first-law thermal model
-  `m·c_p·dT/dt = Q_heat − Q_loss + Σq_in·(T_src − T)` with level-coupled thermal
-  mass (`m = ρ·A·h`) make the repo name true: the agent controls 2 pumps (levels)
-  + 3 heaters (temps) against the level→temp coupling, and the reward tracks
-  both. Verified: a heater raises its tank's temperature and a cold pump inflow
-  slows it (the cascade disturbance); a full 5-action rollout runs through IA2.
-- **Timing budget + transport (review item 6 / G6)** — the contract states the
-  observation-lag budget (~200 ms: 50 ms Modbus poll + 50 ms PLC scan + ~10 Hz
-  snapshot cache; `min_control_dt` 0.3 s), and the device TOML uses the current
-  `[transport] kind = "tcp"` schema. Verified: `cs project check` + a full chain run.
-- **L5 software shield (review item 3)** — `threetank.st` is now a safety layer,
-  not pass-through: the agent writes `actuator*_req` / `heater*_req` and the PLC
-  body clamps + interlocks (high-level pump cutoff; low-level dry-fire + high-temp
-  heater cutoff) before assigning the mapped outputs. Verified: driving pump1 full
-  past the 0.55 m cutoff forces `actuator1 = 0` while `actuator1_req` stays 10000
-  (preempts the L3 hardware trip).
-- **Control-mode selector (Phase 3 / 3a)** — `--mode {manual,pid,mpc,rl}` selects
-  the controller via a PLC `mode` variable; `threetank.st` `CASE`-switches the
-  request source (Manual/PID via vendored `FB_PID`/`FB_MANSTATION`; MPC/RL via
-  `actuator*_req`) and the L5 shield clamps it. Verified: PID tracks the config
-  setpoints (reward −2.6→−0.6), manual follows the operator output; the smoke
-  suite still passes. (MPC supervisor + vectorized training track = 3b/3c.)
-- **MPC supervisor (Phase 3 / 3b, numpy)** — `controllers/run_mpc.py` runs AIO-Gym's
-  `MPCAgent` (copied) against the live IA2 plant with a 3-tank prediction model
-  (`controllers/threetank_model.py`, mirroring `mock_cabinet`). Verified: it drives
-  levels + temps to the config setpoints — reward −2.75 → −0.03 over 40 steps,
-  predictively backing off the actuators as it nears the target. (CasADi NMPC and
-  the vectorized training track remain.)
-- **NMPC supervisor (Phase 3 / 3b, CasADi)** — `controllers/run_nmpc.py` runs the
-  CasADi+IPOPT nonlinear MPC (`NMPCOracle` copied from AIO-Gym) with a symbolic
-  3-tank plant (`_f_threetank`, smooth Torricelli via `ca.fmax`+`ca.sqrt`). Verified:
-  tracks the setpoints — reward −2.65 → −0.008 over 40 steps (levels → 0.45/0.40 m,
-  temps → 45 °C). Note: IPOPT's solve time (~1–4 s) exceeds the 0.5 s control step,
-  so the NMPC's prediction `dt` is set to the loop time (~2 s) to avoid overshoot;
-  it's the slow oracle baseline, not for real-time training (use the numpy MPC for
-  that). (The vectorized training track = 3c.)
-- **Training track (Phase 3 / 3c, G3+G5)** — `mock_cabinet.py --time-scale k` (G3,
-  verified ~12x at k=10) + `aio_vec_env.py` (N cabinets on N ports, AsyncVectorEnv,
-  G5). `controllers/train_rl.py` runs a random policy or SB3 PPO. Verified: 4 envs ×
-  10x ≈ 37x real-time (800 plant-steps in ~11s wall).
-
-## Workflow integration & deployment
-
-- **Agent tooling** — the IA2 agent skill is bundled at
-  [`.claude/skills/industrial-automation-skill`](.claude/skills/industrial-automation-skill);
-  load it into Claude Code / Cursor to drive the whole stack — author/compile/run
-  PLC programs, force variables, debug — through `cs` and the HTTP API.
-- **End-to-end testing** — the validated data flow is:
-  `Agent decision → AIO-Gym (Gymnasium) call → IA2 runtime → Modbus TCP →
-  simulated tank response` (see *Architecture* and *Verification* above).
-- **Deployment readiness (sim → hardware)** — the simulation is *hardware-ready*.
-  IA2 fronts the plant through the device config rather than in code, so moving
-  from the local simulator to a physical PLC is a configuration change: repoint
-  `ia2_project/devices/mock_cabinet.toml` at the PLC's IP **and** align its
-  register addresses/scales to the real I/O map (e.g. the LT101/201, TT101/201
-  sensors and valve/pump/SSR actuators). The PLC program, iomap, and
-  `aio_bridge_env.py` then run unchanged against real hardware.
+IA2 fronts the plant through the device config, not in code. Moving from the local
+simulator to a physical PLC is a configuration change: repoint
+`ia2_project/devices/mock_cabinet.toml` at the PLC's IP and align its register
+addresses/scales to the real I/O map. The PLC program, iomap, and bridge env run
+unchanged against real hardware.

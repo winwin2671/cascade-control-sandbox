@@ -12,6 +12,7 @@
 #   ./run_mode.sh mpc            # external numpy MPC supervisor (run_mpc.py)
 #   ./run_mode.sh nmpc           # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
 #   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
+#   ./run_mode.sh gui            # interactive manual control GUI (tkinter sliders + live plot)
 #   STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
@@ -24,7 +25,7 @@ MODE="${1:-rl}"
 STEPS="${STEPS:-20}"
 
 case "$MODE" in
-  pid|manual|rl|mpc|nmpc|modbus) ;;
+  pid|manual|rl|mpc|nmpc|modbus|gui) ;;
   *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus]  (got: $MODE)"; exit 2 ;;
 esac
 
@@ -57,14 +58,26 @@ if [ "$MODE" != "modbus" ]; then
   "$IA2/cs" run
 fi
 
-echo "==> running mode=$MODE" $([ "$MODE" = mpc ] || [ "$MODE" = nmpc ] || echo "(steps=$STEPS)")
+echo "==> running mode=$MODE" $([ "$MODE" = mpc ] || [ "$MODE" = nmpc ] || [ "$MODE" = gui ] || echo "(steps=$STEPS)")
 case "$MODE" in
   modbus)
     python3 -u "$ROOT/aio_bridge_env.py" --backend modbus --steps "$STEPS" ;;
-  pid|manual|rl)
+  pid|manual)
     python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
+  rl)
+    POLICY="$ROOT/controllers/sac_threetank.zip"
+    if [ -f "$POLICY" ]; then
+      python3 -u "$ROOT/controllers/run_rl.py" --policy "$POLICY" \
+        --action-mode "${RL_ACTION_MODE:-setpoint}" --steps "${STEPS:-40}"
+    else
+      echo "(no trained policy at $POLICY; running random RL demo)"
+      python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode rl --steps "$STEPS"
+    fi
+    ;;
   mpc)
     python3 -u "$ROOT/controllers/run_mpc.py" ;;
   nmpc)
     python3 -u "$ROOT/controllers/run_nmpc.py" ;;
+  gui)
+    python3 -u "$ROOT/controllers/manual_gui.py" ;;
 esac

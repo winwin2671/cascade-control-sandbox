@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -45,6 +47,8 @@ def main():
 
     obs, _ = env.reset()
     LOG.info("NMPC supervisor start — sp levels=%s m, temps=%s degC", sp["h_sp"], sp["t_sp"])
+    rewards = []
+    steps_data = []
 
     for k in range(40):
         meas = {"levels": [float(obs[0]), float(obs[2]), float(obs[4])],
@@ -66,7 +70,15 @@ def main():
                      tp.get("tank1_temp", float("nan")),
                      tp.get("tank2_temp", float("nan")),
                      tp.get("tank3_temp", float("nan")), reward)
+        rewards.append(reward)
+        steps_data.append({
+            "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
+            "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
+            "action": [float(x) for x in a], "reward": reward})
     env.close()
+    LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
+    from controllers.rollout_report import report
+    report(steps_data, tag="nmpc")
 
 
 if __name__ == "__main__":
