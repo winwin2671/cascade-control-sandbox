@@ -10,7 +10,23 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AIO_GYM = str(Path.home() / "projects" / "AIO-Gym")
+
+
+def find_aiogym() -> str:
+    """Resolve the AIO-Gym repo path. Checks: $AIO_GYM_PATH → sibling clone
+    (../AIO-Gym, per the README setup) → ~/projects/AIO-Gym (WSL dev default)."""
+    import os
+    for candidate in [
+        os.environ.get("AIO_GYM_PATH"),
+        str(ROOT.parent / "AIO-Gym"),
+        str(Path.home() / "projects" / "AIO-Gym"),
+    ]:
+        if candidate and Path(candidate, "aiogym", "__init__.py").exists():
+            return candidate
+    return str(Path.home() / "projects" / "AIO-Gym")  # fallback (error surfaces on import)
+
+
+AIO_GYM = find_aiogym()
 for _p in (str(ROOT), AIO_GYM):
     if _p not in sys.path:
         sys.path.insert(0, _p)

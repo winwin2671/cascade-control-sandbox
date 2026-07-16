@@ -23,9 +23,6 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-AIO_GYM = str(Path.home() / "projects" / "AIO-Gym")
-if AIO_GYM not in sys.path:
-    sys.path.insert(0, AIO_GYM)
 
 
 def report(steps_data: list[dict], tag: str = "rollout",

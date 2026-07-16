@@ -26,7 +26,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path.home() / "projects" / "AIO-Gym"))
 
 import numpy as np  # noqa: E402
 from controllers.aiogym_register import register_threetank  # noqa: E402
@@ -67,6 +66,15 @@ def main():
     cls = SAC if args.algo == "sac" else PPO
     model = cls.load(args.policy)
     LOG.info("loaded policy: %s (%s)", args.policy, args.algo)
+
+    # B2 fix: detect action mode from the metadata sidecar
+    import json
+    meta_path = args.policy.replace(".zip", ".json")
+    if Path(meta_path).exists():
+        meta = json.load(open(meta_path))
+        if meta.get("action_mode") == "setpoint":
+            LOG.warning("Policy trained in setpoint mode — use `./run_mode.sh rl` instead "
+                        "(run_rl.py handles setpoint → *_sp). This validator assumes actuator mode.")
 
     plant = ThreeTankModel()
     scorer = KPIScorer(plant)

@@ -44,6 +44,13 @@ def main():
     ap.add_argument("--control-dt", type=float, default=0.5)
     args = ap.parse_args()
 
+    # B2 fix: auto-detect action mode from the metadata sidecar (saved by train_sb3.py)
+    meta_path = args.policy.replace(".zip", ".json")
+    if Path(meta_path).exists():
+        meta = json.load(open(meta_path))
+        if "action_mode" in meta:
+            args.action_mode = meta["action_mode"]
+
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("pymodbus").setLevel(logging.WARNING)

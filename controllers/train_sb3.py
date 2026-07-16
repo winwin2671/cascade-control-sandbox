@@ -79,7 +79,13 @@ def main():
 
     out = args.out or str(ROOT / "controllers" / f"{args.algo}_threetank")
     model.save(out)
-    print(f"\nsaved {out}.zip")
+    # save metadata sidecar (B2 fix: lets validate_policy.py + run_rl.py auto-detect
+    # the action mode — setpoint vs actuator — instead of guessing wrong)
+    import json as _json
+    with open(out + ".json", "w") as f:
+        _json.dump({"action_mode": args.action_mode, "reward_mode": args.reward_mode,
+                     "algo": args.algo}, f)
+    print(f"\nsaved {out}.zip  +  {out}.json (action_mode={args.action_mode})")
 
 
 if __name__ == "__main__":

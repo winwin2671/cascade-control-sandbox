@@ -177,6 +177,34 @@ PID          84.18   2.03     3.80    2.35      0.352      0.00
 
 Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/`.
 
+### Training & validation workflow
+
+The end-to-end flow — train on the fast numpy plant, benchmark against
+classical controllers, then validate the winner on the real IA2 track:
+
+```
+  1. TRAIN                          2. BENCHMARK                      3. VALIDATE
+  ─────────                         ────────────                      ──────────
+  train_sb3.py                      benchmark.py                      run_mode.sh rl
+  SAC on numpy plant                PID / MPC / RL ranked             policy on IA2 track
+  (in-process, fast)                by KPI score                      (50 ms scan + L5 shield)
+       │                                  │                                  │
+       ▼                                  ▼                                  ▼
+  sac_threetank.zip               KPI table + CSV + PNG              sim-to-real gap
+  + .json (action mode)           (controllers/runs/)                (numpy KPI vs IA2 KPI)
+```
+
+```bash
+# step 1 — train SAC on the numpy plant (fast; ~5 min for 500k steps on GPU)
+python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n-envs 8
+
+# step 2 — benchmark: PID vs MPC vs RL on the same KPI yardstick
+python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mode kpi
+
+# step 3 — validate: run the trained policy on the real IA2 track (boots everything)
+./run_mode.sh rl
+```
+
 ### Manual control GUI
 
 ```bash
@@ -191,15 +219,50 @@ Launches a tkinter desktop window (rendered on Windows via WSLg):
 - **Real-time plot** — levels + temps with setpoint lines
 - **Live KPI readout** — score, temp error, level error
 
-### Training track (faster than real-time)
+### Training track (Modbus, secondary path)
+
+> **`train_rl.py` (Modbus) vs `train_sb3.py` (numpy):** `train_sb3.py` is the
+> **primary training path** — it trains on the numpy `ThreeTankModel`
+> (in-process, thousands of steps/s). `train_rl.py` is a **secondary path** —
+> it trains on the actual `mock_cabinet.py` via Modbus TCP (slower, but
+> verifies the mock_cabinet physics match the numpy model, and tests training
+> directly against the simulated hardware). Most users should use `train_sb3.py`
+> for training; `train_rl.py` for physics-drift testing.
 
 ```bash
-python3 mock_cabinet.py --time-scale 10                          # 10× physics
-python3 controllers/train_rl.py --n-envs 4 --time-scale 10        # vectorized (AsyncVectorEnv)
+# random policy — throughput check (gymnasium AsyncVectorEnv)
+python3 controllers/train_rl.py --n-envs 4 --time-scale 10 --steps 200
+
+# PPO training on the Modbus track (SB3 DummyVecEnv over N cabinets)
+python3 controllers/train_rl.py --algo ppo --n-envs 4 --time-scale 10 \
+    --total-timesteps 50000 --device cpu
+
+# SAC training on the Modbus track
+python3 controllers/train_rl.py --algo sac --n-envs 4 --time-scale 10 \
+    --total-timesteps 50000 --device cuda
+
+# one cabinet k× faster (for standalone testing)
+python3 mock_cabinet.py --time-scale 10
 ```
 
-~37× real-time with 4 envs × 10× time-scale. The IA2 validation track stays
-single-instance (one PROGRAM per server).
+> **PPO on CPU:** small MLP policies (256×256) train faster on CPU than GPU
+> (per-op overhead dominates tiny matmuls). Pass `--device cpu` for PPO; SAC
+> benefits from CUDA (`--device cuda`).
+
+After training on the Modbus track, the **benchmark + validation steps are
+identical** to the primary workflow above — just point at the Modbus-trained
+policy:
+
+```bash
+# benchmark (same KPI scorer, same plant comparison)
+python3 controllers/benchmark.py --rl controllers/sac_cascade.zip --reward-mode kpi
+
+# validate on IA2 (same sim-to-real gate)
+python3 controllers/run_rl.py --policy controllers/sac_cascade.zip --steps 100
+```
+
+~37× real-time with 4 envs × 10× time-scale (random throughput check). The IA2
+validation track stays single-instance (one PROGRAM per server).
 
 ### Repository layout
 
@@ -246,7 +309,10 @@ cascade-control-sandbox/
 
 ### Setup
 
-**Common prerequisites (all OS):**
+**Prerequisites:** Python ≥3.10 (pymodbus ≥3.13 floor — check with `python3 --version`).
+Rust toolchain ([rustup.rs](https://rustup.rs)) for building IA2.
+
+**Common (all OS):**
 
 ```bash
 # clone this repo

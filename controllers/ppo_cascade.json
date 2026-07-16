@@ -1,0 +1,1 @@
+{"action_mode": "actuator", "reward_mode": "track", "algo": "ppo", "track": "modbus"}
