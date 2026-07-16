@@ -42,6 +42,10 @@ echo "==> starting mock_cabinet (Modbus TCP plant on :5020)"
 python3 -u "$ROOT/mock_cabinet.py" --log-every 0 &
 CAB_PID=$!
 sleep 2
+if ! kill -0 "$CAB_PID" 2>/dev/null; then
+  echo "ERROR: mock_cabinet failed to start (port 5020 in use?). Aborting."
+  exit 1
+fi
 
 if [ "$MODE" != "modbus" ]; then
   echo "==> starting ia2-server (:3001)"

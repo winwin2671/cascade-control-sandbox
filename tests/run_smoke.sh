@@ -14,6 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PYTHON:-python3}"
 HOST="${CABINET_HOST:-127.0.0.1}"
 PORT="${CABINET_PORT:-5020}"
+export CABINET_HOST="$HOST" CABINET_PORT="$PORT"   # so the test scripts read the same port
 
 echo "==> starting mock_cabinet (${HOST}:${PORT})"
 "$PY" -u "$ROOT/mock_cabinet.py" --host "$HOST" --port "$PORT" --log-every 0 &
@@ -27,6 +28,10 @@ cleanup() {
 trap cleanup EXIT
 
 sleep 1   # let it bind (each test also retries its own connection)
+if ! kill -0 "$CAB" 2>/dev/null; then
+    echo "ERROR: mock_cabinet failed to start (port ${PORT} in use?). Aborting."
+    exit 1
+fi
 
 rc=0
 for t in smoke_reset smoke_heater smoke_env; do

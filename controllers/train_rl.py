@@ -102,7 +102,7 @@ def main() -> None:
         print(f"==> starting {args.n_envs} cabinets at {args.time_scale}x (for SB3 {args.algo.upper()})...")
         pool = CabinetPool(args.n_envs, args.time_scale).start()
         try:
-            rc = run_sb3(args.algo, pool, args.n_envs, 5020, args.time_scale,
+            rc = run_sb3(args.algo, pool, args.n_envs, 5200, args.time_scale,
                          args.plant_dt, args.total_timesteps, device=args.device)
         finally:
             pool.close()

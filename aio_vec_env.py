@@ -42,7 +42,7 @@ class CabinetPool:
     """Spawn / hold / tear down N mock_cabinet subprocesses on distinct ports."""
 
     def __init__(self, n: int, time_scale: float = 1.0,
-                 base_port: int = 5020, host: str = "127.0.0.1"):
+                 base_port: int = 5200, host: str = "127.0.0.1"):
         self.n = n
         self.time_scale = time_scale
         self.base_port = base_port
@@ -71,9 +71,22 @@ class CabinetPool:
         from pymodbus.client import ModbusTcpClient
         deadline = time.time() + timeout
         for i in range(self.n):
+            # C3 fix: verify the child process is alive before connecting — if it
+            # died (e.g. bind failure from a stale cabinet on the port), abort early
+            # instead of silently attaching to a foreign cabinet.
+            if self.procs[i].poll() is not None:
+                self.close()
+                raise RuntimeError(
+                    f"cabinet {i} (pid {self.procs[i].pid}) exited immediately — "
+                    f"port {self.base_port + i} likely in use by a stale process")
             cl = ModbusTcpClient(host=self.host, port=self.base_port + i)
             ok = False
             while time.time() < deadline:
+                if self.procs[i].poll() is not None:
+                    self.close()
+                    raise RuntimeError(
+                        f"cabinet {i} (pid {self.procs[i].pid}) died during startup "
+                        f"on port {self.base_port + i}")
                 if cl.connect():
                     ok = True
                     break

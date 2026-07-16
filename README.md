@@ -122,7 +122,7 @@ tears down on exit — one command per mode:
 ./run_mode.sh pid       # PLC FB_PID tracks the config setpoints
 ./run_mode.sh manual    # operator manual_* → FB_MANSTATION → actuators
 ./run_mode.sh mpc       # numpy MPC (successive-linearization box-QP)
-./run_mode.sh nmpc      # CasADi + IPOPT NMPC (slow; ~1–4 s/step)
+./run_mode.sh nmpc      # CasADi + IPOPT NMPC (offline oracle; ~1–4 s/step)
 ./run_mode.sh rl       # trained SAC/PPO policy (setpoint supervisory mode)
 ./run_mode.sh gui       # interactive tkinter GUI (sliders + live plot + KPI)
 ./run_mode.sh modbus    # direct Modbus (skip IA2; for quick standalone tests)

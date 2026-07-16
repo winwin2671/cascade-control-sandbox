@@ -35,7 +35,10 @@ async def _connect(cl):
 async def main() -> int:
     cfg, reg = contract()
     m = cfg["modbus"]
-    host, port, unit = m["host"], int(m["port"]), int(m["unit_id"])
+    import os
+    host = os.environ.get("CABINET_HOST", m["host"])
+    port = int(os.environ.get("CABINET_PORT", m["port"]))
+    unit = int(os.environ.get("CABINET_UNIT", m["unit_id"]))
     lscale, tscale = reg["tank1_level"]["scale"], reg["tank1_temp"]["scale"]
 
     cl = AsyncModbusTcpClient(host=host, port=port)

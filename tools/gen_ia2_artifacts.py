@@ -58,7 +58,7 @@ def gen_device_toml(cfg: dict) -> str:
         f"name = \"{dev}\"",
         "protocol = \"modbus\"",
         f"slave_id = {m['unit_id']}",
-        f"poll_interval_ms = {m.get('poll_interval_ms', 50)}",
+        f"poll_interval_ms = {cfg.get('timing', {}).get('modbus_poll_ms', 50)}",
         "",
         "[transport]",
         "kind = \"tcp\"",
@@ -90,7 +90,7 @@ def gen_iomap_toml(cfg: dict) -> str:
         for r in rs:
             lines += [
                 "[[mappings]]",
-                f"application = \"{pou}\"",
+                f"application = \"threetank_inst\"",  # C15: instance name, not POU name
                 f"variable = \"{r['name']}\"",
                 f"direction = \"{direction}\"",
                 f"device = \"{dev}\"",
@@ -147,12 +147,15 @@ def main() -> int:
     device_txt = gen_device_toml(cfg)
     iomap_txt = gen_iomap_toml(cfg)
 
-    # ST name check (advisory in --check mode, always reported).
+    # ST name check — fail (not just warn) in --check mode.
     missing = validate_st(cfg)
     if missing:
-        print(f"WARNING: threetank.st is missing VAR declarations for: {', '.join(missing)}", file=sys.stderr)
+        msg = f"threetank.st is missing VAR declarations for: {', '.join(missing)}"
+        print(f"FAIL: {msg}", file=sys.stderr)
+        st_fail = True
     else:
         print("ST VAR names OK: every contract register is declared in threetank.st.")
+        st_fail = False
 
     drift = []
     for path, content in ((DEVICE_TOML, device_txt), (IOMAP_TOML, iomap_txt)):
@@ -171,7 +174,10 @@ def main() -> int:
         if drift:
             print(f"\nFAIL: {len(drift)} file(s) out of date — run: python3 tools/gen_ia2_artifacts.py", file=sys.stderr)
             return 1
-        print("\nOK: generated artifacts match the contract.")
+        if st_fail:
+            print("\nFAIL: ST VAR validation failed (see above).", file=sys.stderr)
+            return 1
+        print("\nOK: generated artifacts match the contract + ST vars validated.")
         return 0
     if not drift:
         print("OK: all artifacts already up to date.")

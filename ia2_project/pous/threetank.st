@@ -81,6 +81,9 @@ PROGRAM ThreeTank
     up_h1 : REAL;  up_h2 : REAL;  up_h3 : REAL;
     out_p1 : REAL; out_p2 : REAL;
     out_h1 : REAL; out_h2 : REAL; out_h3 : REAL;
+    (* C11: L5 interlock hysteresis latches (trip at threshold, clear with margin). *)
+    lvl1_trip : BOOL;  lvl2_trip : BOOL;  lvl3_trip : BOOL;
+    t1_trip : BOOL;    t2_trip : BOOL;    t3_trip : BOOL;
     (* heartbeat *)
     scan_count : UDINT;
   END_VAR
@@ -129,6 +132,9 @@ PROGRAM ThreeTank
       up_h1 := INT_TO_REAL(heater1_req) * 1.0e-2;
       up_h2 := INT_TO_REAL(heater2_req) * 1.0e-2;
       up_h3 := INT_TO_REAL(heater3_req) * 1.0e-2;
+    ELSE  (* C12: unknown mode -> safe (all outputs to 0) *)
+      up_p1 := 0.0; up_p2 := 0.0;
+      up_h1 := 0.0; up_h2 := 0.0; up_h3 := 0.0;
   END_CASE;
 
   (* ---------- FB_MANSTATION: bumpless manual<->auto (manual_out raw->REAL) ---------- *)
@@ -146,7 +152,11 @@ PROGRAM ThreeTank
   out_h1 := msta_h1.out; out_h2 := msta_h2.out; out_h3 := msta_h3.out;
 
   (* ---------- L5 shield: eng (0..100) -> raw (0..10000) + cutoffs ---------- *)
-  IF (tank1_level > 5500) OR (tank2_level > 5500) THEN
+  (* C11: hysteresis — trip at the threshold, clear with a margin to prevent
+     actuator chatter at the boundary (500-count deadband = ~0.05 m / ~5 degC). *)
+  IF (tank1_level > 5500) OR (tank2_level > 5500) THEN lvl1_trip := TRUE; END_IF;
+  IF (tank1_level < 5000) AND (tank2_level < 5000) THEN lvl1_trip := FALSE; END_IF;
+  IF lvl1_trip THEN
     actuator1 := 0;
   ELSIF out_p1 > 100.0 THEN
     actuator1 := 10000;
@@ -154,7 +164,9 @@ PROGRAM ThreeTank
     actuator1 := REAL_TO_INT(out_p1 * 100.0);
   END_IF;
 
-  IF (tank3_level > 5500) OR (tank2_level > 5500) THEN
+  IF (tank3_level > 5500) OR (tank2_level > 5500) THEN lvl3_trip := TRUE; END_IF;
+  IF (tank3_level < 5000) AND (tank2_level < 5000) THEN lvl3_trip := FALSE; END_IF;
+  IF lvl3_trip THEN
     actuator2 := 0;
   ELSIF out_p2 > 100.0 THEN
     actuator2 := 10000;
@@ -162,7 +174,11 @@ PROGRAM ThreeTank
     actuator2 := REAL_TO_INT(out_p2 * 100.0);
   END_IF;
 
-  IF (tank1_level < 500) OR (tank1_temp > 7000) THEN
+  IF (tank1_level < 500) THEN lvl1_trip := TRUE; END_IF;
+  IF (tank1_level > 600) THEN lvl1_trip := FALSE; END_IF;
+  IF (tank1_temp > 7000) THEN t1_trip := TRUE; END_IF;
+  IF (tank1_temp < 6500) THEN t1_trip := FALSE; END_IF;
+  IF lvl1_trip OR t1_trip THEN
     heater1 := 0;
   ELSIF out_h1 > 100.0 THEN
     heater1 := 10000;
@@ -170,7 +186,11 @@ PROGRAM ThreeTank
     heater1 := REAL_TO_INT(out_h1 * 100.0);
   END_IF;
 
-  IF (tank2_level < 500) OR (tank2_temp > 7000) THEN
+  IF (tank2_level < 500) THEN lvl2_trip := TRUE; END_IF;
+  IF (tank2_level > 600) THEN lvl2_trip := FALSE; END_IF;
+  IF (tank2_temp > 7000) THEN t2_trip := TRUE; END_IF;
+  IF (tank2_temp < 6500) THEN t2_trip := FALSE; END_IF;
+  IF lvl2_trip OR t2_trip THEN
     heater2 := 0;
   ELSIF out_h2 > 100.0 THEN
     heater2 := 10000;
@@ -178,7 +198,11 @@ PROGRAM ThreeTank
     heater2 := REAL_TO_INT(out_h2 * 100.0);
   END_IF;
 
-  IF (tank3_level < 500) OR (tank3_temp > 7000) THEN
+  IF (tank3_level < 500) THEN lvl3_trip := TRUE; END_IF;
+  IF (tank3_level > 600) THEN lvl3_trip := FALSE; END_IF;
+  IF (tank3_temp > 7000) THEN t3_trip := TRUE; END_IF;
+  IF (tank3_temp < 6500) THEN t3_trip := FALSE; END_IF;
+  IF lvl3_trip OR t3_trip THEN
     heater3 := 0;
   ELSIF out_h3 > 100.0 THEN
     heater3 := 10000;
