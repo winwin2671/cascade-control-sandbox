@@ -87,12 +87,12 @@ PROGRAM ThreeTank
 
   (* ---------- PID loops (sp/pv scaled raw -> REAL eng) ---------- *)
   pid_level1(pv := INT_TO_REAL(tank1_level) * 1.0e-4, sp := INT_TO_REAL(tank1_level_sp) * 1.0e-4,
-             kp := 2.0, ti_s := 30.0, td_s := 0.0, dt_s := 0.05,
+             kp := 500.0, ti_s := 10.0, td_s := 0.0, dt_s := 0.05,
              direct := FALSE, auto := TRUE, manual_out := 0.0,
              out_min := 0.0, out_max := 100.0,
              track := (mode <> 1), track_value := INT_TO_REAL(actuator1) * 1.0e-2);
   pid_level3(pv := INT_TO_REAL(tank3_level) * 1.0e-4, sp := INT_TO_REAL(tank3_level_sp) * 1.0e-4,
-             kp := 2.0, ti_s := 30.0, td_s := 0.0, dt_s := 0.05,
+             kp := 500.0, ti_s := 10.0, td_s := 0.0, dt_s := 0.05,
              direct := FALSE, auto := TRUE, manual_out := 0.0,
              out_min := 0.0, out_max := 100.0,
              track := (mode <> 1), track_value := INT_TO_REAL(actuator2) * 1.0e-2);
@@ -133,15 +133,15 @@ PROGRAM ThreeTank
 
   (* ---------- FB_MANSTATION: bumpless manual<->auto (manual_out raw->REAL) ---------- *)
   msta_p1(auto_in := up_p1, auto := (mode <> 0), manual_out := INT_TO_REAL(manual_p1) * 1.0e-2,
-          out_min := 0.0, out_max := 100.0, dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_p2(auto_in := up_p2, auto := (mode <> 0), manual_out := INT_TO_REAL(manual_p2) * 1.0e-2,
-          out_min := 0.0, out_max := 100.0, dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_h1(auto_in := up_h1, auto := (mode <> 0), manual_out := INT_TO_REAL(manual_h1) * 1.0e-2,
-          out_min := 0.0, out_max := 100.0, dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_h2(auto_in := up_h2, auto := (mode <> 0), manual_out := INT_TO_REAL(manual_h2) * 1.0e-2,
-          out_min := 0.0, out_max := 100.0, dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_h3(auto_in := up_h3, auto := (mode <> 0), manual_out := INT_TO_REAL(manual_h3) * 1.0e-2,
-          out_min := 0.0, out_max := 100.0, dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   out_p1 := msta_p1.out; out_p2 := msta_p2.out;
   out_h1 := msta_h1.out; out_h2 := msta_h2.out; out_h3 := msta_h3.out;
 

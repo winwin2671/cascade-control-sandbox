@@ -175,8 +175,8 @@ class ManualGUI:
         self.b.write_register(name, int(val * 100))
 
     def _on_reset(self):
-        self._reset_nonce = getattr(self, "_reset_nonce", 0) + 1
-        self.b.write_register("reset_cmd", self._reset_nonce % 65536)
+        self._reset_nonce = getattr(self, "_reset_nonce", 0) % 65535 + 1  # C2 fix
+        self.b.write_register("reset_cmd", self._reset_nonce)
         self.root.after(300, lambda: self.b.write_register("reset_cmd", 0))
         self.scorer.reset()
         self.k = 0

@@ -54,10 +54,14 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
               "  pip3 install --user stable_baselines3   (pulls torch; heavy)")
         return 1
     from stable_baselines3.common.vec_env import DummyVecEnv
+    from gymnasium.wrappers import TimeLimit
 
     wall_dt = plant_dt / time_scale if time_scale > 0 else plant_dt
-    venv = DummyVecEnv([lambda i=i: CascadeBridgeEnv(
-        backend="modbus", port=base_port + i, control_dt=wall_dt) for i in range(n_envs)])
+    # C1 fix: TimeLimit so training episodes truncate + auto-reset (the G1
+    # init-state randomization is exercised every episode, not just once per run)
+    venv = DummyVecEnv([lambda i=i: TimeLimit(
+        CascadeBridgeEnv(backend="modbus", port=base_port + i, control_dt=wall_dt),
+        max_episode_steps=200) for i in range(n_envs)])
 
     if algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,

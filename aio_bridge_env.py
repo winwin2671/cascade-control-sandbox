@@ -424,7 +424,7 @@ class CascadeBridgeEnv(gym.Env):
             info["init_levels_m"] = init_levels
             cmd = rcfg.get("command_register")
             if cmd:
-                self._reset_nonce = (self._reset_nonce + 1) % 65536
+                self._reset_nonce = self._reset_nonce % 65535 + 1  # C2 fix: never wraps to 0
                 self.backend.write_register(cmd, self._reset_nonce)  # fresh nonce -> snap + hold
                 time.sleep(self.control_dt)
                 obs = self._decode_obs(self.backend.read_raw())

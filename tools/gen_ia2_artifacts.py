@@ -82,7 +82,8 @@ def gen_iomap_toml(cfg: dict) -> str:
     dev = cfg["ia2"]["device_name"]
     regs = cfg["registers"]
     inputs = [r for r in regs if r["direction"] == "read"]
-    outputs = [r for r in regs if r["direction"] == "write"]
+    outputs = sorted([r for r in regs if r["direction"] == "write"],
+                     key=lambda r: (r["name"] == "reset_cmd", r["address"]))  # C16: reset_cmd last
 
     def mappings(title: str, rs: list[dict], direction: str) -> list[str]:
         lines = [f"# --- {title} ---"]
