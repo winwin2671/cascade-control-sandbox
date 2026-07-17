@@ -343,7 +343,7 @@ pip3 install --user torch stable_baselines3    # see CUDA notes per-OS below
 
 | OS | IA2 build | CUDA (for RL training) | Manual GUI |
 | --- | --- | --- | --- |
-| **WSL2 (Windows)** | `cargo build --release` in WSL | `pip install torch` (auto-detects CUDA via WSL GPU passthrough — tested on GTX 1650 Ti) | `sudo apt install python3-tk` (renders via WSLg on Windows 11) |
+| **WSL2 (Windows)** | `cargo build --release` in WSL | `pip install torch` (auto-detects CUDA via WSL GPU passthrough) | `sudo apt install python3-tk` (renders via WSLg on Windows 11) |
 | **Linux (native)** | `cargo build --release` | `pip install torch` (CUDA if NVIDIA GPU present, else CPU) | `sudo apt install python3-tk` or `python3-tkinter` |
 | **macOS** | `cargo build --release` | `pip install torch` (CPU — MPS per-op overhead dominates small MLPs; use `--device cpu`) | Bundled with system Python (no install needed) |
 
