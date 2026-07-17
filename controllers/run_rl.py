@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from aio_bridge_env import CascadeBridgeEnv  # noqa: E402
+from controllers.rollout_report import report, detect_interlock
 
 LOG = logging.getLogger("rl_supervisor")
 
@@ -94,6 +95,11 @@ def main():
         if args.action_mode == "actuator":
             # action = [p1, p2, h1, h2, h3] -> env.step writes actuator*_req.
             obs, reward, _, _, info = env.step(action)
+            # env.step() already called b.read_raw(). Calling it again immediately 
+            # raises RuntimeError because the scan_count hasn't advanced yet. 
+            # We sleep briefly to let the PLC scan count advance.
+            time.sleep(0.1)
+            raw_vars = b.read_raw()
         else:
             # action = [t_sp0, t_sp1, t_sp2, h_sp0, h_sp2] (SUPERVISORY order).
             # Map to engineering ranges + write *_sp vars directly.
@@ -108,7 +114,8 @@ def main():
             b.write_register("tank1_level_sp", int(round(h0 / 0.0001)))
             b.write_register("tank3_level_sp", int(round(h2 / 0.0001)))
             time.sleep(args.control_dt)
-            obs = env._decode_obs(b.read_raw())
+            raw_vars = b.read_raw()
+            obs = env._decode_obs(raw_vars)
             sidx = {n: i for i, n in enumerate(env.sensor_names)}
             levels = {n: float(obs[sidx[n]]) for n in env.setpoints}
             temps = {n: float(obs[sidx[n]]) for n in env.temp_setpoints}
@@ -123,7 +130,7 @@ def main():
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
             "action": [float(x) for x in action], "reward": reward,
-            "interlock": detect_interlock(b.read_raw())})
+            "interlock": detect_interlock(raw_vars)})
         if k % 4 == 0 or k == args.steps - 1:
             lv = info.get("levels_m", {}); tp = info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f  r=%.3f",
@@ -137,7 +144,6 @@ def main():
 
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), args.steps)
-    from controllers.rollout_report import report, detect_interlock
     report(steps_data, tag="rl")
 
 
