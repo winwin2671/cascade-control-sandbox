@@ -101,7 +101,9 @@ def main():
         heat_w = plant.heater_power(act_dict)
         ideal_w = plant.ideal_power(levels, temps, t_sp,
                                     {"t_cold": t_cold, "t_amb": t_amb}, act_dict)
-        scorer.step_penalty(levels, temps, h_sp_all, t_sp, heat_w, ideal_w, False,
+        from controllers.rollout_report import detect_interlock
+        interlock = detect_interlock(env.backend.read_raw())
+        scorer.step_penalty(levels, temps, h_sp_all, t_sp, heat_w, ideal_w, interlock,
                             args.control_dt)
         if k % 10 == 0 or k == args.steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})

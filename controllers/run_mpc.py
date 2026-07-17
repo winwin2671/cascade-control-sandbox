@@ -67,10 +67,11 @@ def main():
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in a], "reward": reward})
+            "action": [float(x) for x in a], "reward": reward,
+            "interlock": detect_interlock(env.backend.read_raw())})
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
-    from controllers.rollout_report import report
+    from controllers.rollout_report import report, detect_interlock
     report(steps_data, tag="mpc")
 
 

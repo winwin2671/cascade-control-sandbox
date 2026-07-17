@@ -122,7 +122,8 @@ def main():
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in action], "reward": reward})
+            "action": [float(x) for x in action], "reward": reward,
+            "interlock": detect_interlock(b.read_raw())})
         if k % 4 == 0 or k == args.steps - 1:
             lv = info.get("levels_m", {}); tp = info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f  r=%.3f",
@@ -136,7 +137,7 @@ def main():
 
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), args.steps)
-    from controllers.rollout_report import report
+    from controllers.rollout_report import report, detect_interlock
     report(steps_data, tag="rl")
 
 

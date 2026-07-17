@@ -8,7 +8,7 @@ its rollout, then calls report(steps_data, tag) at the end. This utility:
   4. Saves a 3-panel PNG plot (levels, temps, reward with setpoint lines)
 
 Usage:
-    from controllers.rollout_report import report
+    from controllers.rollout_report import report, detect_interlock
     steps_data = []   # collect during the rollout
     report(steps_data, tag="mpc")
 """
@@ -23,6 +23,28 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+
+def detect_interlock(raw_snapshot: dict) -> bool:
+    """C4 fix: detect if the L5 software shield intervened this step.
+
+    Compares the pre-shield request vars (*_req) to the post-shield mapped
+    outputs. If a request is nonzero but the mapped output is 0, the shield
+    forced a cutoff. Works for MPC/RL-actuator modes (where *_req is populated).
+    For PID/Manual/setpoint modes, *_req is 0 (the PID output doesn't go through
+    the req path), so this returns False — shield interventions in those modes
+    are not detected (the PID's intermediate output isn't in the snapshot).
+    """
+    for req_name, mapped_name in [
+        ("actuator1_req", "actuator1"), ("actuator2_req", "actuator2"),
+        ("heater1_req", "heater1"), ("heater2_req", "heater2"),
+        ("heater3_req", "heater3"),
+    ]:
+        req = raw_snapshot.get(req_name, 0)
+        mapped = raw_snapshot.get(mapped_name, 0)
+        if req > 0 and mapped == 0:
+            return True
+    return False
 
 
 def report(steps_data: list[dict], tag: str = "rollout",
@@ -64,7 +86,7 @@ def report(steps_data: list[dict], tag: str = "rollout",
         heat_w = model.heater_power(act)
         ideal_w = model.ideal_power(levels, temps, t_sp, env_dict, act)
         scorer.step_penalty(levels, temps, h_sp, t_sp,
-                             heat_w, ideal_w, False, control_dt)
+                             heat_w, ideal_w, sd.get("interlock", False), control_dt)
 
     rep = scorer.report()
     mean_reward = float(np.mean([sd["reward"] for sd in steps_data]))

@@ -320,6 +320,8 @@ async def physics_loop(
     sensor_base = min(layout.addr[s] for s in layout.sensors)
     tick = 0
     prev_reset_val = 0
+    wall_budget = dt / time_scale   # C8: target wall-clock per tick
+    t_prev = asyncio.get_event_loop().time()
     while True:
         all_vals = await server.async_getValues(unit_id, 3, layout.base, layout.n)
         regval = {name: int(v) for name, v in zip(layout.names, all_vals)}
@@ -350,7 +352,15 @@ async def physics_loop(
                      regval.get("actuator1", 0), regval.get("actuator2", 0),
                      regval.get("heater1", 0), regval.get("heater2", 0),
                      regval.get("heater3", 0), proc.snapshot())
-        await asyncio.sleep(dt / time_scale)
+        # C8 fix: deadline compensation — if the read+step+write already took
+        # longer than wall_budget, skip the sleep (don't fall further behind);
+        # otherwise sleep only the remaining time. This keeps the effective time-
+        # scale close to the target even at high k or under host load.
+        elapsed = asyncio.get_event_loop().time() - t_prev
+        remaining = wall_budget - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        t_prev = asyncio.get_event_loop().time()
 
 
 def _install_signals(loop: asyncio.AbstractEventLoop, server: ModbusTcpServer) -> None:

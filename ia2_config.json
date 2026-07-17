@@ -154,7 +154,7 @@
     },
     "objective": "Cascade / decoupling control: hold Tank1/Tank3 levels AND all three temperatures at setpoint despite hydraulic coupling through Tank2 and the level->thermal-mass coupling (fuller tank = slower to heat).",
     "reward": "-(w_level*sum((level_i-sp)^2) + w_temp*sum((temp_i-Tsp)^2) + w_action*sum(action)) per step (maximize)",
-    "reward_weights": {"level": 1.0, "temp": 0.002, "action": 0.01},
+    "reward_weights": {"level": 1.0, "temp": 0.0004, "action": 0.01},
     "modes": {"manual": 0, "pid": 1, "mpc": 2, "rl": 3},
     "mode_vars": {
       "manual": ["manual_p1", "manual_p2", "manual_h1", "manual_h2", "manual_h3"],

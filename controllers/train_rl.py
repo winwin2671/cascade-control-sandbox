@@ -26,6 +26,38 @@ from aio_bridge_env import CascadeBridgeEnv  # noqa: E402
 LOG = logging.getLogger("train_rl")
 
 
+def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb):
+    """C5 fix: wrap CascadeBridgeEnv to produce the same 13-dim obs as AIO-Gym.
+
+    AIO-Gym's obs = [levels(3), temps(3), t_sp(3), h_sp_ctrl(2), t_cold, t_amb].
+    The raw CascadeBridgeEnv returns 6-dim [h1,T1,h2,T2,h3,T3]. This wrapper
+    reorders to [h1,h2,h3, T1,T2,T3] and appends the 7 context values so the
+    policy trained on the Modbus track sees the same obs as the numpy track."""
+    import gymnasium as gym
+    from gymnasium.wrappers import TimeLimit
+
+    base = CascadeBridgeEnv(backend="modbus", port=port, control_dt=control_dt)
+
+    class EnrichedObs(gym.ObservationWrapper):
+        def __init__(self, env):
+            super().__init__(env)
+            import numpy as np
+            from gymnasium import spaces
+            lo = np.full(13, -np.inf, dtype=np.float32)
+            hi = np.full(13, np.inf, dtype=np.float32)
+            self.observation_space = spaces.Box(lo, hi, dtype=np.float32)
+
+        def observation(self, obs):
+            # obs = [h1, T1, h2, T2, h3, T3] → [h1,h2,h3, T1,T2,T3, t_sp×3, h_sp×2, tc, ta]
+            levels = [obs[0], obs[2], obs[4]]
+            temps = [obs[1], obs[3], obs[5]]
+            h_sp_ctrl = [hsp["tank1_level"], hsp["tank3_level"]]
+            return np.array(levels + temps + list(tsp) + h_sp_ctrl + [t_cold, t_amb],
+                           dtype=np.float32)
+
+    return TimeLimit(EnrichedObs(base), max_episode_steps=200)
+
+
 def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
     obs, _ = env.reset()
     t0 = time.time()
@@ -54,14 +86,18 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
               "  pip3 install --user stable_baselines3   (pulls torch; heavy)")
         return 1
     from stable_baselines3.common.vec_env import DummyVecEnv
-    from gymnasium.wrappers import TimeLimit
+    import json
+    cfg = json.load(open(ROOT / "ia2_config.json"))
+    hsp = cfg["control"]["setpoints_m"]
+    tsp = list(cfg["control"]["setpoints_c"].values())
+    t_cold = float(cfg["process"]["t_supply_c"])
+    t_amb = float(cfg["process"]["t_ambient_c"])
 
     wall_dt = plant_dt / time_scale if time_scale > 0 else plant_dt
-    # C1 fix: TimeLimit so training episodes truncate + auto-reset (the G1
-    # init-state randomization is exercised every episode, not just once per run)
-    venv = DummyVecEnv([lambda i=i: TimeLimit(
-        CascadeBridgeEnv(backend="modbus", port=base_port + i, control_dt=wall_dt),
-        max_episode_steps=200) for i in range(n_envs)])
+    # C1+C5 fix: TimeLimit + EnrichedObs (13-dim, matches AIO-Gym obs) so the
+    # policy sees setpoints + t_cold/t_amb, not just the raw 6-dim sensors.
+    venv = DummyVecEnv([lambda i=i: _make_enriched_env(
+        base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
 
     if algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,

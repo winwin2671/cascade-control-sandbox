@@ -190,6 +190,10 @@ class IA2Backend(_IA2HttpBase):
         (a between-scan variable write; the iomap forwards it to the cabinet).
     """
 
+    def __init__(self, server_url: str, project: str | None):
+        super().__init__(server_url, project)
+        self._prev_scan_count = None   # C7: frozen-obs detection
+
     def _vars(self) -> list[dict]:
         snap = _http_json("GET", f"{self.base}/api/runtime/snapshot",
                           headers=self._hdr(), timeout=2.0)
@@ -198,6 +202,17 @@ class IA2Backend(_IA2HttpBase):
                 "IA2 runtime snapshot is empty — open ia2_project/ and start "
                 f"the program (e.g. `cs --server {self.base} run --program ThreeTank`)."
             )
+        # C7 fix: detect a frozen scan loop (scan_count not advancing between
+        # steps → the cabinet or IA2 is dead/paused, feeding stale observations).
+        sc = snap.get("scan_count")
+        if sc is not None:
+            sc = int(sc)
+            if self._prev_scan_count is not None and sc == self._prev_scan_count:
+                raise RuntimeError(
+                    f"IA2 scan_count frozen at {sc} between steps — the runtime "
+                    "is paused or the cabinet is dead. Stale observations would "
+                    "poison training. Check: is mock_cabinet running? Is cs paused?")
+            self._prev_scan_count = sc
         return snap["vars"]
 
     def _post_write(self, full_name: str, value: int) -> None:
@@ -387,7 +402,9 @@ class CascadeBridgeEnv(gym.Env):
         w = self.reward_weights
         track_l = sum((levels[n] - self.setpoints[n]) ** 2 for n in levels)
         track_t = sum((temps[n] - self.temp_setpoints[n]) ** 2 for n in temps)
-        action_cost = w["action"] * float(np.sum(np.asarray(action)))
+        # C6 fix: action cost on the CLIPPED action (not the pre-clip raw)
+        clipped = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
+        action_cost = w["action"] * float(np.sum(clipped))
         reward = float(-(w["level"] * track_l + w["temp"] * track_t + action_cost))
         info = {
             "levels_m": levels,
