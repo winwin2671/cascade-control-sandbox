@@ -13,7 +13,8 @@
 #   ./run_mode.sh nmpc           # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
 #   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
 #   ./run_mode.sh gui            # interactive manual control GUI (tkinter sliders + live plot)
-#   STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+#   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo> and --train_track <numpy|modbus>
+#   ./run_mode.sh pid --steps 40 # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
 # cabinet directly (the fast training path). See README "Control modes".
@@ -22,12 +23,52 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IA2="$ROOT/ia2/target/release"
 MODE="${1:-rl}"
+
+# Shift the mode off the args if it was provided as the first argument
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+# Default RL attributes and Steps (fallback to STEPS env var if set)
+ALGO="sac"
+TRAIN_TRACK="numpy"
 STEPS="${STEPS:-20}"
+
+# Parse optional flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --algo)
+      ALGO="${2:-sac}"
+      shift 2
+      ;;
+    --train_track)
+      TRAIN_TRACK="${2:-numpy}"
+      shift 2
+      ;;
+    --step|--steps)
+      STEPS="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 2
+      ;;
+  esac
+done
 
 case "$MODE" in
   pid|manual|rl|mpc|nmpc|modbus|gui) ;;
-  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus]  (got: $MODE)"; exit 2 ;;
+  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--steps N]  (got: $MODE)"; exit 2 ;;
 esac
+
+# Determine if we need the IA2 server running
+NEEDS_IA2=true
+if [ "$MODE" = "modbus" ]; then
+  NEEDS_IA2=false
+fi
+if [ "$MODE" = "rl" ] && [ "$TRAIN_TRACK" = "modbus" ]; then
+  NEEDS_IA2=false
+fi
 
 CAB_PID=""; SRV_PID=""
 cleanup() {
@@ -47,7 +88,7 @@ if ! kill -0 "$CAB_PID" 2>/dev/null; then
   exit 1
 fi
 
-if [ "$MODE" != "modbus" ]; then
+if [ "$NEEDS_IA2" = true ]; then
   echo "==> starting ia2-server (:3001)"
   "$IA2/server" --bind 127.0.0.1:3001 &
   SRV_PID=$!
@@ -69,13 +110,23 @@ case "$MODE" in
   pid|manual)
     python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
   rl)
-    POLICY="$ROOT/controllers/sac_threetank.zip"
+    # Determine policy path and backend based on train_track and algo
+    if [ "$TRAIN_TRACK" = "modbus" ]; then
+      POLICY="$ROOT/controllers/${ALGO}_cascade.zip"
+      BACKEND="modbus"
+    else
+      POLICY="$ROOT/controllers/${ALGO}_threetank.zip"
+      BACKEND="ia2"
+    fi
+
+    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, policy=$POLICY, backend=$BACKEND"
     if [ -f "$POLICY" ]; then
       python3 -u "$ROOT/controllers/run_rl.py" --policy "$POLICY" \
+        --backend "$BACKEND" \
         --action-mode "${RL_ACTION_MODE:-setpoint}" --steps "${STEPS:-40}"
     else
       echo "(no trained policy at $POLICY; running random RL demo)"
-      python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode rl --steps "$STEPS"
+      python3 -u "$ROOT/aio_bridge_env.py" --backend "$BACKEND" --mode rl --steps "$STEPS"
     fi
     ;;
   mpc)

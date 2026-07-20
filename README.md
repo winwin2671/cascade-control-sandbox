@@ -123,10 +123,22 @@ tears down on exit — one command per mode:
 ./run_mode.sh manual    # operator manual_* → FB_MANSTATION → actuators
 ./run_mode.sh mpc       # numpy MPC (successive-linearization box-QP)
 ./run_mode.sh nmpc      # CasADi + IPOPT NMPC (offline oracle; ~1–4 s/step)
-./run_mode.sh rl       # trained SAC/PPO policy (setpoint supervisory mode)
+./run_mode.sh rl [opts] # trained SAC/PPO policy (setpoint supervisory mode)
 ./run_mode.sh gui       # interactive tkinter GUI (sliders + live plot + KPI)
 ./run_mode.sh modbus    # direct Modbus (skip IA2; for quick standalone tests)
-STEPS=40 ./run_mode.sh pid   # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+./run_mode.sh pid --steps 40  # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+```
+
+For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
+- `--algo <sac|ppo>`: Specify the algorithm (defaults to `sac`).
+- `--train_track <numpy|modbus>`: Specify the training track (defaults to `numpy`). If `modbus` is used, the script automatically skips the IA2 server and connects directly to the `mock_cabinet.py` plant, matching how cascade policies were trained.
+
+```bash
+# Examples for RL mode attributes:
+./run_mode.sh rl                                  # default: --algo sac --train_track numpy
+./run_mode.sh rl --algo ppo                       # evaluate a PPO policy trained on numpy
+./run_mode.sh rl --train_track modbus             # evaluate a SAC policy trained on Modbus
+./run_mode.sh rl --algo ppo --train_track modbus  # evaluate a PPO policy trained on Modbus
 ```
 
 | Mode | Controller | Runs in | Agent writes |
@@ -172,7 +184,10 @@ PID          84.18   2.03     3.80    2.35      0.352      0.00
 
 **Validate (sim-to-real gate — trained policy on the real IA2 track):**
 ```bash
-./run_mode.sh rl     # runs the policy through the 50 ms scan + L5 shield
+./run_mode.sh rl     # runs the default SAC policy through the 50 ms scan + L5 shield
+# Or specify attributes:
+./run_mode.sh rl --algo ppo
+./run_mode.sh rl --train_track modbus --algo sac
 ```
 
 Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/`.
@@ -202,7 +217,9 @@ python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n
 python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mode kpi
 
 # step 3 — validate: run the trained policy on the real IA2 track (boots everything)
-./run_mode.sh rl
+./run_mode.sh rl                                  # defaults to --algo sac --train_track numpy
+./run_mode.sh rl --algo ppo                       # validate a numpy-trained PPO policy
+./run_mode.sh rl --train_track modbus --algo sac  # validate a Modbus-trained SAC policy
 ```
 
 ### Manual control GUI
@@ -251,14 +268,16 @@ python3 mock_cabinet.py --time-scale 10
 
 After training on the Modbus track, the **benchmark + validation steps are
 identical** to the primary workflow above — just point at the Modbus-trained
-policy:
+policy using the `./run_mode.sh rl` attributes:
 
 ```bash
 # benchmark (same KPI scorer, same plant comparison)
 python3 controllers/benchmark.py --rl controllers/sac_cascade.zip --reward-mode kpi
 
-# validate on IA2 (same sim-to-real gate)
-python3 controllers/run_rl.py --policy controllers/sac_cascade.zip --steps 100
+# validate (runs policy directly on mock_cabinet via Modbus backend)
+./run_mode.sh rl --train_track modbus --algo sac
+# or for PPO trained on Modbus:
+./run_mode.sh rl --train_track modbus --algo ppo
 ```
 
 ~37× real-time with 4 envs × 10× time-scale (random throughput check). The IA2

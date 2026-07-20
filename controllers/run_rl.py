@@ -1,7 +1,7 @@
-"""RL supervisor — drives the live IA2 plant with a trained SAC/PPO policy.
+"""RL supervisor — drives the live plant with a trained SAC/PPO policy.
 
 Like run_mpc.py / run_nmpc.py but the controller is a trained RL policy. Loads
-the .zip, runs it through the IA2 track (real 50 ms scan + L5 shield), reports
+the .zip, runs it through the IA2 track or directly via Modbus, reports
 levels/temps/reward per step.
 
 Handles BOTH action modes:
@@ -12,10 +12,12 @@ Handles BOTH action modes:
                            PID, supervisory RL-on-PID). Matches AIO-Gym's default.
 
 Usage:
-    python3 controllers/run_rl.py --policy controllers/sac_threetank.zip --action-mode setpoint
-    python3 controllers/run_rl.py --action-mode actuator   # uses default policy path
+    python3 controllers/run_rl.py --policy controllers/sac_threetank.zip --action-mode setpoint --backend ia2
+    python3 controllers/run_rl.py --action-mode actuator --backend modbus --policy controllers/sac_cascade.zip
 
-Requires the IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` + `cs run`.
+Requires either:
+    1) IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` + `cs run`
+    2) Modbus track: mock_cabinet.py (direct control, no PLC logic)
 """
 from __future__ import annotations
 
@@ -38,8 +40,10 @@ LOG = logging.getLogger("rl_supervisor")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RL supervisor — trained policy on the IA2 track.")
+    ap = argparse.ArgumentParser(description="RL supervisor — trained policy on the IA2 or Modbus track.")
     ap.add_argument("--policy", default=str(ROOT / "controllers" / "sac_threetank.zip"))
+    ap.add_argument("--backend", default="ia2", choices=["ia2", "modbus"],
+                    help="Communication backend (ia2 for PLC, modbus for direct plant)")
     ap.add_argument("--action-mode", default="setpoint", choices=["actuator", "setpoint"])
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--control-dt", type=float, default=0.5)
@@ -61,7 +65,7 @@ def main():
         model = SAC.load(args.policy)
     except Exception:
         model = PPO.load(args.policy)
-    LOG.info("loaded policy: %s  action_mode: %s", args.policy, args.action_mode)
+    LOG.info("loaded policy: %s  action_mode: %s  backend: %s", args.policy, args.action_mode, args.backend)
 
     cfg = json.load(open(ROOT / "ia2_config.json"))
     hsp = cfg["control"]["setpoints_m"]
@@ -72,7 +76,7 @@ def main():
     # Build the env. For actuator mode, use mode="rl" (writes actuator*_req).
     # For setpoint mode, use mode="pid" (PLC PID active) but write *_sp directly
     # (bypassing env.step's write, which uses the wrong range mapping).
-    env = CascadeBridgeEnv(backend="ia2", control_dt=args.control_dt,
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt,
                             mode=("rl" if args.action_mode == "actuator" else "pid"))
     b = env.backend
 
@@ -81,15 +85,22 @@ def main():
     rewards = []
     steps_data = []
 
-    for k in range(args.steps):
-        # Construct the 13-dim AIO-Gym obs from the IA2 6-dim obs.
-        levels = [float(obs[0]), float(obs[2]), float(obs[4])]
-        temps = [float(obs[1]), float(obs[3]), float(obs[5])]
-        full_obs = np.array(
-            levels + temps + tsp + [hsp["tank1_level"], hsp["tank3_level"]] + [t_cold, t_amb],
-            dtype=np.float32)
+    # Determine expected observation dimensionality from the loaded model
+    expected_shape = model.observation_space.shape
 
-        action, _ = model.predict(full_obs, deterministic=True)
+    for k in range(args.steps):
+        if expected_shape == (13,):
+            # Original AIO-Gym 13-dim obs
+            levels_list = [float(obs[0]), float(obs[2]), float(obs[4])]
+            temps_list = [float(obs[1]), float(obs[3]), float(obs[5])]
+            model_obs = np.array(
+                levels_list + temps_list + tsp + [hsp["tank1_level"], hsp["tank3_level"]] + [t_cold, t_amb],
+                dtype=np.float32)
+        else:
+            # Native 6-dim obs (used by direct Modbus/Cascade training)
+            model_obs = np.asarray(obs, dtype=np.float32)
+
+        action, _ = model.predict(model_obs, deterministic=True)
         action = np.clip(np.asarray(action, dtype=np.float64).flatten(), 0.0, 1.0)
 
         if args.action_mode == "actuator":
