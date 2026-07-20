@@ -1,8 +1,8 @@
 """Manual control GUI — human-in-the-loop plant control via tkinter.
 
-Launches a desktop window with 5 sliders (pump1, pump2, heater1-3), a mode
-dropdown (Manual/PID/MPC/RL), a reset button, a real-time level/temp plot,
-and a live KPI readout. The user drives the plant through IA2 in real time.
+Launches a desktop window with 5 sliders (pump1, pump2, heater1-3), a reset
+button, a real-time level/temp plot, and a live KPI readout. The user drives
+the plant through IA2 in real time.
 
 Requires the IA2 chain up (run_mode.sh gui handles the boot). tkinter + matplotlib
 are rendered natively on Windows 11 via WSLg (no X server setup).
@@ -43,9 +43,8 @@ T_SP = list(CFG["control"]["setpoints_c"].values())
 T_COLD = float(CFG["process"]["t_supply_c"])
 T_AMB = float(CFG["process"]["t_ambient_c"])
 
-# Actuator register names for each mode's write targets.
+# Actuator register names for Manual mode's write targets.
 MANUAL_VARS = ["manual_p1", "manual_p2", "manual_h1", "manual_h2", "manual_h3"]
-MODE_NAMES = {"Manual": 0, "PID": 1, "MPC": 2, "RL": 3}
 
 
 class ManualGUI:
@@ -70,29 +69,32 @@ class ManualGUI:
         left = ttk.Frame(self.root, padding=10)
         left.pack(side=tk.LEFT, fill=tk.Y)
 
-        ttk.Label(left, text="Mode:").pack(anchor=tk.W)
-        self.mode_var = tk.StringVar(value="Manual")
-        mode_menu = ttk.OptionMenu(left, self.mode_var, "Manual", *MODE_NAMES,
-                                   command=self._on_mode)
-        mode_menu.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(left, text="Mode: Manual", font=("-weight", "bold")).pack(anchor=tk.W, pady=(0, 10))
 
         self.sliders = {}
         self.slider_vars = {}
-        self.slider_val_labels = {}
         labels = ["Pump 1", "Pump 2", "Heater 1", "Heater 2", "Heater 3"]
         for i, label in enumerate(labels):
             row = ttk.Frame(left)
-            row.pack(fill=tk.X, pady=1)
+            row.pack(fill=tk.X, pady=2)
             ttk.Label(row, text=label, width=9).pack(side=tk.LEFT)
+            
+            # Shared variable for both the slider and the spinbox
             var = tk.IntVar(value=50)
-            s = ttk.Scale(row, from_=0, to=100, orient=tk.HORIZONTAL,
-                          variable=var, command=lambda v, idx=i: self._on_slider(idx, v))
-            s.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            vl = ttk.Label(row, text="50%", width=5)
-            vl.pack(side=tk.RIGHT)
+            
+            # The slider
+            s = ttk.Scale(row, from_=0, to=100, orient=tk.HORIZONTAL, variable=var)
+            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+            
+            # The spinbox (allows typing exact values)
+            sp = ttk.Spinbox(row, from_=0, to=100, textvariable=var, width=4, justify=tk.RIGHT)
+            sp.pack(side=tk.RIGHT)
+            
             self.sliders[i] = s
             self.slider_vars[i] = var
-            self.slider_val_labels[i] = vl
+            
+            # Trace writes to the variable so typing or dragging both trigger the callback
+            var.trace_add("write", lambda *args, idx=i: self._on_slider(idx))
 
         ttk.Button(left, text="Reset Episode", command=self._on_reset).pack(fill=tk.X, pady=10)
 
@@ -120,10 +122,12 @@ class ManualGUI:
         # --- right: plot ---
         self._build_plot()
 
-        # --- init: reset + set mode ---
+        # --- init: reset + push initial slider states ---
         self.env.reset()
-        self.b.write_register("mode", 0)  # start in Manual
         self.scorer.reset()
+        # Write initial slider values to the manual_* registers
+        for i in range(len(self.sliders)):
+            self._on_slider(i)
 
         # --- start the update loop ---
         self.root.after(500, self._tick)
@@ -162,15 +166,16 @@ class ManualGUI:
         self.hist_x = []
 
     # --- callbacks ---
-    def _on_mode(self, selection):
-        mode_int = MODE_NAMES.get(selection, 0)
-        self.b.write_register("mode", mode_int)
-        LOG.info("mode switched to %s (%d)", selection, mode_int)
-
-    def _on_slider(self, idx, _value):
-        """Write the slider value (0-100) to the manual_* register (raw 0-10000)."""
-        val = self.slider_vars[idx].get()
-        self.slider_val_labels[idx].config(text=f"{val}%")
+    def _on_slider(self, idx):
+        """Write the shared variable value (0-100) to the manual_* register (raw 0-10000)."""
+        try:
+            val = self.slider_vars[idx].get()
+        except tk.TclError:
+            # Happens if the user temporarily types a non-integer or clears the box
+            return
+        
+        # Clamp to safe limits just in case
+        val = max(0, min(100, int(val)))
         name = MANUAL_VARS[idx]
         self.b.write_register(name, int(val * 100))
 
@@ -196,9 +201,6 @@ class ManualGUI:
             return
 
         # In Manual mode, sliders are already written on drag.
-        # In other modes (PID/MPC/RL), the external controller drives; the GUI
-        # just observes (the sliders have no effect when mode != Manual).
-
         # Read the plant state
         time.sleep(self.env.control_dt)
         raw = self.b.read_raw()
@@ -255,8 +257,7 @@ class ManualGUI:
         """Called when the rollout ends or the window closes."""
         if self.steps_data:
             from controllers.rollout_report import report
-            tag = self.mode_var.get().lower()
-            report(self.steps_data, tag=f"gui_{tag}")
+            report(self.steps_data, tag="gui_manual")
         LOG.info("GUI session ended")
         if self.running:
             self.running = False
@@ -277,6 +278,7 @@ def main():
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
+    # Env constructor sets mode to 'manual' on the PLC. The GUI does not write mode.
     env = CascadeBridgeEnv(backend="ia2", control_dt=args.control_dt, mode="manual")
     gui = ManualGUI(env, steps=args.steps)
     gui.run()
