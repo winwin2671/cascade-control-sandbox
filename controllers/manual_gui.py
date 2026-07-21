@@ -10,6 +10,11 @@ are rendered natively on Windows 11 via WSLg (no X server setup).
 Usage:
     python3 controllers/manual_gui.py --steps 200
     # or via run_mode.sh gui (boots IA2 automatically)
+
+Note on edge backend: If using `--backend edge:<name>`, be aware that each
+step requires an SSH round-trip proxied through the dev server (~6 handshakes
+per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
+the network latency.
 """
 from __future__ import annotations
 
@@ -272,6 +277,8 @@ def main():
     ap = argparse.ArgumentParser(description="Manual control GUI.")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--control-dt", type=float, default=0.5)
+    ap.add_argument("--backend", default="ia2",
+                    help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -279,7 +286,7 @@ def main():
     logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
     # Env constructor sets mode to 'manual' on the PLC. The GUI does not write mode.
-    env = CascadeBridgeEnv(backend="ia2", control_dt=args.control_dt, mode="manual")
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode="manual")
     gui = ManualGUI(env, steps=args.steps)
     gui.run()
     env.close()

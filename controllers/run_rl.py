@@ -18,6 +18,11 @@ Usage:
 Requires either:
     1) IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` + `cs run`
     2) Modbus track: mock_cabinet.py (direct control, no PLC logic)
+
+Note on edge backend: If using `--backend edge:<name>`, be aware that each
+step requires an SSH round-trip proxied through the dev server (~6 handshakes
+per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
+the network latency.
 """
 from __future__ import annotations
 
@@ -34,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from aio_bridge_env import CascadeBridgeEnv  # noqa: E402
-from controllers.rollout_report import report, detect_interlock
+from controllers.rollout_report import report, detect_interlock  # noqa: E402
 
 LOG = logging.getLogger("rl_supervisor")
 
@@ -42,8 +47,8 @@ LOG = logging.getLogger("rl_supervisor")
 def main():
     ap = argparse.ArgumentParser(description="RL supervisor — trained policy on the IA2 or Modbus track.")
     ap.add_argument("--policy", default=str(ROOT / "controllers" / "sac_threetank.zip"))
-    ap.add_argument("--backend", default="ia2", choices=["ia2", "modbus"],
-                    help="Communication backend (ia2 for PLC, modbus for direct plant)")
+    ap.add_argument("--backend", default="ia2",
+                    help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
     ap.add_argument("--action-mode", default="setpoint", choices=["actuator", "setpoint"])
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--control-dt", type=float, default=0.5)

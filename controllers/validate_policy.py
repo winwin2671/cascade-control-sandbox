@@ -14,7 +14,12 @@ actuator*_req (mode=mpc) → through the L5 shield → to the cabinet.
 Requires the IA2 chain up: mock_cabinet.py + ia2-server + cs project open + cs run.
 
 Usage:
-    python3 controllers/validate_policy.py --policy controllers/sac_threetank.zip
+    python3 controllers/validate_policy.py --policy controllers/sac_threetank.zip --backend ia2
+
+Note on edge backend: If using `--backend edge:<name>`, be aware that each
+step requires an SSH round-trip proxied through the dev server (~6 handshakes
+per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
+the network latency.
 """
 from __future__ import annotations
 
@@ -56,6 +61,8 @@ def main():
     ap = argparse.ArgumentParser(description="Validation gate — RL policy on IA2 (sim-to-real).")
     ap.add_argument("--policy", required=True, help="path to the SB3 .zip policy")
     ap.add_argument("--algo", default="sac", choices=["sac", "ppo"])
+    ap.add_argument("--backend", default="ia2",
+                    help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
     ap.add_argument("--steps", type=int, default=60)
     ap.add_argument("--control-dt", type=float, default=0.5)
     args = ap.parse_args()
@@ -83,7 +90,7 @@ def main():
     h_sp_all = [h_sp_dict.get(i, 0.0) for i in range(plant.n)]     # [0.45, 0.30, 0.40]
     t_cold, t_amb = plant.t_supply, plant.t_ambient
 
-    env = CascadeBridgeEnv(backend="ia2", control_dt=args.control_dt, mode="mpc")
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode="mpc")
 
     obs, _ = env.reset()
     scorer.reset()

@@ -7,9 +7,15 @@ solve), but a true nonlinear optimizer.
 
 Requires the IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` +
 `cs run` (see nmpc_run.sh).
+
+Note on edge backend: If using `--backend edge:<name>`, be aware that each
+step requires an SSH round-trip proxied through the dev server (~6 handshakes
+per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
+the network latency.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import time
@@ -22,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from aio_bridge_env import CascadeBridgeEnv             # noqa: E402
 from controllers.nmpc_oracle import OracleAgent          # noqa: E402
+from controllers.rollout_report import report            # noqa: E402
 
 LOG = logging.getLogger("nmpc_supervisor")
 
@@ -31,7 +38,12 @@ def main():
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
-    env = CascadeBridgeEnv(backend="ia2", control_dt=0.5, mode="mpc")
+    ap = argparse.ArgumentParser(description="NMPC supervisor — drives the live plant.")
+    ap.add_argument("--backend", default="ia2",
+                    help="Backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
+    args = ap.parse_args()
+
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=0.5, mode="mpc")
     # NMPC prediction dt matches the actual loop time (IPOPT solve ~1-2 s + 0.5 s
     # sleep ≈ 2 s/step); using 0.5 s here under-predicts the plant evolution
     # (the plant runs during the solve) and the levels overshoot. Shorter horizon
@@ -77,7 +89,6 @@ def main():
             "action": [float(x) for x in a], "reward": reward})
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
-    from controllers.rollout_report import report
     report(steps_data, tag="nmpc")
 
 

@@ -6,9 +6,15 @@ actuator*_req. The MPC predicts with ThreeTankModel (mirrors mock_cabinet).
 
 Requires the IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` +
 `cs run` (see mpc_run.sh).
+
+Note on edge backend: If using `--backend edge:<name>`, be aware that each
+step requires an SSH round-trip proxied through the dev server (~6 handshakes
+per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
+the network latency.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -21,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 from aio_bridge_env import CascadeBridgeEnv          # noqa: E402
 from controllers.threetank_model import ThreeTankModel  # noqa: E402
 from controllers.mpc_agent import MPCAgent            # noqa: E402
+from controllers.rollout_report import report, detect_interlock  # noqa: E402
 
 LOG = logging.getLogger("mpc_supervisor")
 
@@ -30,7 +37,12 @@ def main():
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
-    env = CascadeBridgeEnv(backend="ia2", control_dt=0.5, mode="mpc")
+    ap = argparse.ArgumentParser(description="MPC supervisor — drives the live IA2 plant.")
+    ap.add_argument("--backend", default="ia2",
+                    help="Backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
+    args = ap.parse_args()
+
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=0.5, mode="mpc")
     model = ThreeTankModel()
     mpc = MPCAgent(model, Ts=0.5, P=20)
     mpc.reset()
@@ -71,7 +83,6 @@ def main():
             "interlock": detect_interlock(env.backend.read_raw())})
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
-    from controllers.rollout_report import report, detect_interlock
     report(steps_data, tag="mpc")
 
 

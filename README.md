@@ -129,6 +129,28 @@ tears down on exit — one command per mode:
 ./run_mode.sh pid --steps 40  # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
 ```
 
+### Control backends
+
+For any controller supervisor (`run_mpc.py`, `run_nmpc.py`, `run_rl.py`, `validate_policy.py`, `manual_gui.py`), you can specify the communication backend using the `--backend` flag. This allows you to bypass the IA2 server for quick tests, or target a remote edge device.
+
+- ``auto`` (default for scripts): Uses ia2 if the dev server is running and a program is loaded, otherwise falls back to modbus.
+- ``ia2``: Connects via the local IA2 dev server and runs the full PLC scan + L5 safety shield.
+- ``modbus``: Bypasses IA2 and connects directly to mock_cabinet.py (useful for quick standalone tests without booting IA2).
+- ``edge:<name>``: Connects to a remote edge runtime via the dev server's SSH proxy.
+
+>Note on edge latency: If using `--backend edge:<name>`, be aware that each step requires an SSH round-trip proxied >through the dev server (~6 handshakes per step). For edge deployments, increase the step time using ``--control-dt`` (e.g., ``>--control-dt 2.0``) to accommodate the network latency.
+
+```bash
+# Example: Run MPC directly on the mock cabinet (no IA2 server required)
+python3 controllers/run_mpc.py --backend modbus
+
+# Example: Run the Manual GUI against a remote edge device
+python3 controllers/manual_gui.py --backend edge:my_edge --control-dt 2.0
+
+# Example: Validate a policy on the IA2 track, explicitly enforcing the backend
+python3 controllers/validate_policy.py --policy controllers/sac_threetank.zip --backend ia2
+```
+
 For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
 - `--algo <sac|ppo>`: Specify the algorithm (defaults to `sac`).
 - `--train_track <numpy|modbus>`: Specify the training track (defaults to `numpy`). If `modbus` is used, the script automatically skips the IA2 server and connects directly to the `mock_cabinet.py` plant, matching how cascade policies were trained.

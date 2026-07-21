@@ -190,17 +190,27 @@ class IA2Backend(_IA2HttpBase):
         (a between-scan variable write; the iomap forwards it to the cabinet).
     """
 
-    def __init__(self, server_url: str, project: str | None):
+    def __init__(self, server_url: str, project: str | None,
+                 probe_runtime: bool = False):
         super().__init__(server_url, project)
         self._prev_scan_count = None   # C7: frozen-obs detection
+        if probe_runtime:
+            # C17: --backend auto must fall back when the dev server is up
+            # but the program isn't loaded/running. Health alone can't tell
+            # those apart, so do one snapshot read here — it surfaces the
+            # same 409 / empty-snapshot that the mode write would hit later,
+            # but inside _make_backend's try/except so the Modbus fallback
+            # actually fires.
+            self.read_raw()
 
     def _vars(self) -> list[dict]:
         snap = _http_json("GET", f"{self.base}/api/runtime/snapshot",
                           headers=self._hdr(), timeout=2.0)
         if not snap or not snap.get("vars"):
             raise RuntimeError(
-                "IA2 runtime snapshot is empty — open ia2_project/ and start "
-                f"the program (e.g. `cs --server {self.base} run --program ThreeTank`)."
+                "IA2 runtime snapshot is empty — no program is loaded/running. "
+                f"Start one with `cs run --server {self.base} --program ThreeTank` "
+                "(or just `cs run --program ThreeTank` against the default server)."
             )
         # C7 fix: detect a frozen scan loop (scan_count not advancing between
         # steps → the cabinet or IA2 is dead/paused, feeding stale observations).
@@ -250,8 +260,9 @@ class EdgeBackend(_IA2HttpBase):
         snap = (status or {}).get("last_snapshot")
         if not snap or not snap.get("vars"):
             raise RuntimeError(
-                f"edge '{self.edge}' /status has no last_snapshot — is the project "
-                f"deployed and running on the edge? (cs edge create / cs deploy)"
+                "IA2 runtime snapshot is empty — no program is loaded/running. "
+                f"Start one with `cs run --server {self.base} --program ThreeTank` "
+                "(or just `cs run --program ThreeTank` against the default server)."
             )
         return snap["vars"]
 
@@ -323,7 +334,6 @@ class CascadeBridgeEnv(gym.Env):
 
     # ---- backend selection ----
     def _make_backend(self, kind: str) -> Backend:
-        # "edge" or "edge:<name>" -> edge-runtime backend via dev-server proxy.
         if kind.startswith("edge"):
             ia2 = self.config["ia2"]
             edge_name = kind.split(":", 1)[1] if ":" in kind else ia2.get("edge_name")
@@ -338,7 +348,8 @@ class CascadeBridgeEnv(gym.Env):
         if kind in ("ia2", "auto"):
             try:
                 ia2 = self.config["ia2"]
-                be = IA2Backend(ia2["server_url"], ia2.get("project_name"))
+                be = IA2Backend(ia2["server_url"], ia2.get("project_name"),
+                                probe_runtime=(kind == "auto"))
                 LOG.info("backend = IA2 (%s)", ia2["server_url"])
                 return be
             except Exception as e:
