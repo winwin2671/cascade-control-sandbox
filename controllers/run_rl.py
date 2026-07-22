@@ -156,7 +156,8 @@ def main():
 
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), args.steps)
-    report(steps_data, tag="rl")
+    model_tag = Path(args.policy).stem  # e.g. sac_threetank, ppo_cascade
+    report(steps_data, tag=f"rl_{model_tag}")
 
 
 if __name__ == "__main__":

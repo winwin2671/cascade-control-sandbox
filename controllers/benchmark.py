@@ -69,12 +69,19 @@ def run(agent, env, episodes, seed):
 
 class RLAgent:
     """Trained RL policy (SB3 SAC/PPO) wrapped as an agent for evaluate()."""
-    name = "RL-SAC"
-
-    def __init__(self, model_path, algo="sac"):
+    def __init__(self, model_path):
         from stable_baselines3 import SAC, PPO
-        cls = SAC if algo == "sac" else PPO
-        self.model = cls.load(model_path)
+        import json as _json
+        # Read algo from metadata sidecar; fall back to trying SAC then PPO
+        algo = "sac"
+        sidecar = model_path.replace(".zip", ".json")
+        if Path(sidecar).exists():
+            algo = _json.load(open(sidecar)).get("algo", "sac")
+        try:
+            self.model = (SAC if algo == "sac" else PPO).load(model_path)
+        except Exception:
+            self.model = PPO.load(model_path)
+        self.name = f"RL-{type(self.model).__name__}"
 
     def reset(self):
         pass
