@@ -7,6 +7,7 @@ times (checking init levels are randomized AND applied), and steps (checking obs
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -19,8 +20,10 @@ GREEN, RED, BOLD, RESET = "\033[32m", "\033[31m", "\033[1m", "\033[0m"
 
 
 def main() -> int:
+    # H2 fix: respect CABINET_HOST/CABINET_PORT env vars (like the other tests)
+    port = int(os.environ.get("CABINET_PORT", "5020"))
     try:
-        env = CascadeBridgeEnv(backend="modbus", control_dt=0.3)
+        env = CascadeBridgeEnv(backend="modbus", port=port, control_dt=0.3)
     except Exception as e:
         print(f"{RED}FAIL{RESET}: cannot build env (modbus backend): {e}\n"
               f"  start mock_cabinet.py first (or run ./tests/run_smoke.sh).")

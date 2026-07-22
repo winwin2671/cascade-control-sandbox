@@ -286,6 +286,12 @@ def main():
     logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
     # Env constructor sets mode to 'manual' on the PLC. The GUI does not write mode.
+    # R4b fix: manual mode writes PLC vars (manual_p*, mode, *_sp) which don't exist
+    # in the cabinet register space — require the IA2 backend (not modbus).
+    if args.backend == "modbus":
+        print("ERROR: manual GUI requires the IA2 backend (writes PLC variables like manual_p1, mode, *_sp). "
+              "Run `./run_mode.sh gui` (boots IA2) or use --backend ia2.")
+        sys.exit(1)
     env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode="manual")
     gui = ManualGUI(env, steps=args.steps)
     gui.run()

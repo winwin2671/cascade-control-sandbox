@@ -82,9 +82,14 @@ async def main() -> int:
     fails = []
     if d_no_pump < 3.0:
         fails.append(f"heater raised T1 only {d_no_pump:.1f} C in 4s (expected >=3)")
-    if d_pump >= d_no_pump:
-        fails.append(f"cold pump inflow did not slow heating "
-                     f"(d_pump={d_pump:.1f} >= d_no_pump={d_no_pump:.1f})")
+    # H4 fix: the margin must be >1.0°C — without the advection coupling term
+    # (Σq_in·(T_src−T)/V), the only effect is thermal-mass change from the level rise,
+    # which contributes <0.5°C over 4s at these rates. A ≥1.0°C margin fails if the
+    # advection coupling is zeroed (the thermal-mass-only effect is too small).
+    if d_no_pump - d_pump < 1.0:
+        fails.append(f"cold pump inflow coupling too weak "
+                     f"(d_no_pump={d_no_pump:.1f} - d_pump={d_pump:.1f} = {d_no_pump - d_pump:.1f} < 1.0; "
+                     "advection coupling may be missing")
     if fails:
         print(f"\n{RED}{BOLD}FAIL{RESET}: " + "; ".join(fails))
         return 1

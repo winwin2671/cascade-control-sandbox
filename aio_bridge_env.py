@@ -308,14 +308,21 @@ class CascadeBridgeEnv(gym.Env):
         rw = self.config["control"].get("reward_weights", {})
         self.reward_weights = {
             "level": float(rw.get("level", 1.0)),
-            "temp": float(rw.get("temp", 0.002)),
+            "temp": float(rw.get("temp", 0.0001)),
             "action": float(rw.get("action", 0.01)),
         }
         self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
         self.mode = mode.lower()
-        self._mode_int = {"manual": 0, "pid": 1, "mpc": 2, "rl": 3}.get(self.mode, 3)
+        
+        valid_modes = {"manual", "pid", "mpc", "rl"}
+        if self.mode not in valid_modes:
+            raise ValueError(
+                f"Invalid mode '{self.mode}'. Please use one of: {', '.join(sorted(valid_modes))}"
+            )
+            
+        self._mode_int = {"manual": 0, "pid": 1, "mpc": 2, "rl": 3}[self.mode]
         # PLC-mode write targets (what the agent writes each step). Modbus backend
         # has no PLC -> drives the cabinet registers directly (mode ignored).
         self._write_names, self._write_max = self._write_targets()
@@ -465,8 +472,11 @@ class CascadeBridgeEnv(gym.Env):
         for name, value in self._action_to_writes(action).items():
             self.backend.write_register(name, value)
         time.sleep(self.control_dt)
-        obs = self._decode_obs(self.backend.read_raw())
+        raw = self.backend.read_raw()       # R1 fix: stash for detect_interlock
+        self.last_raw = raw               #   (no second read needed)
+        obs = self._decode_obs(raw)
         reward, info = self._reward(action, obs)
+        info["raw"] = raw                 #   also in info for callers
         return obs, reward, False, False, info
 
     def close(self):
@@ -519,6 +529,7 @@ def main():
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--control-dt", type=float, default=0.5)
     ap.add_argument("--mode", default="rl",
+                    choices=["manual", "pid", "mpc", "rl"],
                     help="control mode: manual | pid | mpc | rl (default rl; IA2 backend only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()

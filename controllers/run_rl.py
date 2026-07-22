@@ -111,11 +111,7 @@ def main():
         if args.action_mode == "actuator":
             # action = [p1, p2, h1, h2, h3] -> env.step writes actuator*_req.
             obs, reward, _, _, info = env.step(action)
-            # env.step() already called b.read_raw(). Calling it again immediately 
-            # raises RuntimeError because the scan_count hasn't advanced yet. 
-            # We sleep briefly to let the PLC scan count advance.
-            time.sleep(0.1)
-            raw_vars = b.read_raw()
+            raw_vars = info["raw"]  # R1 fix: use stashed read (no second read_raw)
         else:
             # action = [t_sp0, t_sp1, t_sp2, h_sp0, h_sp2] (SUPERVISORY order).
             # Map to engineering ranges + write *_sp vars directly.

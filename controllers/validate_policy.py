@@ -74,23 +74,29 @@ def main():
     model = cls.load(args.policy)
     LOG.info("loaded policy: %s (%s)", args.policy, args.algo)
 
-    # B2 fix: detect action mode from the metadata sidecar
+    # B2 fix: dispatch on action mode from the metadata sidecar.
     import json
     meta_path = args.policy.replace(".zip", ".json")
+    action_mode = "actuator"   # default if no sidecar
     if Path(meta_path).exists():
         meta = json.load(open(meta_path))
-        if meta.get("action_mode") == "setpoint":
-            LOG.warning("Policy trained in setpoint mode — use `./run_mode.sh rl` instead "
-                        "(run_rl.py handles setpoint → *_sp). This validator assumes actuator mode.")
+        action_mode = meta.get("action_mode", "actuator")
+    else:
+        LOG.warning("No metadata sidecar at %s — assuming actuator mode. "
+                    "Re-train with train_sb3.py (writes .json sidecar).", meta_path)
+    LOG.info("action_mode: %s", action_mode)
 
     plant = ThreeTankModel()
     scorer = KPIScorer(plant)
-    h_sp_dict, t_sp = plant.default_setpoints()       # {0:0.45,1:0.30,2:0.40}, [45,45,45]
-    h_sp_ctrl = [h_sp_dict[i] for i in plant.controlled_levels()]  # [0.45, 0.40]
-    h_sp_all = [h_sp_dict.get(i, 0.0) for i in range(plant.n)]     # [0.45, 0.30, 0.40]
+    h_sp_dict, t_sp = plant.default_setpoints()
+    h_sp_ctrl = [h_sp_dict[i] for i in plant.controlled_levels()]
+    h_sp_all = [h_sp_dict.get(i, 0.0) for i in range(plant.n)]
     t_cold, t_amb = plant.t_supply, plant.t_ambient
 
-    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode="mpc")
+    # Setpoint mode → PID mode (PLC tracks setpoints); actuator mode → MPC mode (direct)
+    plc_mode = "pid" if action_mode == "setpoint" else "mpc"
+    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode=plc_mode)
+    b = env.backend
 
     obs, _ = env.reset()
     scorer.reset()
@@ -99,7 +105,30 @@ def main():
         full_obs = ia2_to_aiogym_obs(obs, h_sp_ctrl, t_sp, t_cold, t_amb)
         action, _ = model.predict(full_obs, deterministic=True)
         action = np.clip(np.asarray(action, dtype=np.float32).flatten(), 0.0, 1.0)
-        obs, reward, _, _, info = env.step(action)
+
+        if action_mode == "setpoint":
+            # Map [t_sp0,t_sp1,t_sp2,h_sp0,h_sp2] to *_sp vars (same as run_rl.py)
+            t0 = 20.0 + action[0] * 60.0; t1 = 20.0 + action[1] * 60.0; t2 = 20.0 + action[2] * 60.0
+            h0 = 0.15 + action[3] * 0.40; h2 = 0.15 + action[4] * 0.40
+            b.write_register("tank1_temp_sp", int(round(t0 / 0.01)))
+            b.write_register("tank2_temp_sp", int(round(t1 / 0.01)))
+            b.write_register("tank3_temp_sp", int(round(t2 / 0.01)))
+            b.write_register("tank1_level_sp", int(round(h0 / 0.0001)))
+            b.write_register("tank3_level_sp", int(round(h2 / 0.0001)))
+            import time as _time
+            _time.sleep(args.control_dt)
+            raw_vars = b.read_raw()
+            obs = env._decode_obs(raw_vars)
+            sidx = {n: i for i, n in enumerate(env.sensor_names)}
+            levels_d = {n: float(obs[sidx[n]]) for n in env.setpoints}
+            temps_d = {n: float(obs[sidx[n]]) for n in env.temp_setpoints}
+            track_l = sum((levels_d[n] - env.setpoints[n]) ** 2 for n in env.setpoints)
+            track_t = sum((temps_d[n] - env.temp_setpoints[n]) ** 2 for n in env.temp_setpoints)
+            w = env.reward_weights
+            reward = float(-(w["level"] * track_l + w["temp"] * track_t))
+            info = {"levels_m": levels_d, "temps_c": temps_d, "raw": raw_vars}
+        else:
+            obs, reward, _, _, info = env.step(action)
         rewards.append(reward)
 
         levels = [float(obs[0]), float(obs[2]), float(obs[4])]
@@ -109,7 +138,7 @@ def main():
         ideal_w = plant.ideal_power(levels, temps, t_sp,
                                     {"t_cold": t_cold, "t_amb": t_amb}, act_dict)
         from controllers.rollout_report import detect_interlock
-        interlock = detect_interlock(env.backend.read_raw())
+        interlock = detect_interlock(info["raw"])  # R1 fix: use stashed read
         scorer.step_penalty(levels, temps, h_sp_all, t_sp, heat_w, ideal_w, interlock,
                             args.control_dt)
         if k % 10 == 0 or k == args.steps - 1:

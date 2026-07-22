@@ -81,9 +81,11 @@ PROGRAM ThreeTank
     up_h1 : REAL;  up_h2 : REAL;  up_h3 : REAL;
     out_p1 : REAL; out_p2 : REAL;
     out_h1 : REAL; out_h2 : REAL; out_h3 : REAL;
-    (* C11: L5 interlock hysteresis latches (trip at threshold, clear with margin). *)
-    lvl1_trip : BOOL;  lvl2_trip : BOOL;  lvl3_trip : BOOL;
-    t1_trip : BOOL;    t2_trip : BOOL;    t3_trip : BOOL;
+    (* R2 fix: 8 independent interlock latches (one per condition, not shared between
+       opposing interlocks). Trip at threshold, clear with margin to prevent chatter. *)
+    p1_hi_trip : BOOL;  p2_hi_trip : BOOL;
+    h1_lo_trip : BOOL;  h2_lo_trip : BOOL;  h3_lo_trip : BOOL;
+    t1_trip : BOOL;     t2_trip : BOOL;     t3_trip : BOOL;
     (* heartbeat *)
     scan_count : UDINT;
   END_VAR
@@ -152,11 +154,15 @@ PROGRAM ThreeTank
   out_h1 := msta_h1.out; out_h2 := msta_h2.out; out_h3 := msta_h3.out;
 
   (* ---------- L5 shield: eng (0..100) -> raw (0..10000) + cutoffs ---------- *)
-  (* C11: hysteresis — trip at the threshold, clear with a margin to prevent
-     actuator chatter at the boundary (500-count deadband = ~0.05 m / ~5 degC). *)
-  IF (tank1_level > 5500) OR (tank2_level > 5500) THEN lvl1_trip := TRUE; END_IF;
-  IF (tank1_level < 5000) AND (tank2_level < 5000) THEN lvl1_trip := FALSE; END_IF;
-  IF lvl1_trip THEN
+  (* R2 fix: 8 independent latches, one per condition. Each trip/clear pair owns its
+     own variable — opposing interlocks (e.g. pump high-level vs heater dry-fire on the
+     same tank) no longer clear each other's latches. Trip at threshold, clear with
+     margin (~500 counts = 0.05 m / ~5 degC deadband). *)
+
+  (* pump1: high-level cutoff (tank1 OR tank2 above 0.55 m) *)
+  IF (tank1_level > 5500) OR (tank2_level > 5500) THEN p1_hi_trip := TRUE; END_IF;
+  IF (tank1_level < 5000) AND (tank2_level < 5000) THEN p1_hi_trip := FALSE; END_IF;
+  IF p1_hi_trip THEN
     actuator1 := 0;
   ELSIF out_p1 > 100.0 THEN
     actuator1 := 10000;
@@ -164,9 +170,10 @@ PROGRAM ThreeTank
     actuator1 := REAL_TO_INT(out_p1 * 100.0);
   END_IF;
 
-  IF (tank3_level > 5500) OR (tank2_level > 5500) THEN lvl3_trip := TRUE; END_IF;
-  IF (tank3_level < 5000) AND (tank2_level < 5000) THEN lvl3_trip := FALSE; END_IF;
-  IF lvl3_trip THEN
+  (* pump2: high-level cutoff (tank3 OR tank2 above 0.55 m) *)
+  IF (tank3_level > 5500) OR (tank2_level > 5500) THEN p2_hi_trip := TRUE; END_IF;
+  IF (tank3_level < 5000) AND (tank2_level < 5000) THEN p2_hi_trip := FALSE; END_IF;
+  IF p2_hi_trip THEN
     actuator2 := 0;
   ELSIF out_p2 > 100.0 THEN
     actuator2 := 10000;
@@ -174,11 +181,12 @@ PROGRAM ThreeTank
     actuator2 := REAL_TO_INT(out_p2 * 100.0);
   END_IF;
 
-  IF (tank1_level < 500) THEN lvl1_trip := TRUE; END_IF;
-  IF (tank1_level > 600) THEN lvl1_trip := FALSE; END_IF;
+  (* heater1: dry-fire (tank1 < 0.05 m) OR over-temp (tank1 > 70 degC) *)
+  IF (tank1_level < 500) THEN h1_lo_trip := TRUE; END_IF;
+  IF (tank1_level > 600) THEN h1_lo_trip := FALSE; END_IF;
   IF (tank1_temp > 7000) THEN t1_trip := TRUE; END_IF;
   IF (tank1_temp < 6500) THEN t1_trip := FALSE; END_IF;
-  IF lvl1_trip OR t1_trip THEN
+  IF h1_lo_trip OR t1_trip THEN
     heater1 := 0;
   ELSIF out_h1 > 100.0 THEN
     heater1 := 10000;
@@ -186,11 +194,12 @@ PROGRAM ThreeTank
     heater1 := REAL_TO_INT(out_h1 * 100.0);
   END_IF;
 
-  IF (tank2_level < 500) THEN lvl2_trip := TRUE; END_IF;
-  IF (tank2_level > 600) THEN lvl2_trip := FALSE; END_IF;
+  (* heater2: dry-fire (tank2 < 0.05 m) OR over-temp (tank2 > 70 degC) *)
+  IF (tank2_level < 500) THEN h2_lo_trip := TRUE; END_IF;
+  IF (tank2_level > 600) THEN h2_lo_trip := FALSE; END_IF;
   IF (tank2_temp > 7000) THEN t2_trip := TRUE; END_IF;
   IF (tank2_temp < 6500) THEN t2_trip := FALSE; END_IF;
-  IF lvl2_trip OR t2_trip THEN
+  IF h2_lo_trip OR t2_trip THEN
     heater2 := 0;
   ELSIF out_h2 > 100.0 THEN
     heater2 := 10000;
@@ -198,11 +207,12 @@ PROGRAM ThreeTank
     heater2 := REAL_TO_INT(out_h2 * 100.0);
   END_IF;
 
-  IF (tank3_level < 500) THEN lvl3_trip := TRUE; END_IF;
-  IF (tank3_level > 600) THEN lvl3_trip := FALSE; END_IF;
+  (* heater3: dry-fire (tank3 < 0.05 m) OR over-temp (tank3 > 70 degC) *)
+  IF (tank3_level < 500) THEN h3_lo_trip := TRUE; END_IF;
+  IF (tank3_level > 600) THEN h3_lo_trip := FALSE; END_IF;
   IF (tank3_temp > 7000) THEN t3_trip := TRUE; END_IF;
   IF (tank3_temp < 6500) THEN t3_trip := FALSE; END_IF;
-  IF lvl3_trip OR t3_trip THEN
+  IF h3_lo_trip OR t3_trip THEN
     heater3 := 0;
   ELSIF out_h3 > 100.0 THEN
     heater3 := 10000;

@@ -80,7 +80,7 @@ def main():
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
             "action": [float(x) for x in a], "reward": reward,
-            "interlock": detect_interlock(env.backend.read_raw())})
+            "interlock": detect_interlock(info["raw"])})  # R1 fix: use stashed read
     env.close()
     LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
     report(steps_data, tag="mpc")

@@ -71,22 +71,24 @@ class CabinetPool:
         from pymodbus.client import ModbusTcpClient
         deadline = time.time() + timeout
         for i in range(self.n):
-            # C3 fix: verify the child process is alive before connecting — if it
-            # died (e.g. bind failure from a stale cabinet on the port), abort early
-            # instead of silently attaching to a foreign cabinet.
+            # R4a fix: C3 abort path — read pid/poll BEFORE close() empties self.procs
             if self.procs[i].poll() is not None:
+                pid = self.procs[i].pid
+                port = self.base_port + i
                 self.close()
                 raise RuntimeError(
-                    f"cabinet {i} (pid {self.procs[i].pid}) exited immediately — "
-                    f"port {self.base_port + i} likely in use by a stale process")
+                    f"cabinet {i} (pid {pid}) exited immediately — "
+                    f"port {port} likely in use by a stale process")
             cl = ModbusTcpClient(host=self.host, port=self.base_port + i)
             ok = False
             while time.time() < deadline:
                 if self.procs[i].poll() is not None:
+                    pid = self.procs[i].pid
+                    port = self.base_port + i
                     self.close()
                     raise RuntimeError(
-                        f"cabinet {i} (pid {self.procs[i].pid}) died during startup "
-                        f"on port {self.base_port + i}")
+                        f"cabinet {i} (pid {pid}) died during startup "
+                        f"on port {port}")
                 if cl.connect():
                     ok = True
                     break
@@ -111,7 +113,7 @@ class CabinetPool:
 
 
 def make_vec_env(n: int = 4, time_scale: float = 1.0,
-                 base_port: int = 5020, plant_dt: float = 0.5
+                 base_port: int = 5200, plant_dt: float = 0.5
                  ) -> tuple[AsyncVectorEnv, CabinetPool]:
     """Create N cabinets + an AsyncVectorEnv over them.
 

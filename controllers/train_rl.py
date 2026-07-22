@@ -86,7 +86,7 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
         print("ERROR: stable_baselines3 not installed.\n"
               "  pip3 install --user stable_baselines3   (pulls torch; heavy)")
         return 1
-    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.vec_env import SubprocVecEnv
     import json
     cfg = json.load(open(ROOT / "ia2_config.json"))
     hsp = cfg["control"]["setpoints_m"]
@@ -97,7 +97,9 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
     wall_dt = plant_dt / time_scale if time_scale > 0 else plant_dt
     # C1+C5 fix: TimeLimit + EnrichedObs (13-dim, matches AIO-Gym obs) so the
     # policy sees setpoints + t_cold/t_amb, not just the raw 6-dim sensors.
-    venv = DummyVecEnv([lambda i=i: _make_enriched_env(
+    # R3 fix: SubprocVecEnv (not DummyVecEnv) — each env steps in its own process,
+    # so the per-step sleeps overlap (restoring the 0.5 s control period + N× throughput).
+    venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
         base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
 
     if algo == "sac":

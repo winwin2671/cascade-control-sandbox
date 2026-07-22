@@ -138,7 +138,7 @@ For any controller supervisor (`run_mpc.py`, `run_nmpc.py`, `run_rl.py`, `valida
 - ``modbus``: Bypasses IA2 and connects directly to mock_cabinet.py (useful for quick standalone tests without booting IA2).
 - ``edge:<name>``: Connects to a remote edge runtime via the dev server's SSH proxy.
 
->Note on edge latency: If using `--backend edge:<name>`, be aware that each step requires an SSH round-trip proxied >through the dev server (~6 handshakes per step). For edge deployments, increase the step time using ``--control-dt`` (e.g., ``>--control-dt 2.0``) to accommodate the network latency.
+>Note on edge latency: If using `--backend edge:<name>`, be aware that each step requires an SSH round-trip proxied >through the dev server (~6 handshakes per step). For edge deployments, increase the step time using ``--control-dt`` (e.g., >``--control-dt 2.0``) to accommodate the network latency.
 
 ```bash
 # Example: Run MPC directly on the mock cabinet (no IA2 server required)
@@ -253,7 +253,6 @@ python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mod
 Launches a tkinter desktop window (rendered on Windows via WSLg):
 
 - **5 sliders** (pump/heater duty, 0–100 %, with live % readout)
-- **Mode dropdown** — switch between Manual / PID / MPC / RL on the fly
 - **Reset button** — new random init levels
 - **Real-time plot** — levels + temps with setpoint lines
 - **Live KPI readout** — score, temp error, level error
@@ -406,6 +405,39 @@ python3 controllers/benchmark.py --rl controllers/sac_threetank.zip
 # run the smoke tests
 ./tests/run_smoke.sh
 ```
+
+### Run with IA2 WebUI
+
+To drive the plant via the **IA2 WebUI** (useful for inspecting the live PLC scan), you'll need three terminals.
+
+**Terminal 1 — start the simulated cabinet:**
+```bash
+python3 mock_cabinet.py &
+```
+
+**Terminal 2 — build & launch the IA2 web server:**
+```bash
+cd ia2
+
+# one-time setup
+. "$HOME/.cargo/env"
+pnpm install
+cargo test -p server                 # populates apps/web/src/types/generated/
+
+# build frontend + run server
+pnpm --filter @cs/web build
+cargo run -p server --release -- --static-dir apps/web/dist
+```
+Open the server URL and press **Start** on the `threetank` PRG.
+
+**Terminal 3 — drive the plant via the bridge env:**
+```bash
+python3 aio_bridge_env.py --backend ia2 --mode pid --steps 200
+python3 aio_bridge_env.py --backend ia2 --mode mpc --steps 200
+python3 aio_bridge_env.py --backend ia2 --mode rl  --steps 200
+```
+
+> **Tip:** Use `--backend modbus` instead of `ia2` in Terminal 3 for quick standalone tests without booting the IA2 server.
 
 ### Smoke tests
 

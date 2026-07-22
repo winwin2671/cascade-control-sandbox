@@ -92,6 +92,13 @@ if [ "$NEEDS_IA2" = true ]; then
   echo "==> starting ia2-server (:3001)"
   "$IA2/server" --bind 127.0.0.1:3001 &
   SRV_PID=$!
+  sleep 1
+  # H3 fix: check the server is alive before health-polling (a stale server on
+  # :3001 would satisfy the health check while our process already died on bind)
+  if ! kill -0 "$SRV_PID" 2>/dev/null; then
+    echo "ERROR: ia2-server failed to start (port 3001 in use?). Aborting."
+    exit 1
+  fi
   for _ in $(seq 1 40); do
     curl -sf -m 1 http://127.0.0.1:3001/api/health >/dev/null && break
     sleep 0.5
