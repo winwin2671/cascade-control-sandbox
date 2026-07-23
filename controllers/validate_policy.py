@@ -98,6 +98,17 @@ def main():
     env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode=plc_mode)
     b = env.backend
 
+    # Setpoint mode writes PLC variables (*_sp) that only exist on the IA2/edge
+    # backends; a direct-Modbus backend has no such registers and write_register
+    # would raise a cryptic ValueError mid-rollout. Reject up front (same class
+    # of guard as manual_gui.py). Checking writes_via_plc also covers --backend
+    # auto once it has resolved to a concrete backend.
+    if action_mode == "setpoint" and not b.writes_via_plc:
+        LOG.error("setpoint-mode policy requires a PLC backend (ia2/edge); the %s "
+                  "backend has no *_sp registers. Use --backend ia2, or validate "
+                  "an actuator-mode policy on modbus.", args.backend)
+        sys.exit(1)
+
     obs, _ = env.reset()
     scorer.reset()
     rewards = []
@@ -133,7 +144,18 @@ def main():
 
         levels = [float(obs[0]), float(obs[2]), float(obs[4])]
         temps = [float(obs[1]), float(obs[3]), float(obs[5])]
-        act_dict = {"pumps": list(action[:2]), "valves": [], "heaters": list(action[2:])}
+        # Energy KPI must use the *applied* actuator/heater duty (post-L5-shield),
+        # NOT the raw policy action: in setpoint mode `action` is [t_sp, h_sp]
+        # setpoints, so feeding it to heater_power() as duty produces a meaningless
+        # excess_kwh. The applied duty lives in the actuator*/heater* registers
+        # (raw 0..10000 = 0..1). Reading them back also makes the energy accounting
+        # shield-aware in actuator mode (a clamped request costs no power).
+        raw = info["raw"]
+        act_dict = {
+            "pumps": [raw.get("actuator1", 0) * 1e-4, raw.get("actuator2", 0) * 1e-4],
+            "valves": [],
+            "heaters": [raw.get(n, 0) * 1e-4 for n in ("heater1", "heater2", "heater3")],
+        }
         heat_w = plant.heater_power(act_dict)
         ideal_w = plant.ideal_power(levels, temps, t_sp,
                                     {"t_cold": t_cold, "t_amb": t_amb}, act_dict)
