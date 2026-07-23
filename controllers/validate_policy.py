@@ -14,7 +14,7 @@ actuator*_req (mode=mpc) → through the L5 shield → to the cabinet.
 Requires the IA2 chain up: mock_cabinet.py + ia2-server + cs project open + cs run.
 
 Usage:
-    python3 controllers/validate_policy.py --policy controllers/sac_threetank.zip --backend ia2
+    python3 controllers/validate_policy.py --policy controllers/policies/sac_threetank.zip --backend ia2
 
 Note on edge backend: If using `--backend edge:<name>`, be aware that each
 step requires an SSH round-trip proxied through the dev server (~6 handshakes
@@ -65,6 +65,10 @@ def main():
                     help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
     ap.add_argument("--steps", type=int, default=60)
     ap.add_argument("--control-dt", type=float, default=0.5)
+    ap.add_argument("--action-mode", default=None, choices=["actuator", "setpoint"],
+                    help="Override the policy action mode (otherwise read from the "
+                         ".json sidecar written by train_sb3.py). Required when no "
+                         "sidecar is present.")
     args = ap.parse_args()
 
     from stable_baselines3 import SAC, PPO  # noqa: E402
@@ -74,16 +78,32 @@ def main():
     model = cls.load(args.policy)
     LOG.info("loaded policy: %s (%s)", args.policy, args.algo)
 
-    # B2 fix: dispatch on action mode from the metadata sidecar.
+    # B2/B2c fix: dispatch on action mode. Priority: --action-mode flag >
+    # metadata sidecar > hard error. A missing sidecar is an ERROR (B2c), not a
+    # silent actuator assumption — a setpoint policy whose sidecar was lost would
+    # otherwise be scored as actuator garbage with only a log line (the exact
+    # original failure). This guard runs before env construction, so the error is
+    # reachable without the IA2 chain up.
     import json
     meta_path = args.policy.replace(".zip", ".json")
-    action_mode = "actuator"   # default if no sidecar
-    if Path(meta_path).exists():
-        meta = json.load(open(meta_path))
-        action_mode = meta.get("action_mode", "actuator")
+    if args.action_mode is not None:
+        action_mode = args.action_mode
+        if Path(meta_path).exists():
+            sidecar_mode = json.load(open(meta_path)).get("action_mode")
+            if sidecar_mode and sidecar_mode != action_mode:
+                LOG.warning("sidecar %s says action_mode=%s but --action-mode=%s "
+                            "given; using the CLI value.", meta_path, sidecar_mode, action_mode)
+    elif Path(meta_path).exists():
+        action_mode = json.load(open(meta_path)).get("action_mode")
+        if action_mode is None:
+            LOG.error("Metadata sidecar %s has no action_mode key. Pass "
+                      "--action-mode {actuator,setpoint} explicitly.", meta_path)
+            sys.exit(1)
     else:
-        LOG.warning("No metadata sidecar at %s — assuming actuator mode. "
-                    "Re-train with train_sb3.py (writes .json sidecar).", meta_path)
+        LOG.error("Cannot determine action mode: no metadata sidecar at %s and no "
+                  "--action-mode given. Re-train with train_sb3.py (it writes the "
+                  ".json sidecar) or pass --action-mode {actuator,setpoint}.", meta_path)
+        sys.exit(1)
     LOG.info("action_mode: %s", action_mode)
 
     plant = ThreeTankModel()

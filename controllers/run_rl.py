@@ -12,8 +12,8 @@ Handles BOTH action modes:
                            PID, supervisory RL-on-PID). Matches AIO-Gym's default.
 
 Usage:
-    python3 controllers/run_rl.py --policy controllers/sac_threetank.zip --action-mode setpoint --backend ia2
-    python3 controllers/run_rl.py --action-mode actuator --backend modbus --policy controllers/sac_cascade.zip
+    python3 controllers/run_rl.py --policy controllers/policies/sac_threetank.zip --action-mode setpoint --backend ia2
+    python3 controllers/run_rl.py --action-mode actuator --backend modbus --policy controllers/policies/sac_cascade.zip
 
 Requires either:
     1) IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` + `cs run`
@@ -46,7 +46,7 @@ LOG = logging.getLogger("rl_supervisor")
 
 def main():
     ap = argparse.ArgumentParser(description="RL supervisor — trained policy on the IA2 or Modbus track.")
-    ap.add_argument("--policy", default=str(ROOT / "controllers" / "sac_threetank.zip"))
+    ap.add_argument("--policy", default=str(ROOT / "controllers" / "policies" / "sac_threetank.zip"))
     ap.add_argument("--backend", default="ia2",
                     help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
     ap.add_argument("--action-mode", default="setpoint", choices=["actuator", "setpoint"])
@@ -138,11 +138,18 @@ def main():
             info = {"levels_m": levels, "temps_c": temps}
 
         rewards.append(reward)
+        # Applied duty for the energy KPI: read back the post-L5-shield
+        # actuator*/heater* registers (raw 0..10000 = 0..1). In setpoint mode the
+        # logged `action` holds setpoints, not duties, so report() must use this
+        # instead — feeding `action` to heater_power() would produce a meaningless
+        # excess_kwh (same fix as validate_policy.py:153-158).
+        applied_duty = [raw_vars.get(n, 0) * 1e-4
+                        for n in ("actuator1", "actuator2", "heater1", "heater2", "heater3")]
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in action], "reward": reward,
-            "interlock": detect_interlock(raw_vars)})
+            "action": [float(x) for x in action], "applied_duty": applied_duty,
+            "reward": reward, "interlock": detect_interlock(raw_vars)})
         if k % 4 == 0 or k == args.steps - 1:
             lv = info.get("levels_m", {}); tp = info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f  r=%.3f",

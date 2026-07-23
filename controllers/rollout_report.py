@@ -55,6 +55,13 @@ def report(steps_data: list[dict], tag: str = "rollout",
     Each entry in steps_data must have:
         step (int), levels (list[3] m), temps (list[3] degC),
         action (list[5] 0-1), reward (float)
+    Optional per-step keys:
+        applied_duty (list[5], 0-1) — post-L5-shield actuator/heater duty used for
+            the energy KPI when `action` is NOT the applied duty (e.g. setpoint-
+            mode policies, where `action` holds normalized setpoints, not duties).
+            If absent, `action` is used (correct for actuator/mpc/nmpc/manual
+            callers, which already log the true duty as `action`).
+        interlock (bool)
     Returns the scorer.report() dict.
     """
     out_dir = Path(out_dir or ROOT / "controllers" / "runs")
@@ -80,8 +87,15 @@ def report(steps_data: list[dict], tag: str = "rollout",
     for sd in steps_data:
         levels = sd["levels"]
         temps = sd["temps"]
-        act = {"pumps": list(sd["action"][:2]), "valves": [],
-               "heaters": list(sd["action"][2:])}
+        # Energy KPI uses the *applied* duty (post-L5-shield) when the caller
+        # supplies it; otherwise fall back to the logged action. Setpoint-mode
+        # policies must supply applied_duty — their `action` holds normalized
+        # setpoints, so feeding it to heater_power() as duty produces a meaningless
+        # excess_kwh (same defect as validate_policy.py:147-165, fixed by reading
+        # back the actuator*/heater* registers).
+        duty = sd.get("applied_duty", sd["action"])
+        act = {"pumps": list(duty[:2]), "valves": [],
+               "heaters": list(duty[2:])}
         env_dict = {"t_cold": t_cold, "t_amb": t_amb, "extra_outflow": 0.0}
         heat_w = model.heater_power(act)
         ideal_w = model.ideal_power(levels, temps, t_sp, env_dict, act)

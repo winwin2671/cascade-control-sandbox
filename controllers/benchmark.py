@@ -106,7 +106,7 @@ def main():
 
     env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
                           action_mode="actuator", episode_steps=args.episode_steps)
-    pairs = [(PIDAgent(env.model), env), (MPCAgent(env.model), env)]
+    pairs = [(FixedAgent(env.model), env), (PIDAgent(env.model), env), (MPCAgent(env.model), env)]
     if args.nmpc:
         from controllers.nmpc_oracle import OracleAgent
         pairs.append((OracleAgent(), env))

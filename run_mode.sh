@@ -119,10 +119,10 @@ case "$MODE" in
   rl)
     # Determine policy path and backend based on train_track and algo
     if [ "$TRAIN_TRACK" = "modbus" ]; then
-      POLICY="$ROOT/controllers/${ALGO}_cascade.zip"
+      POLICY="$ROOT/controllers/policies/${ALGO}_cascade.zip"
       BACKEND="modbus"
     else
-      POLICY="$ROOT/controllers/${ALGO}_threetank.zip"
+      POLICY="$ROOT/controllers/policies/${ALGO}_threetank.zip"
       BACKEND="ia2"
     fi
 

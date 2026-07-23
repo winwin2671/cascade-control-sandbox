@@ -111,7 +111,8 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
                     policy_kwargs=dict(net_arch=[256, 256]))
 
     model.learn(total_timesteps=total_timesteps)
-    out = str(ROOT / "controllers" / f"{algo}_cascade")
+    out = str(ROOT / "controllers" / "policies" / f"{algo}_cascade")
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
     import json
     with open(out + ".json", "w") as f:

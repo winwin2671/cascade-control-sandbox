@@ -148,7 +148,7 @@ python3 controllers/run_mpc.py --backend modbus
 python3 controllers/manual_gui.py --backend edge:my_edge --control-dt 2.0
 
 # Example: Validate a policy on the IA2 track, explicitly enforcing the backend
-python3 controllers/validate_policy.py --policy controllers/sac_threetank.zip --backend ia2
+python3 controllers/validate_policy.py --policy controllers/policies/sac_threetank.zip --backend ia2
 ```
 
 For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
@@ -184,24 +184,25 @@ python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n
 
 **Benchmark (compare all controllers on the same KPI):**
 ```bash
-python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mode kpi
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --reward-mode kpi
 # add --nmpc for the CasADi NMPC oracle (slow)
 ```
 
 Output (AIO-Gym-style KPI table, ranked):
 ```
-=== Benchmark (mode=kpi, 14 eps x 200 steps) ===
+=== Benchmark (mode=kpi, 5 eps x 200 steps) ===
 controller     kpi   ±std temp_err  lvl_cm excess_kwh interlock
 ---------------------------------------------------------------
-RL-SAC       97.13   0.52     0.56    1.83      0.015      0.00
-MPC          86.75   1.81     3.17    2.74      0.262      0.00
-PID          84.18   2.03     3.80    2.35      0.352      0.00
+RL-SAC       97.09   0.63     0.51    1.94      0.019      0.00
+MPC          86.33   1.32     3.41    2.79      0.256      0.00
+PID          83.35   1.57     4.20    2.33      0.355      0.00
+Manual       54.93   2.49     9.65    9.24      0.434      0.18
 ```
 
 > NMPC is excluded by default (CasADi + IPOPT is ~1–4 s/step, adding ~20 min to
 > the benchmark). Include it with `--nmpc`:
 > ```bash
-> python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --nmpc --reward-mode kpi
+> python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --nmpc --reward-mode kpi
 > ```
 
 **Validate (sim-to-real gate — trained policy on the real IA2 track):**
@@ -236,7 +237,7 @@ classical controllers, then validate the winner on the real IA2 track:
 python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n-envs 8
 
 # step 2 — benchmark: PID vs MPC vs RL on the same KPI yardstick
-python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mode kpi
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --reward-mode kpi
 
 # step 3 — validate: run the trained policy on the real IA2 track (boots everything)
 ./run_mode.sh rl                                  # defaults to --algo sac --train_track numpy
@@ -253,7 +254,7 @@ python3 controllers/benchmark.py --rl controllers/sac_threetank.zip --reward-mod
 Launches a tkinter desktop window (rendered on Windows via WSLg):
 
 - **5 sliders** (pump/heater duty, 0–100 %, with live % readout)
-- **Reset button** — new random init levels
+- **Reset button** — re-pulses the reset nonce; tanks snap back to the startup init levels and the episode KPI/history resets
 - **Real-time plot** — levels + temps with setpoint lines
 - **Live KPI readout** — score, temp error, level error
 
@@ -293,7 +294,7 @@ policy using the `./run_mode.sh rl` attributes:
 
 ```bash
 # benchmark (same KPI scorer, same plant comparison)
-python3 controllers/benchmark.py --rl controllers/sac_cascade.zip --reward-mode kpi
+python3 controllers/benchmark.py --rl controllers/policies/sac_cascade.zip --reward-mode kpi
 
 # validate (runs policy directly on mock_cabinet via Modbus backend)
 ./run_mode.sh rl --train_track modbus --algo sac
@@ -328,7 +329,8 @@ cascade-control-sandbox/
 │   ├── aiogym_register.py     # register "threetank" in AIO-Gym's registries
 │   ├── validate_policy.py     # sim-to-real validation gate
 │   ├── rollout_report.py      # shared KPI table + CSV + PNG plot
-│   └── manual_gui.py          # tkinter manual control GUI
+│   ├── manual_gui.py          # tkinter manual control GUI
+│   └── policies/              # trained RL policies (.zip) + action-mode .json sidecars (.zip gitignored)
 ├── tests/
 │   ├── smoke_reset.py         # reset snaps levels to targets
 │   ├── smoke_heater.py        # heater raises temp; cold pump inflow slows it
@@ -397,7 +399,7 @@ pip3 install --user torch stable_baselines3    # see CUDA notes per-OS below
 ./run_mode.sh pid
 
 # benchmark all controllers
-python3 controllers/benchmark.py --rl controllers/sac_threetank.zip
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip
 
 # interactive manual control GUI
 ./run_mode.sh gui

@@ -77,7 +77,8 @@ def main():
 
     model.learn(total_timesteps=args.steps, progress_bar=False)
 
-    out = args.out or str(ROOT / "controllers" / f"{args.algo}_threetank")
+    out = args.out or str(ROOT / "controllers" / "policies" / f"{args.algo}_threetank")
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
     # save metadata sidecar (B2 fix: lets validate_policy.py + run_rl.py auto-detect
     # the action mode — setpoint vs actuator — instead of guessing wrong)
