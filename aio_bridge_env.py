@@ -497,10 +497,17 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
         action = pid_act if pid_act is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
+        # Energy KPI uses the *applied* duty (post-L5-shield registers), not the
+        # raw action: in pid mode `action` holds setpoints, so feeding it to
+        # heater_power() would give a meaningless excess_kwh (same fix as
+        # run_rl.py + validate_policy.py). info["raw"] is stashed by step().
+        applied_duty = [info["raw"].get(n, 0) * 1e-4
+                        for n in ("actuator1", "actuator2", "heater1", "heater2", "heater3")]
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in action], "reward": reward})
+            "action": [float(x) for x in action], "applied_duty": applied_duty,
+            "reward": reward})
         if k % 4 == 0 or k == steps - 1:
             lv = info["levels_m"]
             tp = info.get("temps_c", {})

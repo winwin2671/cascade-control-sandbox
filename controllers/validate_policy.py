@@ -95,9 +95,14 @@ def main():
                             "given; using the CLI value.", meta_path, sidecar_mode, action_mode)
     elif Path(meta_path).exists():
         action_mode = json.load(open(meta_path)).get("action_mode")
-        if action_mode is None:
-            LOG.error("Metadata sidecar %s has no action_mode key. Pass "
-                      "--action-mode {actuator,setpoint} explicitly.", meta_path)
+        # Validate the value, not just presence: a missing key (None), empty
+        # string, typo, or wrong case would otherwise fall through to the
+        # `else "mpc"` branch and silently mis-validate as actuator. Mirror the
+        # CLI's argparse choices.
+        if action_mode not in ("actuator", "setpoint"):
+            LOG.error("Metadata sidecar %s has action_mode=%r; must be 'actuator' "
+                      "or 'setpoint'. Re-train with train_sb3.py (writes the sidecar) "
+                      "or pass --action-mode to override.", meta_path, action_mode)
             sys.exit(1)
     else:
         LOG.error("Cannot determine action mode: no metadata sidecar at %s and no "
