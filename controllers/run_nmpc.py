@@ -69,7 +69,10 @@ def main():
         t0 = time.time()
         act = agent.compute(meas, sp, env.control_dt)
         solve_s = time.time() - t0
-        a = list(act["pumps"]) + list(act["valves"]) + list(act["heaters"])
+        by_name = {"vfd_cmd": act["pumps"][0], "v_12_cmd": act["valves"][0],
+                   "v_23_cmd": act["valves"][1], "v_33_cmd": act["valves"][2],
+                   "e_101_cmd": act["heaters"][0]}
+        a = [float(by_name[n]) for n in env.actuator_names]
         obs, reward, _, _, info = env.step(a)
         if k % 4 == 0 or k == 39:
             lv, tp = info["levels_m"], info.get("temps_c", {})

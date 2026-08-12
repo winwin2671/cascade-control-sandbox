@@ -47,28 +47,29 @@ def register_threetank() -> None:
         return
     _m.MODELS["threetank"] = ThreeTankModel
 
-    # ECON: mirror AIO-Gym's cascade structure (value="none" -> minimize heater
-    # energy + band-violation penalties), with bands around OUR setpoints.
+    # ECON: economic reward (value="none" -> minimize heater energy + band-violation
+    # penalties), bands around OUR setpoints (0.30 m, 45 C).
     _e.ECON["threetank"] = {
         "temp_band": [(40.0, 50.0), (40.0, 50.0), (40.0, 50.0)],   # +-5 degC around 45
-        "level_band": [(0.35, 0.55), (0.35, 0.55)],                 # controlled tanks 0,2; +-0.1 m
+        "level_band": [(0.22, 0.40), (0.22, 0.40), (0.22, 0.40)],   # controlled tanks 0,1,2; +-0.08 m
         "value": "none", "w_value": 0.0, "w_energy": 0.7, "w_viol": 29.0,
     }
 
-    # PIDAgent: pump0->tank1 level, pump1->tank3 level; heater0..2 -> tank1..3 temp.
-    # Gains mirror cascade (tunable). demand_valve_index None (no valves, nV=0).
-    _b.GAINS["threetank"] = {"level_pump": (8.0, 0.4, 0.0), "level_valve": (0.0, 0.0, 0.0),
+    # PIDAgent pairing (inflow-control): pump->tank1 level, valve0(V-12)->tank2,
+    # valve1(V-23)->tank3 level; heater0(E-101)->tank1 temp only (T2/T3 warm via
+    # advection, unactuated). V-33 (valve2, Tank3 drain) is a supervisor-only MV
+    # (not PID-paired). Gains are placeholders — tune at SAT.
+    _b.GAINS["threetank"] = {"level_pump": (8.0, 0.4, 0.0), "level_valve": (5.0, 0.25, 0.0),
                              "temp": (0.06, 0.01, 0.0)}
-    _b.PAIRING["threetank"] = {"level": [("pump", 0, 0), ("pump", 1, 2)],
-                               "temp": [(0, 0, False), (1, 1, False), (2, 2, False)],
+    _b.PAIRING["threetank"] = {"level": [("pump", 0, 0), ("valve", 0, 1), ("valve", 1, 2)],
+                               "temp": [(0, 0, False)],
                                "demand_valve_index": None, "holds": []}
 
-    # Supervisory layout: RL picks temp setpoints (tank0..2) + level setpoints
-    # (controlled tanks 0,2), PID tracks them. Enables action_mode="setpoint"
-    # (AIO-Gym's default — RL-on-PID, much easier than direct actuator control).
+    # Supervisory layout: RL picks 3 temp setpoints + 3 level setpoints (PID tracks
+    # them). Only T1 temp is directly reachable; T2/T3 targets shape the cascade.
     _e.SUPERVISORY["threetank"] = [
         ("t_sp", 0, 20.0, 80.0), ("t_sp", 1, 20.0, 80.0), ("t_sp", 2, 20.0, 80.0),
-        ("h_sp", 0, 0.15, 0.55), ("h_sp", 2, 0.15, 0.55),
+        ("h_sp", 0, 0.15, 0.45), ("h_sp", 1, 0.15, 0.45), ("h_sp", 2, 0.15, 0.45),
     ]
     # No PLANT_REGIME entry -> randomize_plant uses the default (no regime shift).
     _registered = True

@@ -63,7 +63,12 @@ def main():
                 "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
                 "t_cold": model.t_supply, "t_amb": model.t_ambient}
         act = mpc.compute(meas, sp, env.control_dt)
-        a = list(act["pumps"]) + list(act["valves"]) + list(act["heaters"])  # [p1,p2,h1,h2,h3]
+        # map MPC's abstract layout (pumps/valves/heaters) -> contract actuator order
+        # (model: pumps=[VFD], valves=[V-12,V-23,V-33], heaters=[E-101])
+        by_name = {"vfd_cmd": act["pumps"][0], "v_12_cmd": act["valves"][0],
+                   "v_23_cmd": act["valves"][1], "v_33_cmd": act["valves"][2],
+                   "e_101_cmd": act["heaters"][0]}
+        a = [float(by_name[n]) for n in env.actuator_names]
         obs, reward, _, _, info = env.step(a)
         if k % 4 == 0 or k == 39:
             lv, tp = info["levels_m"], info.get("temps_c", {})

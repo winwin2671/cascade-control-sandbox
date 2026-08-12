@@ -27,22 +27,18 @@ RHO_CP = 1000.0 * 4186.0
 
 # ----------------------------------------------------------------------------
 # Symbolic continuous dynamics dx/dt = f(x, u, d, p) — mirror mock_cabinet.py.
-# x = [h1, T1, h2, T2, h3, T3]; u = [p1, p2, heater1, heater2, heater3] in [0,1];
+# x = [h1, T1, h2, T2, h3, T3]; u = [pump, V-12, V-23, V-33, heater] in [0,1];
 # d = [t_cold, t_amb]; p = ThreeTankModel.p.
 # ----------------------------------------------------------------------------
-def _flow_sym(h_from, h_to, coeff, p):
-    """Smooth Torricelli flow + its forward/backward parts (well-mixed advection).
+def _valve_flow_sym(h_from, h_to, c_v, frac, p):
+    """Unidirectional valve-modulated Torricelli flow (symbolic, downhill only).
 
-    q = coeff*S_PIPE*sqrt(2g)*sign(dh)*sqrt(|dh|), split into forward (dh>0) and
-    backward (dh<0) via ca.fmax so the advection term carries the upstream temp.
-    """
+    q = frac * c_v * sqrt(2g * max(dh, 0)); frac in [0,1] is the valve position,
+    c_v the effective orifice. The sqrt argument is floored at 1e-9 (NOT 0) so its
+    derivative stays finite in IPOPT's constraint Jacobian. Downhill-only, so the
+    advection term always carries the upstream temperature (no backward split)."""
     dh = h_from - h_to
-    k = coeff * p["S_PIPE"] * ca.sqrt(2 * p["G"])
-    # floor the sqrt argument at 1e-9 (NOT 0): sqrt(0) has an infinite derivative
-    # -> NaN in IPOPT's constraint Jacobian. (Same trick as AIO-Gym's _f_cascade.)
-    fwd = k * ca.sqrt(ca.fmax(dh, 1e-9))
-    bwd = k * ca.sqrt(ca.fmax(-dh, 1e-9))
-    return fwd - bwd, fwd, bwd
+    return frac * c_v * ca.sqrt(2 * p["G"]) * ca.sqrt(ca.fmax(dh, 1e-9))
 
 
 def _dT_sym(T, h, q_heat, adv, t_amb, p):
@@ -55,21 +51,20 @@ def _dT_sym(T, h, q_heat, adv, t_amb, p):
 def _f_threetank(x, u, d, p):
     t_cold, t_amb = d[0], d[1]
     h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
-    q1 = u[0] * p["q_max"]
-    q2 = u[1] * p["q_max"]
-    q_12, f12, b12 = _flow_sym(h1, h2, p["A1"], p)
-    q_32, f32, b32 = _flow_sym(h3, h2, p["A3"], p)
-    q_drain, _, _ = _flow_sym(h2, 0.0, p["A2"], p)
-    dh1 = (q1 - q_12) / p["A_TANK"]
-    dh3 = (q2 - q_32) / p["A_TANK"]
-    dh2 = (q_12 + q_32 - q_drain) / p["A_TANK"]
-    Qh = [u[2 + i] * p["q_heat_max"] for i in range(3)]
-    adv1 = q1 * (t_cold - T1) + b12 * (T2 - T1)
-    adv2 = f12 * (T1 - T2) + f32 * (T3 - T2)
-    adv3 = q2 * (t_cold - T3) + b32 * (T2 - T3)
-    dT1 = _dT_sym(T1, h1, Qh[0], adv1, t_amb, p)
-    dT2 = _dT_sym(T2, h2, Qh[1], adv2, t_amb, p)
-    dT3 = _dT_sym(T3, h3, Qh[2], adv3, t_amb, p)
+    q_pump = u[0] * p["q_max"]                                      # P-101 -> Tank1
+    q_12 = _valve_flow_sym(h1, h2, p["C_V12"], u[1], p)            # V-12: Tank1 -> Tank2
+    q_23 = _valve_flow_sym(h2, h3, p["C_V23"], u[2], p)            # V-23: Tank2 -> Tank3
+    q_3r = _valve_flow_sym(h3, 0.0, p["C_V33"], u[3], p)           # V-33: Tank3 -> reservoir
+    dh1 = (q_pump - q_12) / p["A_TANK"]
+    dh2 = (q_12 - q_23) / p["A_TANK"]
+    dh3 = (q_23 - q_3r) / p["A_TANK"]
+    Qh1 = u[4] * p["q_heat_max"]                                    # single heater in Tank1
+    adv1 = q_pump * (t_cold - T1)        # recirc returns reservoir-temp water
+    adv2 = q_12 * (T1 - T2)             # hot Tank1 outflow -> Tank2
+    adv3 = q_23 * (T2 - T3)             # Tank2 outflow -> Tank3
+    dT1 = _dT_sym(T1, h1, Qh1, adv1, t_amb, p)
+    dT2 = _dT_sym(T2, h2, 0.0, adv2, t_amb, p)
+    dT3 = _dT_sym(T3, h3, 0.0, adv3, t_amb, p)
     return ca.vertcat(dh1, dT1, dh2, dT2, dh3, dT3)
 
 
