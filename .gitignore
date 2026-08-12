@@ -24,3 +24,6 @@ runs/
 # IA2 machine-local state (server open-project tracking)
 projects/.ia2-open-projects.json
 projects/
+
+
+Electrical_BOM_for_heated_tanks.md

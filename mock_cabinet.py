@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
-"""mock_cabinet.py — three-tank "decoupled" process simulator (Modbus TCP server).
+"""mock_cabinet.py — heated serial-cascade + recirculation process simulator (Modbus).
 
-A pymodbus TCP *server* (slave) bound to 127.0.0.1:5020 that exposes the
-holding-register map described in `ia2_config.json`.  An asyncio physics loop
-updates the sensor registers (levels and temperatures) every tick from
-whatever actuator-command registers a Modbus master (the IA2 engine, a
-hand-written controller, or an RL agent) writes.
+A pymodbus TCP server bound to 127.0.0.1:5020 that emulates the field cabinet
+behind the RTU-to-TCP gateway described in ia2_config.json. It serves MULTIPLE
+Modbus slaves (one SimDevice per unit_id) with segregated function codes:
 
-**Config-driven.**  The register layout (names, addresses, directions) and the
-engineering<->raw scales are read from `ia2_config.json` — the same single
-contract `tools/gen_ia2_artifacts.py` uses to generate the IA2 device/iomap
-TOMLs, so the cabinet, the iomap, and the bridge env can never drift apart.
-Adding a register (reset, heaters, ...) is a contract edit; this file picks it
-up automatically.  What stays *here* is the process semantics: the 3-tank
-topology and which register name maps to which physics state.
+    slave 2  AI     FC04 input registers  (3 levels + 2 temps + 3 flows, float)
+    slave 5  AI #2  FC04 input registers  (TT-301, float)
+    slave 3  AO+    FC06/FC16 holding     (V-12, V-23, E-101 cmds [float] + reset [uint16])
+    slave 4  DI     FC02 discrete inputs  (5 hardware-safety-status flags)
+    slave 6  VFD    FC16 holding          (P-101 frequency cmd, float)
 
-Process topology — canonical three-tank benchmark (Amira DTS200-style):
+Process topology — heated serial cascade with recirculation:
 
-    pump q1 --> Tank 1
-    pump q2 --> Tank 3
-    Tank 1 --(valve a1)--> Tank 2     (Tank 1 & Tank 3 both couple into the
-    Tank 3 --(valve a3)--> Tank 2      middle Tank 2 -> the decoupling problem)
-    Tank 2 --(valve a2)--> reservoir (drain)
-    heater i --> Tank i   (SSR, 0..Q_heat_max W; thermal mass m = rho.A.h_i)
+    pump P-101 --> Tank 1 --(prop. valve V-12)--> Tank 2 --(prop. valve V-23)--> Tank 3
+                                              Tank 3 --(manual valve V-3)--> Reservoir
+                                              Reservoir --(P-101)--> Tank 1   (recirculation)
+    heater E-101 (2 kW) --> Tank 1 only
 
-Tank 1 and Tank 3 are each fed by their own pump, but their levels are
-hydraulically coupled through Tank 2.  Driving Tank 1 / Tank 3 levels
-*independently* in the face of that coupling is the classic *decoupling*
-control problem — hence "Tank 3 (Decoupled)".
+Tank1 is the only directly-heated tank; Tank2/Tank3 warm via downstream hot-water
+advection (the under-actuated temperature coupling). Reservoir is modeled as
+infinite (constant level, constant temp = supply).
 
-Register encoding (uint16), defined in ia2_config.json:  engineering = raw * scale.
+Config-driven. The register layout (names, slave_ids, addresses, function codes,
+data types, byte/word order) is read from ia2_config.json — the same single
+contract the IA2 iomap and aio_bridge_env.py use. 32-bit floats are stored as
+two big-endian (ABCD) registers via pack_float_be.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -41,6 +36,7 @@ import json
 import logging
 import math
 import signal
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,51 +47,55 @@ from pymodbus.simulator.simutils import DataType
 CONFIG_PATH = Path(__file__).resolve().parent / "ia2_config.json"
 
 # --------------------------------------------------------------------------- #
-# Physics model constants (NOT in the contract — these are internal tuning).
-# Contract values (q_max / h_max / t_supply) come from ia2_config.json instead.
+# Physics constants (gravity only is universal; geometry/coeffs come from the
+# contract process block — they are PLACEHOLDERS until the rig is measured).
 # --------------------------------------------------------------------------- #
 G = 9.81  # gravity, m/s^2
-A_TANK = 0.0154  # tank cross-sectional area, m^2
-S_PIPE = 5.0e-5  # connecting-pipe cross-section, m^2
-A1 = 0.5  # outflow coefficient, Tank1<->Tank2 coupling
-A2 = 0.5  # outflow coefficient, Tank2 -> reservoir drain
-A3 = 0.5  # outflow coefficient, Tank3<->Tank2 coupling
-# Thermal params (cp, rho, Q_heat_max, UA, T_ambient) come from ia2_config.json.
 
-# Register-name -> physics-state attribute (the cabinet's domain semantics).
+# Register-name -> process-state attribute.
 LEVEL_ATTR = {"tank1_level": "h1", "tank2_level": "h2", "tank3_level": "h3"}
 TEMP_ATTR = {"tank1_temp": "T1", "tank2_temp": "T2", "tank3_temp": "T3"}
-# Actuator-name -> pump index (order of the q tuple passed to step()).
-ACTUATOR_Q = {"actuator1": 0, "actuator2": 1}
-# Heater register names, in tank order (heater1->Tank1, ...).
-HEATER_REG = ["heater1", "heater2", "heater3"]
+FLOW_ATTR = {"tank1_flow": "q12_lpm", "tank2_flow": "q23_lpm", "tank3_flow": "q3r_lpm"}
+DI_ATTR = {"di_dryfire": "di_dryfire", "di_overflow": "di_overflow",
+           "di_heater_contactor": "di_heater_contactor",
+           "di_pump_contactor": "di_pump_contactor", "di_estop": "di_estop"}
+
+# Actuator command register names (decoded from their slave holding blocks).
+VFD_CMD, V12_CMD, V23_CMD, E101_CMD = "vfd_cmd", "v_12_cmd", "v_23_cmd", "e_101_cmd"
 
 
-def _pos(x: float) -> float:
-    """Positive part: max(x, 0)."""
-    return x if x > 0.0 else 0.0
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else (hi if x > hi else x)
 
-
-def _neg(x: float) -> float:
-    """Negative part: max(-x, 0)."""
-    return -x if x < 0.0 else 0.0
-
-
-def _frac(raw: int, act_max: int) -> float:
-    """Raw actuator/heater drive (0..act_max) -> [0, 1] fraction."""
-    return max(0.0, min(float(raw), float(act_max))) / float(act_max)
 
 # Episode reset (driven by the env between episodes via reset_cmd + init_h*).
 RESET_CMD = "reset_cmd"
 INIT_LEVEL_ATTR = {"init_h1": "h1", "init_h2": "h2", "init_h3": "h3"}
-LEVEL_DEFAULTS = {"h1": 0.30, "h2": 0.18, "h3": 0.24}  # when an init_h* register is 0
-RESET_TEMP_C = 24.0  # warm-start temperature after a reset
+LEVEL_DEFAULTS = {"h1": 0.30, "h2": 0.22, "h3": 0.18}  # when an init_h* register is 0
+RESET_TEMP_C = 25.0  # warm-start temperature after a reset (= supply/ambient)
 
 LOG = logging.getLogger("mock_cabinet")
 
 
 # --------------------------------------------------------------------------- #
-# Contract loading
+# 32-bit float register codec (Modbus "ABCD": big-endian bytes, high word first).
+# MUST match aio_bridge_env.decode_float — the mock encodes, the bridge decodes.
+# --------------------------------------------------------------------------- #
+def pack_float_be(v: float) -> list[int]:
+    """Encode a float to two big-endian (ABCD) 16-bit registers."""
+    b = struct.pack(">f", float(v))
+    return [int.from_bytes(b[0:2], "big"), int.from_bytes(b[2:4], "big")]
+
+
+def unpack_float_be(regs) -> float:
+    """Decode two big-endian (ABCD) 16-bit registers back to a float."""
+    r0, r1 = int(regs[0]), int(regs[1])
+    raw = bytes(((r0 >> 8) & 0xFF, r0 & 0xFF, (r1 >> 8) & 0xFF, r1 & 0xFF))
+    return struct.unpack(">f", raw)[0]
+
+
+# --------------------------------------------------------------------------- #
+# Contract loading + layout
 # --------------------------------------------------------------------------- #
 def load_contract(path: str | Path | None = None) -> dict:
     with open(path or CONFIG_PATH) as fh:
@@ -104,258 +104,313 @@ def load_contract(path: str | Path | None = None) -> dict:
 
 @dataclass
 class Layout:
-    """Register layout derived from the contract (all ordered by address)."""
-
-    names: list[str]            # every register, address order
-    addr: dict[str, int]        # name -> 0-based address
-    scale: dict[str, float]     # name -> engineering-per-raw
-    sensors: list[str]          # direction = "read", address order
-    actuators: list[str]        # direction = "write", address order
-
-    @property
-    def base(self) -> int:
-        return min(self.addr.values())
-
-    @property
-    def n(self) -> int:
-        return len(self.names)
+    """Register layout derived from the contract, grouped for multi-slave I/O."""
+    regs: list[dict]                       # all registers, sorted by (slave_id, address)
+    by_name: dict[str, dict]
+    sensors: list[dict]                    # direction = "read"
+    actuators: list[dict]                  # direction = "write", group = "actuators"
+    by_slave: dict[int, list[dict]]        # slave_id -> its registers (address order)
+    holding_by_slave: dict[int, list[dict]]   # slaves the physics loop must READ (cmds/reset)
+    publish_by_slave: dict[int, list[dict]]   # slaves the physics loop must WRITE (input/discrete)
 
 
-def derive_layout(contract: dict) -> Layout:
-    regs = sorted(contract["registers"], key=lambda r: r["address"])
+def derive_layout(contract: dict) -> "Layout":
+    regs = sorted(contract["registers"], key=lambda r: (r["slave_id"], r["address"]))
+    by_slave: dict[int, list[dict]] = {}
+    for r in regs:
+        by_slave.setdefault(r["slave_id"], []).append(r)
+    holding_by_slave = {sid: [r for r in rs if r["table"] == "holding"] for sid, rs in by_slave.items()}
+    holding_by_slave = {sid: rs for sid, rs in holding_by_slave.items() if rs}
+    publish_by_slave = {
+        sid: [r for r in rs if r["table"] in ("input", "discrete_input")]
+        for sid, rs in by_slave.items()
+    }
+    publish_by_slave = {sid: rs for sid, rs in publish_by_slave.items() if rs}
     return Layout(
-        names=[r["name"] for r in regs],
-        addr={r["name"]: int(r["address"]) for r in regs},
-        scale={r["name"]: float(r["scale"]) for r in regs},
-        sensors=[r["name"] for r in regs if r["direction"] == "read"],
-        actuators=[r["name"] for r in regs if r["direction"] == "write"],
+        regs=regs,
+        by_name={r["name"]: r for r in regs},
+        sensors=[r for r in regs if r["direction"] == "read"],
+        actuators=[r for r in regs if r["direction"] == "write" and r.get("group") == "actuators"],
+        by_slave=by_slave,
+        holding_by_slave=holding_by_slave,
+        publish_by_slave=publish_by_slave,
     )
 
 
 @dataclass
 class PhysicsParams:
     """Contract-sourced process parameters fed to the integrator."""
-
-    q_max: float       # max pump flow, m^3/s
-    h_max: float       # tank height (overflow), m
-    t_supply: float    # inlet/supply temperature, degC
-    act_max: int       # raw full-scale actuator/heater drive (= round(1/scale))
-    cp: float          # specific heat capacity, J/(kg.K)
-    rho: float         # water density, kg/m^3
-    q_heat_max: float  # max electrical heater power per tank, W
-    ua: float          # overall heat-loss coefficient, W/K
-    t_ambient: float   # ambient (heat-sink) temperature, degC
+    q_max: float        # max pump flow at full VFD, m^3/s
+    vfd_max_hz: float   # VFD frequency at full pump speed, Hz
+    h_max: float        # tank height (overflow), m
+    t_supply: float     # reservoir/supply temperature, degC
+    a_tank: float       # tank cross-section, m^2
+    c_v12: float        # V-12 effective orifice (C_d * area), m^2
+    c_v23: float        # V-23 effective orifice, m^2
+    c_v3: float         # V-3 (manual) effective orifice, m^2
+    cp: float           # specific heat capacity, J/(kg.K)
+    rho: float          # water density, kg/m^3
+    q_heat_max: float   # max electrical heater power (E-101, 2 kW), W
+    ua: float           # overall heat-loss coefficient, W/K
+    t_ambient: float    # ambient (heat-sink) temperature, degC
 
     @classmethod
     def from_contract(cls, contract: dict) -> "PhysicsParams":
         p = contract["process"]
-        act_scale = next(r["scale"] for r in contract["registers"]
-                         if r["name"] in ACTUATOR_Q)
         return cls(
-            q_max=float(p["q_max_m3s"]), h_max=float(p["h_max_m"]),
-            t_supply=float(p["t_supply_c"]), act_max=round(1.0 / act_scale),
+            q_max=float(p["q_max_m3s"]), vfd_max_hz=float(p["vfd_max_hz"]),
+            h_max=float(p["h_max_m"]), t_supply=float(p["t_supply_c"]),
+            a_tank=float(p["a_tank_m2"]),
+            c_v12=float(p["c_v12"]), c_v23=float(p["c_v23"]), c_v3=float(p["c_v3"]),
             cp=float(p["cp_j_per_kgk"]), rho=float(p["rho_kg_per_m3"]),
             q_heat_max=float(p["q_heat_max_w"]), ua=float(p["ua_w_per_k"]),
             t_ambient=float(p["t_ambient_c"]),
         )
 
 
-def _flow(h_from: float, h_to: float, coeff: float) -> float:
-    """Signed Torricelli volumetric flow (m^3/s) between two tank levels."""
+def _valve_flow(h_from: float, h_to: float, c_v: float, frac: float) -> float:
+    """Unidirectional, valve-modulated Torricelli volumetric flow (m^3/s).
+
+    Only flows downhill (h_from > h_to); `frac` in [0,1] is the valve position
+    (1.0 for the manual V-3 which is fixed open). `c_v` is the effective orifice.
+    """
     dh = h_from - h_to
-    if abs(dh) < 1e-9:
+    if dh <= 1e-9:
         return 0.0
-    return coeff * S_PIPE * math.copysign(math.sqrt(2.0 * G * abs(dh)), dh)
+    return _clamp(frac, 0.0, 1.0) * c_v * math.sqrt(2.0 * G * dh)
 
 
 @dataclass
 class TankProcess:
-    """State of the three-tank process (SI units)."""
+    """State of the heated serial-cascade process (SI units)."""
 
     h1: float = 0.30
-    h2: float = 0.18
-    h3: float = 0.24
-    T1: float = 24.0  # warm start; relaxes toward t_supply (20 C) as pumps run
-    T2: float = 24.0
-    T3: float = 24.0
+    h2: float = 0.22
+    h3: float = 0.18
+    T1: float = 25.0
+    T2: float = 25.0
+    T3: float = 25.0
+    # last-computed inter-tank flows (L/min) — published to the FT sensors
+    q12_lpm: float = 0.0
+    q23_lpm: float = 0.0
+    q3r_lpm: float = 0.0
+    # emulated hardware safety-status flags (the real ones are hardwired relays)
+    di_dryfire: int = 0
+    di_overflow: int = 0
+    di_heater_contactor: int = 0
+    di_pump_contactor: int = 0
+    di_estop: int = 0
 
-    def step(self, cmd1: int, cmd2: int, heat1: int, heat2: int, heat3: int,
+    def step(self, vfd_hz: float, v12_pct: float, v23_pct: float, e101_pct: float,
              dt: float, p: PhysicsParams) -> None:
-        """Advance one Euler step of `dt` seconds given pump + heater commands.
+        """Advance one Euler step given the 4 actuator commands.
 
-        Hydraulics: Torricelli inter-tank flows + mass balance (levels).
-        Thermal: first law on each tank (control volume = the water in it),
-
-            m.cp.dT/dt = Q_heat - Q_loss + (advective enthalpy in - out)
-
-        where m = rho.A.h (level-coupled thermal mass), Q_heat = SSR duty *
-        Q_heat_max, Q_loss = UA.(T - T_amb), and the advective term is the sum
-        of rho.cp.q.T over the pipe flows (cold supply water in, warm tank
-        water out). A fuller tank has more mass -> heats/cools more slowly,
-        which is the level -> temperature coupling that makes this cascade.
+        Hydraulics: pump recirculation into Tank1 + unidirectional valve-modulated
+        Torricelli cascade T1->T2->T3->reservoir. Thermal: first law per tank
+        (m.cp.dT/dt = Q_heat - Q_loss + advection) with the heater only in Tank1;
+        Tank2/Tank3 warm solely via downstream hot-water advection.
         """
-        # --- pumps: raw drive -> volumetric inflow (m^3/s) ---
-        q1 = _frac(cmd1, p.act_max) * p.q_max   # pump1 -> Tank1
-        q2 = _frac(cmd2, p.act_max) * p.q_max   # pump2 -> Tank3
+        # --- hydraulics ---
+        vfd_frac = _clamp(vfd_hz / p.vfd_max_hz, 0.0, 1.0)
+        q_pump = vfd_frac * p.q_max                                   # P-101 -> Tank1
+        v12_frac = _clamp(v12_pct / 100.0, 0.0, 1.0)
+        v23_frac = _clamp(v23_pct / 100.0, 0.0, 1.0)
+        q_12 = _valve_flow(self.h1, self.h2, p.c_v12, v12_frac)       # Tank1 -> Tank2
+        q_23 = _valve_flow(self.h2, self.h3, p.c_v23, v23_frac)       # Tank2 -> Tank3
+        q_3r = _valve_flow(self.h3, 0.0, p.c_v3, 1.0)                 # Tank3 -> reservoir (V-3 manual)
 
-        # --- hydraulic coupling: signed Torricelli flows between levels ---
-        q_12 = _flow(self.h1, self.h2, A1)      # Tank1 <-> Tank2 (+ = T1->T2)
-        q_32 = _flow(self.h3, self.h2, A3)      # Tank3 <-> Tank2 (+ = T3->T2)
-        q_drain = _flow(self.h2, 0.0, A2)       # Tank2 -> reservoir
-
-        self.h1 += (q1 - q_12) * dt / A_TANK
-        self.h3 += (q2 - q_32) * dt / A_TANK
-        self.h2 += (q_12 + q_32 - q_drain) * dt / A_TANK
+        self.h1 += (q_pump - q_12) * dt / p.a_tank
+        self.h2 += (q_12 - q_23) * dt / p.a_tank
+        self.h3 += (q_23 - q_3r) * dt / p.a_tank
         for attr in ("h1", "h2", "h3"):
-            setattr(self, attr, max(0.0, min(getattr(self, attr), p.h_max)))
+            setattr(self, attr, _clamp(getattr(self, attr), 0.0, p.h_max))
 
-        # --- heaters: SSR duty fraction -> electrical power (W) ---
-        Qh1 = p.q_heat_max * _frac(heat1, p.act_max)
-        Qh2 = p.q_heat_max * _frac(heat2, p.act_max)
-        Qh3 = p.q_heat_max * _frac(heat3, p.act_max)
+        self.q12_lpm = q_12 * 60000.0
+        self.q23_lpm = q_23 * 60000.0
+        self.q3r_lpm = q_3r * 60000.0
 
-        # --- advective mixing: sum over INFLOWS of q_in*(T_source - T_tank)
-        # (the well-mixed-tank term; outflow drops out because it removes
-        # tank-temperature water, which cannot change T). Split each inter-tank
-        # flow into forward/backward parts so an inflow always carries its
-        # upstream temperature. ---
-        f12, b12 = _pos(q_12), _neg(q_12)       # T1->T2 forward, T2->T1 back
-        f32, b32 = _pos(q_32), _neg(q_32)       # T3->T2 forward, T2->T3 back
-        adv1 = q1 * (p.t_supply - self.T1) + b12 * (self.T2 - self.T1)
-        adv2 = f12 * (self.T1 - self.T2) + f32 * (self.T3 - self.T2)
-        adv3 = q2 * (p.t_supply - self.T3) + b32 * (self.T2 - self.T3)
-
+        # --- thermal: single heater in Tank1; chain advection ---
+        Qh1 = _clamp(e101_pct / 100.0, 0.0, 1.0) * p.q_heat_max
+        adv1 = q_pump * (p.t_supply - self.T1)      # recirc returns reservoir-temp water to Tank1
+        adv2 = q_12 * (self.T1 - self.T2)           # hot Tank1 outflow -> Tank2
+        adv3 = q_23 * (self.T2 - self.T3)           # Tank2 outflow -> Tank3 (Tank3 loses via q_3r: outflow drops out)
         self._step_thermal("T1", "h1", Qh1, adv1, dt, p)
-        self._step_thermal("T2", "h2", Qh2, adv2, dt, p)
-        self._step_thermal("T3", "h3", Qh3, adv3, dt, p)
+        self._step_thermal("T2", "h2", 0.0, adv2, dt, p)
+        self._step_thermal("T3", "h3", 0.0, adv3, dt, p)
+
+        # --- emulated safety flags (real ones are hardwired; mock reflects state) ---
+        self.di_dryfire = 1 if self.h1 < 0.05 else 0
+        self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > 0.45 else 0
+        self.di_heater_contactor = 1 if Qh1 > 0.0 else 0
+        self.di_pump_contactor = 1 if q_pump > 0.0 else 0
+        self.di_estop = 0
 
     def _step_thermal(self, t_attr: str, h_attr: str, q_heat: float,
                       adv: float, dt: float, p: PhysicsParams) -> None:
-        """One Euler step of the energy balance for one tank.
-
-        q_heat: heater power (W). adv: sum over INFLOWS of q_in*(T_source - T)
-                (m^3.K/s) -- the well-mixed-tank mixing term (outflow drops
-                out). m = rho.A.h is the thermal mass, so the response slows as
-                the level rises.
-        """
         T = getattr(self, t_attr)
         h = max(getattr(self, h_attr), 0.02)        # guard against empty-tank /0
-        m_cp = p.rho * A_TANK * h * p.cp            # thermal capacitance, J/K
-        q_loss = p.ua * (T - p.t_ambient)           # Newton cooling, W
-        dT = (q_heat - q_loss) / m_cp * dt + adv / (A_TANK * h) * dt
-        setattr(self, t_attr, max(0.0, min(T + dT, 100.0)))
+        m_cp = p.rho * p.a_tank * h * p.cp           # thermal capacitance, J/K
+        q_loss = p.ua * (T - p.t_ambient)            # Newton cooling, W
+        dT = (q_heat - q_loss) / m_cp * dt + adv / (p.a_tank * h) * dt
+        setattr(self, t_attr, _clamp(T + dT, 0.0, 100.0))
 
     def snapshot(self) -> dict:
         return {
-            "h1_cm": round(self.h1 * 100, 2), "h2_cm": round(self.h2 * 100, 2),
-            "h3_cm": round(self.h3 * 100, 2),
-            "T1": round(self.T1, 2), "T2": round(self.T2, 2), "T3": round(self.T3, 2),
+            "h_cm": [round(self.h1 * 100, 2), round(self.h2 * 100, 2), round(self.h3 * 100, 2)],
+            "T": [round(self.T1, 2), round(self.T2, 2), round(self.T3, 2)],
+            "flow_lpm": [round(self.q12_lpm, 2), round(self.q23_lpm, 2), round(self.q3r_lpm, 2)],
         }
 
 
 # --------------------------------------------------------------------------- #
-# Encoding (engineering -> raw uint16), driven by the contract scales
+# Encoding (engineering -> raw register values), driven by the contract
 # --------------------------------------------------------------------------- #
-def encode_sensor(name: str, proc: TankProcess, scale: float, h_max: float) -> int:
-    """raw = engineering / scale, clamped to the register's physical range."""
+def encode_channel(reg: dict, proc: TankProcess, params: PhysicsParams) -> list:
+    """Raw values for one read channel: 2 ints (float), 1 int (uint16), or 1 bool (DI)."""
+    name = reg["name"]
+    if reg["type"] == "bool":
+        return [bool(getattr(proc, DI_ATTR[name]))]   # BITS demands bools, not ints
     if name in LEVEL_ATTR:
-        eng = max(0.0, min(getattr(proc, LEVEL_ATTR[name]), h_max))
+        eng = _clamp(getattr(proc, LEVEL_ATTR[name]), 0.0, params.h_max)
     elif name in TEMP_ATTR:
-        eng = max(0.0, min(getattr(proc, TEMP_ATTR[name]), 100.0))
+        eng = _clamp(getattr(proc, TEMP_ATTR[name]), 0.0, 100.0)
+    elif name in FLOW_ATTR:
+        eng = _clamp(getattr(proc, FLOW_ATTR[name]), 0.0, float(reg.get("max", 50.0)))
     else:
-        raise ValueError(f"don't know how to encode sensor register '{name}'")
-    return int(round(eng / scale))
-
-
-def sensor_registers(proc: TankProcess, layout: Layout, params: PhysicsParams) -> list[int]:
-    """Sensor values in address order (the order iomap/async_setValues expect)."""
-    return [encode_sensor(s, proc, layout.scale[s], params.h_max) for s in layout.sensors]
+        return [0] * int(reg.get("count", 1))
+    return pack_float_be(eng)
 
 
 def apply_reset(proc: TankProcess, regval: dict, layout: Layout, params: PhysicsParams) -> None:
     """Snap the process to the requested initial state (episode reset).
 
-    Levels come from the init_h* registers (raw -> m via the contract scale); a
-    zero/missing init register falls back to the default. Temps return to a warm
-    start. Triggered by the rising edge of reset_cmd in physics_loop.
+    Levels come from the init_h* registers (raw uint16 -> m via the contract
+    scale); a zero/missing init register falls back to the default. Temps return
+    to a warm start. Triggered by a value-change of reset_cmd in physics_loop.
     """
     for reg, attr in INIT_LEVEL_ATTR.items():
         raw = regval.get(reg, 0)
-        val = (raw * layout.scale[reg]) if raw and reg in layout.scale else LEVEL_DEFAULTS[attr]
-        setattr(proc, attr, max(0.0, min(val, params.h_max)))
+        r = layout.by_name.get(reg)
+        scale = float(r["scale"]) if r else 0.0001
+        val = (raw * scale) if raw else LEVEL_DEFAULTS[attr]
+        setattr(proc, attr, _clamp(val, 0.0, params.h_max))
     for attr in ("T1", "T2", "T3"):
         setattr(proc, attr, RESET_TEMP_C)
 
 
-def build_server(host: str, port: int, unit_id: int, proc: TankProcess,
+def _decode_holding(raw_vals: list[int], regs: list[dict]) -> dict:
+    """Decode a contiguous holding block into {name: value} (float/uint16)."""
+    out: dict = {}
+    base = regs[0]["address"]
+    for r in regs:
+        off = r["address"] - base
+        chunk = raw_vals[off:off + int(r["count"])]
+        if r["type"] == "float":
+            out[r["name"]] = unpack_float_be(chunk)
+        elif r["type"] == "uint16":
+            out[r["name"]] = int(chunk[0])
+        else:
+            out[r["name"]] = chunk[0]
+    return out
+
+
+def _simdata_blocks(regs_on_slave: list[dict], proc: TankProcess, params: PhysicsParams):
+    """Build the (coils, discrete_in, holding, input_reg) SimData 4-tuple for a slave.
+
+    pymodbus requires ALL FOUR tuple slots to be non-empty (its block checker
+    indexes [0]), so empty tables get a 1-value dummy block. Real read tables
+    (input/discrete) are seeded with the encoded process state; write tables
+    (holding) start at zero. Note SimData `count` *repeats* the values list, so
+    for a list of N distinct register values we leave count at its default (1).
+    """
+    by_table: dict[str, list[dict]] = {}
+    for r in regs_on_slave:
+        by_table.setdefault(r["table"], []).append(r)
+
+    def block(table: str, datatype, is_read: bool) -> list:
+        rs = sorted(by_table.get(table, []), key=lambda r: r["address"])
+        if not rs:
+            dummy = False if datatype == DataType.BITS else 0
+            return [SimData(0, values=[dummy], datatype=datatype)]  # non-empty placeholder
+        vals: list = []
+        for r in rs:
+            vals += encode_channel(r, proc, params) if is_read else [0] * int(r["count"])
+        return [SimData(rs[0]["address"], values=vals, datatype=datatype)]  # count defaults to 1
+
+    return (block("coil", DataType.BITS, True),
+            block("discrete_input", DataType.BITS, True),
+            block("holding", DataType.REGISTERS, False),
+            block("input", DataType.REGISTERS, True))
+
+
+def build_server(host: str, port: int, proc: TankProcess,
                  layout: Layout, params: PhysicsParams) -> ModbusTcpServer:
-    """Create the pymodbus TCP server; initial regs = encoded state + actuators off."""
-    initial: list[int] = []
-    for name in layout.names:
-        if name in LEVEL_ATTR or name in TEMP_ATTR:
-            initial.append(encode_sensor(name, proc, layout.scale[name], params.h_max))
-        else:  # actuators (and any future non-sensor output) start at 0
-            initial.append(0)
-    hr = SimData(layout.base, values=initial, datatype=DataType.REGISTERS)
-    device = SimDevice(unit_id, simdata=[hr])
-    return ModbusTcpServer(context=[device], address=(host, port))
+    """One SimDevice per slave (multi-slave on a single TCP listener)."""
+    devices = []
+    for slave_id in sorted(layout.by_slave):
+        c, d, h, i = _simdata_blocks(layout.by_slave[slave_id], proc, params)
+        devices.append(SimDevice(slave_id, simdata=(c, d, h, i)))
+    return ModbusTcpServer(context=devices, address=(host, port))
 
 
 async def physics_loop(
-    server: ModbusTcpServer, unit_id: int, proc: TankProcess,
-    layout: Layout, params: PhysicsParams, dt: float, log_every: int,
-    time_scale: float = 1.0,
+    server: ModbusTcpServer, proc: TankProcess, layout: Layout,
+    params: PhysicsParams, dt: float, log_every: int, time_scale: float = 1.0,
 ) -> None:
-    """Tick: read actuator regs, integrate physics, write sensor regs.
+    """Tick: read actuator/reset regs (per slave), integrate physics, publish sensors.
 
-    `dt` is the plant-seconds integrated per tick (kept small for Euler
-    accuracy). `time_scale` > 1 runs faster than real-time (training): the
-    wall-clock sleep per tick is `dt/time_scale`, so the plant advances
-    time_scale x per wall-second. The physics step itself is unchanged, so
-    accuracy doesn't degrade with speed.
-
-    Assumes the register block is contiguous from `layout.base` (true for the
-    current contract; revisit if future registers fragment the address space).
+    `dt` is plant-seconds per tick; `time_scale` > 1 compresses wall-clock
+    (training). Reads union every slave's holding block so reset_cmd (slave 03)
+    is visible alongside the VFD (slave 06) and valve/heater cmds (slave 03).
     """
-    sensor_base = min(layout.addr[s] for s in layout.sensors)
     tick = 0
     prev_reset_val = 0
     wall_budget = dt / time_scale
-    next_deadline = asyncio.get_event_loop().time() + wall_budget  # C8: absolute deadline
-    while True:
-        all_vals = await server.async_getValues(unit_id, 3, layout.base, layout.n)
-        regval = {name: int(v) for name, v in zip(layout.names, all_vals)}
+    next_deadline = asyncio.get_event_loop().time() + wall_budget
 
-        # Episode reset: a CHANGE to a new nonzero reset_cmd value snaps state
-        # to init_h*; while reset_cmd stays nonzero the plant HOLDS that state
-        # (no step) so the env can read clean init levels; writing 0 resumes
-        # stepping. Value-change (not boolean edge) so back-to-back resets with
-        # only a brief 0 between them still trigger — the env writes a fresh
-        # nonce each reset.
+    # Pre-compute the holding read plan (slave_id -> (base, count, sorted regs)).
+    holding_plan = {}
+    for sid, regs in layout.holding_by_slave.items():
+        regs = sorted(regs, key=lambda r: r["address"])
+        holding_plan[sid] = (regs[0]["address"], sum(int(r["count"]) for r in regs), regs)
+
+    while True:
+        # --- read all holding (actuator + reset) blocks, union into regval ---
+        regval: dict = {}
+        for sid, (base, count, regs) in holding_plan.items():
+            raw = await server.async_getValues(sid, 3, base, count)
+            regval.update(_decode_holding(raw, regs))
+
+        # --- episode reset (nonce value-change on reset_cmd, slave 03) ---
         reset_val = int(regval.get(RESET_CMD, 0))
         if reset_val != 0 and reset_val != prev_reset_val:
             apply_reset(proc, regval, layout, params)
             LOG.info("reset applied -> %s", proc.snapshot())
         if reset_val == 0:
-            proc.step(regval.get("actuator1", 0), regval.get("actuator2", 0),
-                      regval.get("heater1", 0), regval.get("heater2", 0),
-                      regval.get("heater3", 0), dt, params)
+            proc.step(regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
+                      regval.get(V23_CMD, 0.0), regval.get(E101_CMD, 0.0), dt, params)
         prev_reset_val = reset_val
 
-        await server.async_setValues(
-            unit_id, 16, sensor_base, sensor_registers(proc, layout, params)
-        )
+        # --- publish sensors + DI flags to each slave's read blocks ---
+        for sid, regs in layout.publish_by_slave.items():
+            by_table: dict[str, list[dict]] = {}
+            for r in regs:
+                by_table.setdefault(r["table"], []).append(r)
+            for table, fc in (("input", 4), ("discrete_input", 2)):
+                if table not in by_table:
+                    continue
+                rs = sorted(by_table[table], key=lambda r: r["address"])
+                vals: list[int] = []
+                for r in rs:
+                    vals += encode_channel(r, proc, params)
+                await server.async_setValues(sid, fc, rs[0]["address"], vals)
 
         tick += 1
         if log_every and tick % log_every == 0:
-            LOG.info("pump=[%5d %5d] heat=[%5d %5d %5d]  %s",
-                     regval.get("actuator1", 0), regval.get("actuator2", 0),
-                     regval.get("heater1", 0), regval.get("heater2", 0),
-                     regval.get("heater3", 0), proc.snapshot())
-        # C8 fix: absolute deadline compensation — carry the overshoot into the next
-        # tick. If tick N's work+sleep took longer than wall_budget, tick N+1 gets a
-        # shorter sleep to catch up. This keeps the effective time-scale close to the
-        # target even at high k or under host load (measured k′ within ~5% at k=100).
+            LOG.info("vfd=%5.1fHz v12=%5.1f v23=%5.1f e101=%5.1f  %s",
+                     regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
+                     regval.get(V23_CMD, 0.0), regval.get(E101_CMD, 0.0), proc.snapshot())
+
         now = asyncio.get_event_loop().time()
         remaining = next_deadline - now
         if remaining > 0:
@@ -374,7 +429,7 @@ def _install_signals(loop: asyncio.AbstractEventLoop, server: ModbusTcpServer) -
 
 
 async def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Three-tank Modbus TCP cabinet.")
+    parser = argparse.ArgumentParser(description="Heated serial-cascade Modbus cabinet.")
     parser.add_argument("--config", default=str(CONFIG_PATH),
                         help="path to ia2_config.json (the register contract)")
     parser.add_argument("--host", default=None, help="bind host (default: contract)")
@@ -396,22 +451,21 @@ async def main(argv: list[str] | None = None) -> None:
     contract = load_contract(args.config)
     layout = derive_layout(contract)
     params = PhysicsParams.from_contract(contract)
-    unit_id = int(contract["modbus"]["unit_id"])
     host = args.host or contract["modbus"]["host"]
     port = args.port or int(contract["modbus"]["port"])
 
     proc = TankProcess()
-    server = build_server(host, port, unit_id, proc, layout, params)
+    server = build_server(host, port, proc, layout, params)
     _install_signals(asyncio.get_running_loop(), server)
 
     phys = asyncio.create_task(
-        physics_loop(server, unit_id, proc, layout, params, args.dt, args.log_every,
-                     args.time_scale),
+        physics_loop(server, proc, layout, params, args.dt, args.log_every, args.time_scale),
         name="physics",
     )
     LOG.info(
-        "listening on %s:%d (device_id=%d, %d regs, %sx) — %s",
-        host, port, unit_id, layout.n, args.time_scale, proc.snapshot(),
+        "listening on %s:%d — %d slaves (%s), %dx — %s",
+        host, port, len(layout.by_slave),
+        ",".join(str(s) for s in sorted(layout.by_slave)), args.time_scale, proc.snapshot(),
     )
 
     try:
