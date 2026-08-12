@@ -16,24 +16,19 @@ port = 5020
 name = "di_dryfire"
 kind = "discrete_input"
 address = 0
-data_type = "bool"
 [[channels]]
 name = "di_overflow"
 kind = "discrete_input"
 address = 1
-data_type = "bool"
 [[channels]]
 name = "di_heater_contactor"
 kind = "discrete_input"
 address = 2
-data_type = "bool"
 [[channels]]
 name = "di_pump_contactor"
 kind = "discrete_input"
 address = 3
-data_type = "bool"
 [[channels]]
 name = "di_estop"
 kind = "discrete_input"
 address = 4
-data_type = "bool"

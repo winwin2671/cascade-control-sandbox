@@ -36,9 +36,9 @@ def detect_interlock(raw_snapshot: dict) -> bool:
     are not detected (the PID's intermediate output isn't in the snapshot).
     """
     for req_name, mapped_name in [
-        ("actuator1_req", "actuator1"), ("actuator2_req", "actuator2"),
-        ("heater1_req", "heater1"), ("heater2_req", "heater2"),
-        ("heater3_req", "heater3"),
+        ("vfd_cmd_req", "vfd_cmd"), ("v_12_cmd_req", "v_12_cmd"),
+        ("v_23_cmd_req", "v_23_cmd"), ("v_33_cmd_req", "v_33_cmd"),
+        ("e_101_cmd_req", "e_101_cmd"),
     ]:
         req = raw_snapshot.get(req_name, 0)
         mapped = raw_snapshot.get(mapped_name, 0)
@@ -93,10 +93,14 @@ def report(steps_data: list[dict], tag: str = "rollout",
         # setpoints, so feeding it to heater_power() as duty produces a meaningless
         # excess_kwh (same defect as validate_policy.py:147-165, fixed by reading
         # back the actuator*/heater* registers).
+        # duty = applied (post-L5) actuator FRACTIONS in contract order
+        # [v_12, v_23, e_101, v_33, vfd]; map to the model's pumps/valves/heaters.
         duty = sd.get("applied_duty", sd["action"])
-        act = {"pumps": list(duty[:2]), "valves": [],
-               "heaters": list(duty[2:])}
-        env_dict = {"t_cold": t_cold, "t_amb": t_amb, "extra_outflow": 0.0}
+        dmap = dict(zip(["v_12_cmd", "v_23_cmd", "e_101_cmd", "v_33_cmd", "vfd_cmd"], duty))
+        act = {"pumps": [dmap["vfd_cmd"]],
+               "valves": [dmap["v_12_cmd"], dmap["v_23_cmd"], dmap["v_33_cmd"]],
+               "heaters": [dmap["e_101_cmd"]]}
+        env_dict = {"t_cold": t_cold, "t_amb": t_amb}
         heat_w = model.heater_power(act)
         ideal_w = model.ideal_power(levels, temps, t_sp, env_dict, act)
         scorer.step_penalty(levels, temps, h_sp, t_sp,

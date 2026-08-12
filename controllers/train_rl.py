@@ -28,33 +28,30 @@ LOG = logging.getLogger("train_rl")
 
 
 def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb):
-    """C5 fix: wrap CascadeBridgeEnv to produce the same 13-dim obs as AIO-Gym.
+    """Wrap CascadeBridgeEnv to append setpoint + ambient context to the raw obs.
 
-    AIO-Gym's obs = [levels(3), temps(3), t_sp(3), h_sp_ctrl(2), t_cold, t_amb].
-    The raw CascadeBridgeEnv returns 6-dim [h1,T1,h2,T2,h3,T3]. This wrapper
-    reorders to [h1,h2,h3, T1,T2,T3] and appends the 7 context values so the
-    policy trained on the Modbus track sees the same obs as the numpy track."""
+    The raw bridge obs is 14-dim (3 levels + 3 temps + 3 flows + 5 DI). We append
+    the 3 level setpoints, 3 temp setpoints, and the supply/ambient temperatures
+    (8 values) so the policy sees its targets and the heat-sink temperatures."""
     import gymnasium as gym
     from gymnasium.wrappers import TimeLimit
 
     base = CascadeBridgeEnv(backend="modbus", port=port, control_dt=control_dt)
+    n_base = base.observation_space.shape[0]
+    ctx = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"],
+           *tsp, t_cold, t_amb]
 
     class EnrichedObs(gym.ObservationWrapper):
         def __init__(self, env):
             super().__init__(env)
-            import numpy as np
             from gymnasium import spaces
-            lo = np.full(13, -np.inf, dtype=np.float32)
-            hi = np.full(13, np.inf, dtype=np.float32)
-            self.observation_space = spaces.Box(lo, hi, dtype=np.float32)
+            n = n_base + len(ctx)
+            self.observation_space = spaces.Box(
+                np.full(n, -np.inf, dtype=np.float32),
+                np.full(n, np.inf, dtype=np.float32), dtype=np.float32)
 
         def observation(self, obs):
-            # obs = [h1, T1, h2, T2, h3, T3] → [h1,h2,h3, T1,T2,T3, t_sp×3, h_sp×2, tc, ta]
-            levels = [obs[0], obs[2], obs[4]]
-            temps = [obs[1], obs[3], obs[5]]
-            h_sp_ctrl = [hsp["tank1_level"], hsp["tank3_level"]]
-            return np.array(levels + temps + list(tsp) + h_sp_ctrl + [t_cold, t_amb],
-                           dtype=np.float32)
+            return np.concatenate([obs, np.array(ctx, dtype=np.float32)])
 
     return TimeLimit(EnrichedObs(base), max_episode_steps=200)
 

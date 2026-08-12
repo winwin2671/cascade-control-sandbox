@@ -51,7 +51,8 @@ def main():
     ap.add_argument("--algo", default="sac", choices=["sac", "ppo"])
     ap.add_argument("--reward-mode", default="economic", choices=["kpi", "economic", "track"])
     ap.add_argument("--action-mode", default="setpoint", choices=["actuator", "setpoint"],
-                    help="setpoint = RL picks targets, PID tracks (AIO-Gym default; easier)")
+                    help="setpoint = RL picks targets, PID tracks (default). "
+                         "actuator = RL drives the 5 MVs directly.")
     ap.add_argument("--n-envs", type=int, default=4)
     ap.add_argument("--steps", type=int, default=30000)
     ap.add_argument("--episode-steps", type=int, default=400)

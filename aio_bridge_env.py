@@ -116,6 +116,10 @@ def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict:
         suf = _suffix(full)
         full_names[suf] = full
         s = str(v["value"]).strip()
+        tn = str(v.get("type_name", "")).upper()
+        if tn == "BOOL" or s in ("TRUE", "FALSE", "True", "False"):
+            out[suf] = (s.upper() == "TRUE")
+            continue
         try:
             out[suf] = int(s)
         except (ValueError, TypeError):
@@ -227,7 +231,18 @@ class _IA2HttpBase(Backend):
 
     def write_register(self, name: str, value) -> None:
         full = self._full_names.get(name, name)
-        self._post_write(full, value)            # pass-through (int for uint16 vars, float for REAL)
+        self._post_write(full, self._i32_value(value))
+
+    @staticmethod
+    def _i32_value(value) -> int:
+        """IA2 variable-write takes i32. REAL vars take their IEEE-754 bits (the VM
+        slot is f32::to_bits); integer vars (UINT/INT/DINT/BOOL) take the value
+        directly. Floats -> bit-cast, ints/bools -> as-is."""
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, float):
+            return struct.unpack("<i", struct.pack("<f", float(value)))[0]
+        return int(value)
 
     def close(self) -> None:
         pass
@@ -525,7 +540,10 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
             "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
             "flows": [float(obs[6]), float(obs[7]), float(obs[8])],
-            "action": [float(x) for x in action], "reward": reward})
+            "action": [float(x) for x in action],
+            "applied_duty": [float(info["raw"].get(n, 0.0)) / env._act_max[n]
+                              for n in env.actuator_names],
+            "reward": reward})
         if k % 4 == 0 or k == steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  "

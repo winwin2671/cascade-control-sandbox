@@ -69,9 +69,10 @@ def run(agent, env, episodes, seed):
 
 class RLAgent:
     """Trained RL policy (SB3 SAC/PPO) wrapped as an agent for evaluate()."""
-    def __init__(self, model_path):
+    def __init__(self, plant, model_path):
         from stable_baselines3 import SAC, PPO
         import json as _json
+        self.plant = plant                       # for actuator_counts() + controlled_levels()
         # Read algo from metadata sidecar; fall back to trying SAC then PPO
         algo = "sac"
         sidecar = model_path.replace(".zip", ".json")
@@ -87,12 +88,15 @@ class RLAgent:
         pass
 
     def compute(self, meas, sp, dt):
-        ctrl = [0, 2]   # controlled_levels
+        ctrl = self.plant.controlled_levels()
         obs = (meas["levels"] + meas["temps"] + list(sp["t_sp"])
                + [sp["h_sp"][i] for i in ctrl] + [meas["t_cold"], meas["t_amb"]])
         action, _ = self.model.predict(np.array(obs, dtype=np.float32), deterministic=True)
         action = np.clip(np.asarray(action, dtype=np.float64).flatten(), 0.0, 1.0)
-        return {"pumps": list(action[:2]), "valves": [], "heaters": list(action[2:])}
+        nP, nV, nH = self.plant.actuator_counts()
+        return {"pumps": list(action[:nP]),
+                "valves": list(action[nP:nP + nV]),
+                "heaters": list(action[nP + nV:])}
 
 
 def main():
@@ -111,13 +115,11 @@ def main():
         from controllers.nmpc_oracle import OracleAgent
         pairs.append((OracleAgent(), env))
     if args.rl:
-        # RL trained in setpoint mode (picks targets, PID tracks) -> evaluate on
-        # a setpoint-mode env so its output is interpreted correctly. PID/MPC
-        # stay on the actuator-mode env. The KPI scores are comparable (same
-        # plant + scorer + reward mode).
+        # RL is trained in actuator mode (direct 5-MV) -> evaluate on the same
+        # actuator-mode env. KPI scores are comparable (same plant + scorer + reward).
         rl_env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
-                                  action_mode="setpoint", episode_steps=args.episode_steps)
-        pairs.append((RLAgent(args.rl), rl_env))
+                                  action_mode="actuator", episode_steps=args.episode_steps)
+        pairs.append((RLAgent(env.model, args.rl), rl_env))
 
     results = sorted((run(a, e, args.episodes, 0) for a, e in pairs),
                      key=lambda r: r["kpi"], reverse=True)

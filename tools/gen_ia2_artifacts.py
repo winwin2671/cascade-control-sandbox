@@ -77,18 +77,24 @@ def _device_name_for_slave(cfg: dict, slave_id: int) -> str:
 
 
 def _channel_block(r: dict) -> list[str]:
-    """One IA2 [[channels]] block for a contract register."""
-    dt = _data_type_for(r)
+    """One IA2 [[channels]] block for a contract register.
+
+    Coils/discrete_inputs ignore data_type (IA2's ModbusDataType has no `bool`),
+    so emit name/kind/address only for those; holding/input registers get
+    data_type (+ word_order for 32-bit)."""
+    kind = _kind_for(r)
     lines = [
         "[[channels]]",
         f"name = \"{r['name']}\"",
-        f"kind = \"{_kind_for(r)}\"",
+        f"kind = \"{kind}\"",
         f"address = {r['address']}",
-        f"data_type = \"{dt}\"",
     ]
-    if dt in _WIDE:
-        wo = WORD_ORDER_MAP.get(r.get("word_order", "big"), "hi_lo")
-        lines.append(f"word_order = \"{wo}\"")
+    if kind in ("holding_register", "input_register"):
+        dt = _data_type_for(r)
+        lines.append(f"data_type = \"{dt}\"")
+        if dt in _WIDE:
+            wo = WORD_ORDER_MAP.get(r.get("word_order", "big"), "hi_lo")
+            lines.append(f"word_order = \"{wo}\"")
     return lines
 
 
