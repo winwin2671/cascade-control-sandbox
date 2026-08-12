@@ -1,7 +1,7 @@
 {
   "$schema": "cascade-control-sandbox/ia2_config/v2",
   "project": "cascade_control_sandbox",
-  "description": "Register <-> engineering-variable map for the HEATED SERIAL-CASCADE + recirculation plant. Single contract shared by mock_cabinet.py (encoder), the IA2 Modbus iomap (ia2_project/, via tools/gen_ia2_artifacts.py), and aio_bridge_env.py (decoder). Topology: tank1 --V-12--> tank2 --V-23--> tank3 --V-3(manual)--> reservoir --P-101(VFD)--> tank1; one 2kW heater (E-101) in tank1. Multi-slave via an RTU-to-TCP gateway; analog values are 32-bit floats (2 regs, big-endian ABCD); safety statuses are FC02 discretes.",
+  "description": "Register <-> engineering-variable map for the HEATED SERIAL-CASCADE + recirculation plant. Single contract shared by mock_cabinet.py (encoder), the IA2 Modbus iomap (ia2_project/, via tools/gen_ia2_artifacts.py), and aio_bridge_env.py (decoder). Topology: tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; one 2kW heater (E-101) in tank1. Multi-slave via an RTU-to-TCP gateway; analog values are 32-bit floats (2 regs, big-endian ABCD); safety statuses are FC02 discretes.",
 
   "modbus": {
     "transport": "tcp",
@@ -82,19 +82,24 @@
      "type": "float", "count": 2, "byte_order": "big", "word_order": "big", "scale": 1.0,
      "units": "percent", "min": 0.0, "max": 100.0, "direction": "write", "group": "actuators",
      "physical": "heater_e101_duty", "ia2_variable": "ThreeTank.e_101_cmd"},
-    {"name": "reset_cmd", "plc": 40004, "slave_id": 3, "address": 6, "table": "holding", "fc": 6,
+    {"name": "v_33_cmd", "plc": 40004, "slave_id": 3, "address": 6, "table": "holding", "fc": 16,
+     "type": "float", "count": 2, "byte_order": "big", "word_order": "big", "scale": 1.0,
+     "units": "percent", "min": 0.0, "max": 100.0, "direction": "write", "group": "actuators",
+     "physical": "valve_v33_position", "ia2_variable": "ThreeTank.v_33_cmd",
+     "note": "V-33 control valve, Tank3 -> reservoir (was V-3 manual). AO Ch 3, fail-closed. BOM lists FC06 but a float is 2 regs -> FC16."},
+    {"name": "reset_cmd", "plc": 40005, "slave_id": 3, "address": 8, "table": "holding", "fc": 6,
      "type": "uint16", "count": 1, "scale": 1.0,
      "units": "nonce", "min": 0.0, "max": 65535.0, "direction": "write", "group": "reset",
      "ia2_variable": "ThreeTank.reset_cmd"},
-    {"name": "init_h1", "plc": 40005, "slave_id": 3, "address": 7, "table": "holding", "fc": 6,
+    {"name": "init_h1", "plc": 40006, "slave_id": 3, "address": 9, "table": "holding", "fc": 6,
      "type": "uint16", "count": 1, "scale": 0.0001,
      "units": "m", "min": 0.0, "max": 0.5, "direction": "write", "group": "reset",
      "ia2_variable": "ThreeTank.init_h1"},
-    {"name": "init_h2", "plc": 40006, "slave_id": 3, "address": 8, "table": "holding", "fc": 6,
+    {"name": "init_h2", "plc": 40007, "slave_id": 3, "address": 10, "table": "holding", "fc": 6,
      "type": "uint16", "count": 1, "scale": 0.0001,
      "units": "m", "min": 0.0, "max": 0.5, "direction": "write", "group": "reset",
      "ia2_variable": "ThreeTank.init_h2"},
-    {"name": "init_h3", "plc": 40007, "slave_id": 3, "address": 9, "table": "holding", "fc": 6,
+    {"name": "init_h3", "plc": 40008, "slave_id": 3, "address": 11, "table": "holding", "fc": 6,
      "type": "uint16", "count": 1, "scale": 0.0001,
      "units": "m", "min": 0.0, "max": 0.5, "direction": "write", "group": "reset",
      "ia2_variable": "ThreeTank.init_h3"},
@@ -134,7 +139,7 @@
     "tank1_flow", "tank2_flow", "tank3_flow",
     "di_dryfire", "di_overflow", "di_heater_contactor", "di_pump_contactor", "di_estop"
   ],
-  "actuators": ["v_12_cmd", "v_23_cmd", "e_101_cmd", "vfd_cmd"],
+  "actuators": ["v_12_cmd", "v_23_cmd", "e_101_cmd", "v_33_cmd", "vfd_cmd"],
 
   "reset": {
     "command_register": "reset_cmd",
@@ -144,7 +149,7 @@
   },
 
   "process": {
-    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-3(manual)--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. Reservoir modeled as infinite (constant level, constant temp = supply).",
+    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. Reservoir modeled as infinite (constant level, constant temp = supply).",
     "q_max_m3s": 0.0002,
     "h_max_m": 0.5,
     "t_supply_c": 25.0,
@@ -152,13 +157,13 @@
     "vfd_max_hz": 50.0,
     "c_v12": 1.5e-4,
     "c_v23": 1.5e-4,
-    "c_v3": 1.5e-4,
+    "c_v33": 1.5e-4,
     "cp_j_per_kgk": 4180.0,
     "rho_kg_per_m3": 1000.0,
     "q_heat_max_w": 2000.0,
     "ua_w_per_k": 8.0,
     "t_ambient_c": 25.0,
-    "_placeholders": ["a_tank_m2", "q_max_m3s", "c_v12", "c_v23", "c_v3", "ua_w_per_k"],
+    "_placeholders": ["a_tank_m2", "q_max_m3s", "c_v12", "c_v23", "c_v33", "ua_w_per_k"],
     "_placeholder_note": "Physics values not yet measured. a_tank_m2 (tank diameter), q_max_m3s (pump curve), c_v* (valve Cv), ua_w_per_k (heat loss) must be refined from the mechanical drawings + pump/valve datasheets + bench SAT. q_heat_max_w=2000 is the real 2kW heater; h_max_m=0.5 from the level sensor span.",
     "_drift_warning": "mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py hand-mirror these ODEs; all three must change together."
   },
@@ -181,7 +186,7 @@
     "mode_vars": {
       "manual": ["manual_vfd", "manual_v12", "manual_v23", "manual_h1"],
       "pid": ["tank1_level_sp", "tank2_level_sp", "tank3_level_sp", "tank1_temp_sp"],
-      "mpc_rl": ["v_12_cmd_req", "v_23_cmd_req", "e_101_cmd_req", "vfd_cmd_req"]
+      "mpc_rl": ["v_12_cmd_req", "v_23_cmd_req", "e_101_cmd_req", "v_33_cmd_req", "vfd_cmd_req"]
     }
   },
 

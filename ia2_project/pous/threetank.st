@@ -2,9 +2,11 @@
   ThreeTank — IA2 PLC program for the HEATED SERIAL-CASCADE rig.
 
   Topology: pump P-101 -> Tank1 --(V-12)--> Tank2 --(V-23)--> Tank3
-            --(manual V-3)--> Reservoir --(P-101)--> Tank1 (recirculation).
+            --(V-33)--> Reservoir --(P-101)--> Tank1 (recirculation).
             One heater E-101 (2 kW) in Tank1 only; Tank2/Tank3 warm via
             downstream hot-water advection (under-actuated temperature).
+            V-33 (Tank3 -> reservoir) is an actuated control valve used as a
+            supervisor MV: PID holds it open as the free drain, MPC/RL modulate.
 
   Control-mode selector (Manual / PID / MPC / RL) + L5 software shield.
 
@@ -50,11 +52,13 @@ PROGRAM ThreeTank
     vfd_cmd   : REAL;   (* P-101 VFD frequency, 0..50 Hz *)
     v_12_cmd  : REAL;   (* V-12 position, 0..100 % *)
     v_23_cmd  : REAL;   (* V-23 position, 0..100 % *)
+    v_33_cmd  : REAL;   (* V-33 position, 0..100 % (Tank3 -> reservoir) *)
     e_101_cmd : REAL;   (* E-101 heater duty, 0..100 % *)
     (* agent requests for MPC/RL (PLC-internal, API-written; body never assigns) *)
     vfd_cmd_req   : REAL;
     v_12_cmd_req  : REAL;
     v_23_cmd_req  : REAL;
+    v_33_cmd_req  : REAL;
     e_101_cmd_req : REAL;
     (* episode reset (iomap output; env-driven; body does not assign) *)
     reset_cmd : UINT;
@@ -70,15 +74,16 @@ PROGRAM ThreeTank
     manual_vfd : REAL;         (* 0..50 Hz *)
     manual_v12 : REAL;         (* 0..100 % *)
     manual_v23 : REAL;
+    manual_v33 : REAL;
     manual_h1  : REAL;
     (* FB instances *)
     pid_l1 : FB_PID;  pid_l2 : FB_PID;  pid_l3 : FB_PID;  pid_t1 : FB_PID;
     msta_vfd : FB_MANSTATION;  msta_v12 : FB_MANSTATION;
-    msta_v23 : FB_MANSTATION;  msta_h1  : FB_MANSTATION;
+    msta_v23 : FB_MANSTATION;  msta_v33 : FB_MANSTATION;  msta_h1  : FB_MANSTATION;
     (* per-actuator request working vars (REAL eng units; locals so FB outputs
        are never the leftmost operand of an IF — ironplc gotcha 8). *)
-    up_vfd : REAL;  up_v12 : REAL;  up_v23 : REAL;  up_h1 : REAL;
-    out_vfd : REAL; out_v12 : REAL; out_v23 : REAL; out_h1 : REAL;
+    up_vfd : REAL;  up_v12 : REAL;  up_v23 : REAL;  up_v33 : REAL;  up_h1 : REAL;
+    out_vfd : REAL; out_v12 : REAL; out_v23 : REAL; out_v33 : REAL; out_h1 : REAL;
     (* R2 fix: independent interlock latches. Trip on DI/threshold, clear with margin. *)
     overflow_trip : BOOL;
     dryfire_trip  : BOOL;
@@ -112,13 +117,17 @@ PROGRAM ThreeTank
   (* ---------- mode selects the upstream request (REAL eng units) ---------- *)
   CASE mode OF
     0 (* MANUAL *):
-      up_vfd := manual_vfd;  up_v12 := manual_v12;  up_v23 := manual_v23;  up_h1 := manual_h1;
+      up_vfd := manual_vfd;  up_v12 := manual_v12;  up_v23 := manual_v23;
+      up_v33 := manual_v33;  up_h1 := manual_h1;
     1 (* PID *):
-      up_vfd := pid_l1.out;  up_v12 := pid_l2.out;  up_v23 := pid_l3.out;  up_h1 := pid_t1.out;
+      up_vfd := pid_l1.out;  up_v12 := pid_l2.out;  up_v23 := pid_l3.out;
+      up_v33 := 100.0;       (* V-33 has no PID loop -> held open as the free drain *)
+      up_h1 := pid_t1.out;
     2, 3 (* MPC, RL *):
-      up_vfd := vfd_cmd_req;  up_v12 := v_12_cmd_req;  up_v23 := v_23_cmd_req;  up_h1 := e_101_cmd_req;
+      up_vfd := vfd_cmd_req;  up_v12 := v_12_cmd_req;  up_v23 := v_23_cmd_req;
+      up_v33 := v_33_cmd_req;  up_h1 := e_101_cmd_req;
     ELSE  (* unknown mode -> safe (all outputs to 0) *)
-      up_vfd := 0.0;  up_v12 := 0.0;  up_v23 := 0.0;  up_h1 := 0.0;
+      up_vfd := 0.0;  up_v12 := 0.0;  up_v23 := 0.0;  up_v33 := 0.0;  up_h1 := 0.0;
   END_CASE;
 
   (* ---------- FB_MANSTATION: bumpless manual<->auto ---------- *)
@@ -128,9 +137,12 @@ PROGRAM ThreeTank
            out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_v23(auto_in := up_v23, auto := (mode <> 0), manual_out := manual_v23,
            out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+  msta_v33(auto_in := up_v33, auto := (mode <> 0), manual_out := manual_v33,
+           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
   msta_h1(auto_in := up_h1, auto := (mode <> 0), manual_out := manual_h1,
           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
-  out_vfd := msta_vfd.out;  out_v12 := msta_v12.out;  out_v23 := msta_v23.out;  out_h1 := msta_h1.out;
+  out_vfd := msta_vfd.out;  out_v12 := msta_v12.out;  out_v23 := msta_v23.out;
+  out_v33 := msta_v33.out;  out_h1 := msta_h1.out;
 
   (* ---------- L5 shield: eng clamp + hardware/software interlocks ----------
      R2 fix: 3 independent latches (overflow / dry-fire / over-temp). Each trips
@@ -172,6 +184,15 @@ PROGRAM ThreeTank
     v_23_cmd := 100.0;
   ELSE
     v_23_cmd := out_v23;
+  END_IF;
+
+  (* V-33 (Tank3 -> reservoir): spring-close on overflow, else clamp *)
+  IF overflow_trip THEN
+    v_33_cmd := 0.0;
+  ELSIF out_v33 > 100.0 THEN
+    v_33_cmd := 100.0;
+  ELSE
+    v_33_cmd := out_v33;
   END_IF;
 
   (* E-101 heater: cut on dry-fire / over-temp / e-stop *)

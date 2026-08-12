@@ -61,7 +61,7 @@ DI_ATTR = {"di_dryfire": "di_dryfire", "di_overflow": "di_overflow",
            "di_pump_contactor": "di_pump_contactor", "di_estop": "di_estop"}
 
 # Actuator command register names (decoded from their slave holding blocks).
-VFD_CMD, V12_CMD, V23_CMD, E101_CMD = "vfd_cmd", "v_12_cmd", "v_23_cmd", "e_101_cmd"
+VFD_CMD, V12_CMD, V23_CMD, V33_CMD, E101_CMD = "vfd_cmd", "v_12_cmd", "v_23_cmd", "v_33_cmd", "e_101_cmd"
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -147,7 +147,7 @@ class PhysicsParams:
     a_tank: float       # tank cross-section, m^2
     c_v12: float        # V-12 effective orifice (C_d * area), m^2
     c_v23: float        # V-23 effective orifice, m^2
-    c_v3: float         # V-3 (manual) effective orifice, m^2
+    c_v33: float        # V-33 effective orifice (Tank3 -> reservoir), m^2
     cp: float           # specific heat capacity, J/(kg.K)
     rho: float          # water density, kg/m^3
     q_heat_max: float   # max electrical heater power (E-101, 2 kW), W
@@ -161,7 +161,7 @@ class PhysicsParams:
             q_max=float(p["q_max_m3s"]), vfd_max_hz=float(p["vfd_max_hz"]),
             h_max=float(p["h_max_m"]), t_supply=float(p["t_supply_c"]),
             a_tank=float(p["a_tank_m2"]),
-            c_v12=float(p["c_v12"]), c_v23=float(p["c_v23"]), c_v3=float(p["c_v3"]),
+            c_v12=float(p["c_v12"]), c_v23=float(p["c_v23"]), c_v33=float(p["c_v33"]),
             cp=float(p["cp_j_per_kgk"]), rho=float(p["rho_kg_per_m3"]),
             q_heat_max=float(p["q_heat_max_w"]), ua=float(p["ua_w_per_k"]),
             t_ambient=float(p["t_ambient_c"]),
@@ -201,8 +201,8 @@ class TankProcess:
     di_pump_contactor: int = 0
     di_estop: int = 0
 
-    def step(self, vfd_hz: float, v12_pct: float, v23_pct: float, e101_pct: float,
-             dt: float, p: PhysicsParams) -> None:
+    def step(self, vfd_hz: float, v12_pct: float, v23_pct: float, v33_pct: float,
+             e101_pct: float, dt: float, p: PhysicsParams) -> None:
         """Advance one Euler step given the 4 actuator commands.
 
         Hydraulics: pump recirculation into Tank1 + unidirectional valve-modulated
@@ -215,9 +215,10 @@ class TankProcess:
         q_pump = vfd_frac * p.q_max                                   # P-101 -> Tank1
         v12_frac = _clamp(v12_pct / 100.0, 0.0, 1.0)
         v23_frac = _clamp(v23_pct / 100.0, 0.0, 1.0)
+        v33_frac = _clamp(v33_pct / 100.0, 0.0, 1.0)
         q_12 = _valve_flow(self.h1, self.h2, p.c_v12, v12_frac)       # Tank1 -> Tank2
         q_23 = _valve_flow(self.h2, self.h3, p.c_v23, v23_frac)       # Tank2 -> Tank3
-        q_3r = _valve_flow(self.h3, 0.0, p.c_v3, 1.0)                 # Tank3 -> reservoir (V-3 manual)
+        q_3r = _valve_flow(self.h3, 0.0, p.c_v33, v33_frac)           # Tank3 -> reservoir (V-33 control)
 
         self.h1 += (q_pump - q_12) * dt / p.a_tank
         self.h2 += (q_12 - q_23) * dt / p.a_tank
@@ -388,7 +389,8 @@ async def physics_loop(
             LOG.info("reset applied -> %s", proc.snapshot())
         if reset_val == 0:
             proc.step(regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
-                      regval.get(V23_CMD, 0.0), regval.get(E101_CMD, 0.0), dt, params)
+                      regval.get(V23_CMD, 0.0), regval.get(V33_CMD, 0.0),
+                      regval.get(E101_CMD, 0.0), dt, params)
         prev_reset_val = reset_val
 
         # --- publish sensors + DI flags to each slave's read blocks ---
@@ -407,9 +409,10 @@ async def physics_loop(
 
         tick += 1
         if log_every and tick % log_every == 0:
-            LOG.info("vfd=%5.1fHz v12=%5.1f v23=%5.1f e101=%5.1f  %s",
+            LOG.info("vfd=%5.1fHz v12=%5.1f v23=%5.1f v33=%5.1f e101=%5.1f  %s",
                      regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
-                     regval.get(V23_CMD, 0.0), regval.get(E101_CMD, 0.0), proc.snapshot())
+                     regval.get(V23_CMD, 0.0), regval.get(V33_CMD, 0.0),
+                     regval.get(E101_CMD, 0.0), proc.snapshot())
 
         now = asyncio.get_event_loop().time()
         remaining = next_deadline - now

@@ -110,6 +110,12 @@ device = "cabinet_ao"
 channel = "e_101_cmd"
 [[mappings]]
 application = "threetank_inst"
+variable = "v_33_cmd"
+direction = "output"
+device = "cabinet_ao"
+channel = "v_33_cmd"
+[[mappings]]
+application = "threetank_inst"
 variable = "init_h1"
 direction = "output"
 device = "cabinet_ao"

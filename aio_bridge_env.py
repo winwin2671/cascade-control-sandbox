@@ -417,8 +417,8 @@ class CascadeBridgeEnv(gym.Env):
         if not self.backend.writes_via_plc:                      # modbus -> drive cabinet directly
             return list(self.actuator_names), [self._act_max[n] for n in self.actuator_names]
         if self.mode == "manual":
-            return (["manual_vfd", "manual_v12", "manual_v23", "manual_h1"],
-                    [50.0, 100.0, 100.0, 100.0])
+            return (["manual_vfd", "manual_v12", "manual_v23", "manual_v33", "manual_h1"],
+                    [50.0, 100.0, 100.0, 100.0, 100.0])
         if self.mode == "pid":
             return (["tank1_level_sp", "tank2_level_sp", "tank3_level_sp", "tank1_temp_sp"],
                     [0.5, 0.5, 0.5, 100.0])
