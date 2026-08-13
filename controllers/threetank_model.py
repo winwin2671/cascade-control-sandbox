@@ -57,6 +57,7 @@ class ThreeTankModel:
         self.cv_overflow = float(p.get("cv_overflow", 0.001))
         self.overflow_head_floor = float(p.get("overflow_head_floor", 1e-9))
         self.reservoir_base = float(p.get("reservoir_base_m2", 0.30))
+        self._last_t_res = self.t_supply  # cached reservoir temp (updated in derivatives, used in ideal_power)
         self.cp = float(p["cp_j_per_kgk"])
         self.rho = float(p["rho_kg_per_m3"])
         self.q_heat_max = float(p["q_heat_max_w"])
@@ -106,6 +107,7 @@ class ThreeTankModel:
         """ODE RHS [dh1, dT1, dh2, dT2, dh3, dT3] given state + action + env."""
         h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
         h_res, T_res = x[6], x[7]  # finite reservoir (internal, unmeasured)
+        self._last_t_res = T_res    # cache for ideal_power
         pumps, valves, heaters = act["pumps"], act["valves"], act["heaters"]
         t_cold = env.get("t_cold", self.t_supply)
         t_amb = env.get("t_amb", self.t_ambient)
@@ -162,10 +164,14 @@ class ThreeTankModel:
         """Thermodynamic floor for the excess-energy KPI: power to warm the cold
         recirc inflow into Tank1 to t_sp[0] and cover Tank1's heat loss. Tank2/Tank3
         are warmed only by advection (no direct heater), so they are not in the floor."""
-        q_pump = act["pumps"][0] * self.q_max
+        # pump curve (must match derivatives — was linear, which inflated the floor)
+        _hm = self.pump_shutoff_head - self.pump_static_head
+        _nh = (self.pump_shutoff_head * act["pumps"][0] ** 2 - self.pump_static_head) / _hm
+        q_pump = self.q_max * max(_nh, 0.0) ** 0.5
         rho_cp = self.rho * self.cp
-        t_amb, t_cold = env["t_amb"], env["t_cold"]
-        return max(0.0, rho_cp * q_pump * (t_sp[0] - t_cold) + self.ua * (t_sp[0] - t_amb))
+        t_amb = env["t_amb"]
+        t_inflow = self._last_t_res  # finite reservoir temp (cached from derivatives)
+        return max(0.0, rho_cp * q_pump * (t_sp[0] - t_inflow) + self.ua * (t_sp[0] - t_amb))
 
     def clamp_state(self, x):
         return x
