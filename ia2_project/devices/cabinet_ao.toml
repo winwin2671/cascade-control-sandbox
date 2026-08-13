@@ -15,27 +15,23 @@ port = 5020
 [[channels]]
 name = "v_12_cmd"
 kind = "holding_register"
-address = 0
-data_type = "f32"
-word_order = "hi_lo"
+address = 1
+data_type = "u16"
 [[channels]]
 name = "v_23_cmd"
 kind = "holding_register"
-address = 2
-data_type = "f32"
-word_order = "hi_lo"
+address = 3
+data_type = "u16"
 [[channels]]
 name = "e_101_cmd"
 kind = "holding_register"
-address = 4
-data_type = "f32"
-word_order = "hi_lo"
+address = 5
+data_type = "u16"
 [[channels]]
 name = "v_33_cmd"
 kind = "holding_register"
-address = 6
-data_type = "f32"
-word_order = "hi_lo"
+address = 7
+data_type = "u16"
 [[channels]]
 name = "reset_cmd"
 kind = "holding_register"

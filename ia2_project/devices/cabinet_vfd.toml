@@ -15,6 +15,5 @@ port = 5020
 [[channels]]
 name = "vfd_cmd"
 kind = "holding_register"
-address = 8192
-data_type = "f32"
-word_order = "hi_lo"
+address = 4096
+data_type = "u16"

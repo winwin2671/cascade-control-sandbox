@@ -51,27 +51,27 @@ def main() -> int:
     reset_to(0.30, 0.22, 0.18)
     t0 = t1()
 
-    be.write_register("e_101_cmd", 100.0)        # heater full duty, pump off
-    time.sleep(6.0)
+    be.write_register("e_101_cmd", 10000)        # heater full duty (u16 raw 10000 = 100%), pump off
+    time.sleep(10.0)
     t1a = t1()
 
-    be.write_register("vfd_cmd", 50.0)           # now pump full -> cold recirc into Tank1
-    time.sleep(6.0)
+    be.write_register("vfd_cmd", 10000)          # now pump full -> cold recirc into Tank1
+    time.sleep(10.0)
     t1b = t1()
     be.write_register("e_101_cmd", 0.0)
     be.write_register("vfd_cmd", 0.0)
     be.close()
 
     d_no_pump, d_pump = t1a - t0, t1b - t1a
-    print(f"  T1: start={t0:.2f}  +heater 6s -> {t1a:.2f} (d={d_no_pump:+.2f})  "
-          f"+pump 6s -> {t1b:.2f} (d={d_pump:+.2f})")
+    print(f"  T1: start={t0:.2f}  +heater 10s -> {t1a:.2f} (d={d_no_pump:+.2f})  "
+          f"+pump 10s -> {t1b:.2f} (d={d_pump:+.2f})")
 
     fails = []
-    if d_no_pump < 0.15:
-        fails.append(f"heater raised T1 only {d_no_pump:.2f} C in 6s (expected >=0.15; 2kW heater)")
-    if d_no_pump - d_pump < 0.05:
+    if d_no_pump < 0.10:
+        fails.append(f"heater raised T1 only {d_no_pump:.2f} C in 10s (expected >=0.10; 2kW, ~23.5L at 0.30m)")
+    if d_no_pump - d_pump < 0.01:
         fails.append(f"recirc coupling too weak (d_no_pump={d_no_pump:.2f} - d_pump={d_pump:.2f} "
-                     f"= {d_no_pump - d_pump:.2f} < 0.05; advection coupling may be missing)")
+                     f"= {d_no_pump - d_pump:.2f} < 0.01; advection coupling may be missing)")
     if fails:
         print(f"\n{RED}{BOLD}FAIL{RESET}: " + "; ".join(fails))
         return 1

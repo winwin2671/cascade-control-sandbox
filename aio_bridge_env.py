@@ -433,12 +433,12 @@ class CascadeBridgeEnv(gym.Env):
             return list(self.actuator_names), [self._act_max[n] for n in self.actuator_names]
         if self.mode == "manual":
             return (["manual_vfd", "manual_v12", "manual_v23", "manual_v33", "manual_h1"],
-                    [50.0, 100.0, 100.0, 100.0, 100.0])
+                    [100.0, 100.0, 100.0, 100.0, 100.0])
         if self.mode == "pid":
             return (["tank1_level_sp", "tank2_level_sp", "tank3_level_sp", "tank1_temp_sp"],
                     [0.5, 0.5, 0.5, 100.0])
         return ([f"{n}_req" for n in self.actuator_names],       # mpc / rl
-                [self._act_max[n] for n in self.actuator_names])
+                [100.0] * len(self.actuator_names))  # _req are REAL % (POU scales x100 -> u16)
 
     def _action_to_writes(self, action) -> dict:
         a = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)

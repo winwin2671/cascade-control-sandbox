@@ -153,6 +153,8 @@ class PhysicsParams:
     q_heat_max: float   # max electrical heater power (E-101, 2 kW), W
     ua: float           # overall heat-loss coefficient, W/K
     t_ambient: float    # ambient (heat-sink) temperature, degC
+    reservoir_base: float    # reservoir cross-section (0.6 x 0.5 m), m^2
+    reservoir_height: float  # reservoir wall height, m
 
     @classmethod
     def from_contract(cls, contract: dict) -> "PhysicsParams":
@@ -165,6 +167,8 @@ class PhysicsParams:
             cp=float(p["cp_j_per_kgk"]), rho=float(p["rho_kg_per_m3"]),
             q_heat_max=float(p["q_heat_max_w"]), ua=float(p["ua_w_per_k"]),
             t_ambient=float(p["t_ambient_c"]),
+            reservoir_base=float(p.get("reservoir_base_m2", 0.30)),
+            reservoir_height=float(p.get("reservoir_height_m", 0.50)),
         )
 
 
@@ -200,9 +204,12 @@ class TankProcess:
     di_heater_contactor: int = 0
     di_pump_contactor: int = 0
     di_estop: int = 0
+    # reservoir (finite, internal — NOT instrumented; affects pump inflow temp)
+    h_res: float = 0.30
+    T_res: float = 25.0
 
-    def step(self, vfd_hz: float, v12_pct: float, v23_pct: float, v33_pct: float,
-             e101_pct: float, dt: float, p: PhysicsParams) -> None:
+    def step(self, vfd_cmd: int, v12_cmd: int, v23_cmd: int, v33_cmd: int,
+             e101_cmd: int, dt: float, p: PhysicsParams) -> None:
         """Advance one Euler step given the 4 actuator commands.
 
         Hydraulics: pump recirculation into Tank1 + unidirectional valve-modulated
@@ -211,11 +218,11 @@ class TankProcess:
         Tank2/Tank3 warm solely via downstream hot-water advection.
         """
         # --- hydraulics ---
-        vfd_frac = _clamp(vfd_hz / p.vfd_max_hz, 0.0, 1.0)
+        vfd_frac = _clamp(vfd_cmd / 10000.0, 0.0, 1.0)
         q_pump = vfd_frac * p.q_max                                   # P-101 -> Tank1
-        v12_frac = _clamp(v12_pct / 100.0, 0.0, 1.0)
-        v23_frac = _clamp(v23_pct / 100.0, 0.0, 1.0)
-        v33_frac = _clamp(v33_pct / 100.0, 0.0, 1.0)
+        v12_frac = _clamp(v12_cmd / 10000.0, 0.0, 1.0)
+        v23_frac = _clamp(v23_cmd / 10000.0, 0.0, 1.0)
+        v33_frac = _clamp(v33_cmd / 10000.0, 0.0, 1.0)
         q_12 = _valve_flow(self.h1, self.h2, p.c_v12, v12_frac)       # Tank1 -> Tank2
         q_23 = _valve_flow(self.h2, self.h3, p.c_v23, v23_frac)       # Tank2 -> Tank3
         q_3r = _valve_flow(self.h3, 0.0, p.c_v33, v33_frac)           # Tank3 -> reservoir (V-33 control)
@@ -231,13 +238,19 @@ class TankProcess:
         self.q3r_lpm = q_3r * 60000.0
 
         # --- thermal: single heater in Tank1; chain advection ---
-        Qh1 = _clamp(e101_pct / 100.0, 0.0, 1.0) * p.q_heat_max
-        adv1 = q_pump * (p.t_supply - self.T1)      # recirc returns reservoir-temp water to Tank1
+        Qh1 = _clamp(e101_cmd / 10000.0, 0.0, 1.0) * p.q_heat_max
+        adv1 = q_pump * (self.T_res - self.T1)      # finite reservoir: pump draws at T_res
         adv2 = q_12 * (self.T1 - self.T2)           # hot Tank1 outflow -> Tank2
         adv3 = q_23 * (self.T2 - self.T3)           # Tank2 outflow -> Tank3 (Tank3 loses via q_3r: outflow drops out)
         self._step_thermal("T1", "h1", Qh1, adv1, dt, p)
         self._step_thermal("T2", "h2", 0.0, adv2, dt, p)
         self._step_thermal("T3", "h3", 0.0, adv3, dt, p)
+
+        # --- finite reservoir: mass balance + thermal (NOT instrumented; internal state) ---
+        self.h_res += (q_3r - q_pump) * dt / p.reservoir_base
+        self.h_res = _clamp(self.h_res, 0.0, p.reservoir_height)
+        adv_res = q_3r * (self.T3 - self.T_res)     # warm Tank3 return -> reservoir
+        self._step_reservoir(adv_res, dt, p)
 
         # --- emulated safety flags (real ones are hardwired; mock reflects state) ---
         self.di_dryfire = 1 if self.h1 < 0.05 else 0
@@ -255,10 +268,20 @@ class TankProcess:
         dT = (q_heat - q_loss) / m_cp * dt + adv / (p.a_tank * h) * dt
         setattr(self, t_attr, _clamp(T + dT, 0.0, 100.0))
 
+    def _step_reservoir(self, adv: float, dt: float, p: PhysicsParams) -> None:
+        """Reservoir thermal step (no heater, well-mixed, level-coupled mass).
+        NOT instrumented — internal state that sets the pump inflow temperature."""
+        h = max(self.h_res, 0.02)
+        m_cp = p.rho * p.reservoir_base * h * p.cp
+        q_loss = p.ua * (self.T_res - p.t_ambient)
+        dT = (-q_loss) / m_cp * dt + adv / (p.reservoir_base * h) * dt
+        self.T_res = _clamp(self.T_res + dT, 0.0, 100.0)
+
     def snapshot(self) -> dict:
         return {
             "h_cm": [round(self.h1 * 100, 2), round(self.h2 * 100, 2), round(self.h3 * 100, 2)],
             "T": [round(self.T1, 2), round(self.T2, 2), round(self.T3, 2)],
+            "reservoir": {"h": round(self.h_res, 3), "T": round(self.T_res, 2)},
             "flow_lpm": [round(self.q12_lpm, 2), round(self.q23_lpm, 2), round(self.q3r_lpm, 2)],
         }
 
@@ -297,6 +320,7 @@ def apply_reset(proc: TankProcess, regval: dict, layout: Layout, params: Physics
         setattr(proc, attr, _clamp(val, 0.0, params.h_max))
     for attr in ("T1", "T2", "T3"):
         setattr(proc, attr, RESET_TEMP_C)
+    proc.T_res = RESET_TEMP_C   # finite reservoir temp -> warm start (level persists)
 
 
 def _decode_holding(raw_vals: list[int], regs: list[dict]) -> dict:
@@ -330,13 +354,19 @@ def _simdata_blocks(regs_on_slave: list[dict], proc: TankProcess, params: Physic
 
     def block(table: str, datatype, is_read: bool) -> list:
         rs = sorted(by_table.get(table, []), key=lambda r: r["address"])
+        zero = False if datatype == DataType.BITS else 0
         if not rs:
-            dummy = False if datatype == DataType.BITS else 0
-            return [SimData(0, values=[dummy], datatype=datatype)]  # non-empty placeholder
-        vals: list = []
+            return [SimData(0, values=[zero], datatype=datatype)]  # non-empty placeholder
+        # gap-aware: cover the full [lo, hi] span; gaps (e.g. AO 16-bit value regs at
+        # 1,3,5,7 with unused 0,2,4,6) stay zero, values placed by address offset.
+        lo = rs[0]["address"]
+        hi = max(r["address"] + int(r["count"]) - 1 for r in rs)
+        vals: list = [zero] * (hi - lo + 1)
         for r in rs:
-            vals += encode_channel(r, proc, params) if is_read else [0] * int(r["count"])
-        return [SimData(rs[0]["address"], values=vals, datatype=datatype)]  # count defaults to 1
+            off = r["address"] - lo
+            enc = encode_channel(r, proc, params) if is_read else [zero] * int(r["count"])
+            vals[off:off + len(enc)] = enc
+        return [SimData(lo, values=vals, datatype=datatype)]  # count defaults to 1
 
     return (block("coil", DataType.BITS, True),
             block("discrete_input", DataType.BITS, True),
@@ -373,7 +403,9 @@ async def physics_loop(
     holding_plan = {}
     for sid, regs in layout.holding_by_slave.items():
         regs = sorted(regs, key=lambda r: r["address"])
-        holding_plan[sid] = (regs[0]["address"], sum(int(r["count"]) for r in regs), regs)
+        lo = regs[0]["address"]
+        hi = max(r["address"] + int(r["count"]) - 1 for r in regs)
+        holding_plan[sid] = (lo, hi - lo + 1, regs)   # gap-aware: read the full span
 
     while True:
         # --- read all holding (actuator + reset) blocks, union into regval ---

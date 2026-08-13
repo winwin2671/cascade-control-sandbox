@@ -6,13 +6,18 @@
 
 ---
 
-A reinforcement-learning sandbox for **cascade / decoupling control of a 3-tank
-process**, built on the [IA2](https://github.com/supcon-international/ia2)
-industrial-automation engine and the
-[AIO-Gym](https://github.com/supcon-international/AIO-Gym) agent-in-the-loop
-pattern. The physical "cabinet" is a Python Modbus TCP simulator; IA2 fronts it
-as a real PLC would front real hardware; a Gymnasium environment bridges an RL
-agent to IA2.
+A reinforcement-learning sandbox for **control of a heated serial-cascade +
+recirculation 3-tank process**, built on the [IA2](https://github.com/supcon-international/ia2)
+industrial-automation engine and the [AIO-Gym](https://github.com/supcon-international/AIO-Gym)
+agent-in-the-loop pattern. The physical "cabinet" is a Python **multi-slave Modbus
+TCP simulator** (32-bit float analog channels + FC02 discretes, behind an
+RTU-to-TCP gateway); IA2 fronts it as a real PLC would front real hardware; a
+Gymnasium environment bridges an RL agent to IA2.
+
+**Plant topology:** pump P-101 → Tank1 →(valve V-12)→ Tank2 →(valve V-23)→
+Tank3 →(valve V-33)→ Reservoir →(P-101 on VFD)→ Tank1 (recirculation). One 2 kW
+heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advection
+(an under-actuated temperature problem: 4 actuators for 3 levels + 3 temps).
 
 ### Highlights
 
@@ -20,9 +25,8 @@ agent to IA2.
   MPC (numpy box-QP), NMPC (CasADi + IPOPT), and RL (trained SAC/PPO) — switch
   live, compare on the same KPI.
 - **Real PLC, not a toy.** The `threetank.st` IEC 61131-3 program runs in IA2's
-  50 ms scan loop with a 5-layer safety architecture (L5 software shield
-  preempts hardware trips — high-level pump cutoff, dry-fire + over-temp
-  heater cutoff).
+  50 ms scan loop with a 5-layer safety architecture (L5 software shield reacts
+  to 5 FC02 hardware DI flags — overflow, dry-fire, over-temp, contactors, e-stop).
 - **AIO-Gym integration for MPC & RL.** IA2 ships native PID + Manual (IEC 61131-3
   FBs), but does not yet include MPC or RL controllers. This sandbox imports
   AIO-Gym's implementations (numpy MPC, CasADi NMPC, SAC/PPO/RLPD training)
@@ -70,48 +74,45 @@ agent to IA2.
 > imports AIO-Gym's battle-tested implementations rather than rewriting them. When
 > IA2 gains native MPC/RL, the AIO-Gym dependency can be dropped.
 
-> **Simulation status:** `mock_cabinet.py` is a **testing prototype** — the
-> physics, register map, and scaling will change to match the real hardware
-> design. Its purpose today is to validate the full connection + workflow
-> end-to-end (agent → IA2 → Modbus → plant → KPI). The final deployment will run
-> on a **Mac mini** connected to the real I/O of the physical 3-tank rig.
+> **Simulation status:** `mock_cabinet.py` models the heated serial-cascade rig
+> from the approved electrical BOM ([Electrical_BOM_for_heated_tanks.md](Electrical_BOM_for_heated_tanks.md)).
+> Tank geometry (37.24 L acrylic boxes) and the heat-loss coefficient are set;
+> pump flow and valve Cv are placeholders pending datasheets (flagged in
+> `ia2_config.json`). The final deployment runs on a **Mac mini** connected to
+> the real I/O via the RTU-to-TCP gateway.
 
 ### Process & register map
 
-Three-tank benchmark: Tank 1 & Tank 3 independently pumped, each with an SSR
-heater, coupled through the middle Tank 2 → the cascade / decoupling problem.
+Heated serial cascade with recirculation (topology above). The rig is
+**multi-slave Modbus** behind an RTU-to-TCP gateway at `127.0.0.1:5020` — five
+slaves with segregated function codes:
 
-| Register | Addr | Variable | Units | Scale |
+| Slave | Module | FC | Type | Channels |
 | --- | --- | --- | --- | --- |
-| 40001 | 0 | Tank 1 Level | m | ×1e-4 |
-| 40002 | 1 | Tank 1 Temperature | °C | ×1e-2 |
-| 40003 | 2 | Tank 2 Level | m | ×1e-4 |
-| 40004 | 3 | Tank 2 Temperature | °C | ×1e-2 |
-| 40005 | 4 | Tank 3 Level | m | ×1e-4 |
-| 40006 | 5 | Tank 3 Temperature | °C | ×1e-2 |
-| 40007 | 6 | Pump 1 drive | frac 0–1 | ×1e-4 |
-| 40008 | 7 | Pump 2 drive | frac 0–1 | ×1e-4 |
-| 40009 | 8 | Reset command (nonce) | — | ×1 |
-| 40010–12 | 9–11 | Init levels (Tank 1–3) | m | ×1e-4 |
-| 40013–15 | 12–14 | Heaters 1–3 (SSR duty) | frac 0–1 | ×1e-4 |
+| 02 | AI | FC04 input reg | f32 | LT-101/201/301 level (0–0.5 m), TT-101/201 temp (0–100 °C), FT-101/201/301 flow (0–50 L/min) |
+| 05 | AI #2 | FC04 input reg | f32 | TT-301 temp (slave 02 full at 8 ch) |
+| 03 | AO + reset | FC06 holding | u16 | V-12/V-23/E-101/V-33 cmd (0–10000 = 0–100 %), reset_cmd, init_h1–3 |
+| 04 | DI | FC02 discrete | bool | dry-fire, overflow, heater/pump contactor, e-stop |
+| 06 | VFD | FC06 holding | u16 | vfd_cmd — Inovance MD200 freq ref (addr 0x1000, 0–10000 = 0–100 % of F0-10) |
 
-Engineering value = raw register × scale. The single source of truth is
-[`ia2_config.json`](ia2_config.json).
+Analog sensors are 32-bit floats (2 registers, big-endian ABCD); actuator commands
+are uint16 raw 0–10000 (FC06 single-register write, MD200-style); safety statuses
+are FC02 discretes. The single source of truth is [`ia2_config.json`](ia2_config.json).
 
 ### Safety model (5 layers)
 
 | Layer | What | Where |
 | --- | --- | --- |
-| L1–L4 | Hardware (RCD, low/high-level switches, thermal protector) | Physical plant — not modeled |
-| **L5** | **Software shield** — clamps + interlocks every actuator request | **`threetank.st` (this repo)** |
+| L1–L4 | Hardware (RCD, high/low-level floats, capillary thermostat, contactors) | Physical plant — emulated as the 5 FC02 DI flags |
+| **L5** | **Software shield** — clamps + interlocks every actuator | **`threetank.st` (this repo)** |
 
-The L5 shield runs in the PLC scan loop. The agent writes `actuator*_req` /
-`heater*_req`; the PLC body clamps each to `[0, 10000]` and forces the mapped
-output to 0 when an action would soon trip hardware:
+The L5 shield runs in the PLC scan loop. The supervisor writes `*_cmd_req` (REAL
+0–100 %); the PLC converts to uint16 raw (×100 → 0–10000), clamps, and forces the
+mapped output to 0 based on the 5 hardware DI flags + software level/temp limits:
 
-- **Pumps OFF** above 0.55 m (preempts the high-level overflow switch)
-- **Heaters OFF** below 0.05 m (preempts dry-fire) or above 70 °C (preempts the
-  thermal protector)
+- **Pump/VFD OFF** on overflow or e-stop (DI flags)
+- **Valves V-12/V-23/V-33 spring-close** on overflow (RLY-101 cuts valve power)
+- **Heater E-101 OFF** on dry-fire, over-temp (>70 °C), or e-stop
 
 ### Control modes
 
@@ -166,10 +167,10 @@ For the **RL mode** (`./run_mode.sh rl`), you can specify the following attribut
 | Mode | Controller | Runs in | Agent writes |
 | --- | --- | --- | --- |
 | Manual | `FB_MANSTATION` | PLC | `manual_*` (0–100 %) |
-| PID | `FB_PID` × 5 | PLC | `*_sp` setpoints |
-| MPC | `MPCAgent` (numpy) | Python supervisor | `actuator*_req` |
-| NMPC | `NMPCOracle` (CasADi) | Python supervisor | `actuator*_req` |
-| RL | Trained SAC/PPO | Python supervisor | setpoints (supervisory) or `actuator*_req` |
+| PID | `FB_PID` × 4 | PLC | `*_sp` setpoints (3 levels + Tank1 temp) |
+| MPC | `MPCAgent` (numpy) | Python supervisor | `*_cmd_req` |
+| NMPC | `NMPCOracle` (CasADi) | Python supervisor | `*_cmd_req` |
+| RL | Trained SAC/PPO | Python supervisor | `*_cmd_req` (actuator) or `*_sp` (setpoint) |
 
 ### RL training & benchmark (AIO-Gym integration)
 
@@ -253,7 +254,8 @@ python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --r
 
 Launches a tkinter desktop window (rendered on Windows via WSLg):
 
-- **5 sliders** (pump/heater duty, 0–100 %, with live % readout)
+- **5 sliders** (Pump/VFD, V-12, V-23, V-33, Heater/E-101 — 0–100 %)
+- **DI safety readout** — 5 FC02 hardware flags (dry-fire, overflow, contactors, e-stop)
 - **Reset button** — re-pulses the reset nonce; tanks snap back to the startup init levels and the episode KPI/history resets
 - **Real-time plot** — levels + temps with setpoint lines
 - **Live KPI readout** — score, temp error, level error
@@ -309,15 +311,16 @@ validation track stays single-instance (one PROGRAM per server).
 
 ```
 cascade-control-sandbox/
-├── ia2_config.json            # single contract — register map, scales, setpoints
-├── mock_cabinet.py            # pymodbus TCP plant on :5020 (--time-scale k)
+├── ia2_config.json            # single contract — multi-slave register map, scales, setpoints
+├── Electrical_BOM_for_heated_tanks.md  # source hardware spec (approved electrical BOM)
+├── mock_cabinet.py            # multi-slave pymodbus TCP plant on :5020 (--time-scale k)
 ├── aio_bridge_env.py          # Gymnasium env (ia2 / edge / modbus backends; --mode)
 ├── aio_vec_env.py             # vectorized training env (N cabinets, AsyncVectorEnv)
 ├── run_mode.sh                # boot + run one controller + teardown (one command)
 ├── tools/
 │   └── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
 ├── controllers/
-│   ├── threetank_model.py     # numpy 3-tank plant (AIO-Gym model interface)
+│   ├── threetank_model.py     # numpy heated serial-cascade plant (AIO-Gym model interface)
 │   ├── mpc_agent.py           # numpy MPC (box-QP)
 │   ├── nmpc_oracle.py         # CasADi+IPOPT NMPC (symbolic plant)
 │   ├── run_mpc.py             # MPC supervisor (IA2 track)
@@ -337,7 +340,7 @@ cascade-control-sandbox/
 │   ├── smoke_env.py           # env reset/step/reward over Modbus
 │   └── run_smoke.sh           # one-command runner (boots + tests + teardown)
 ├── ia2_project/               # IA2 PLC project (IEC 61131-3 ST + device + iomap)
-│   ├── devices/mock_cabinet.toml   # AUTO-GENERATED — Modbus TCP device
+│   ├── devices/cabinet_*.toml      # AUTO-GENERATED — 5 Modbus devices (one per slave)
 │   ├── iomap.toml                  # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml                  # 50 ms cyclic task
 │   └── pous/
@@ -454,7 +457,8 @@ python3 aio_bridge_env.py --backend ia2 --mode rl  --steps 200
 ### Deployment (sim → hardware)
 
 IA2 fronts the plant through the device config, not in code. Moving from the local
-simulator to a physical PLC is a configuration change: repoint
-`ia2_project/devices/mock_cabinet.toml` at the PLC's IP and align its register
-addresses/scales to the real I/O map. The PLC program, iomap, and bridge env run
-unchanged against real hardware.
+simulator to physical hardware is a configuration change: repoint the
+`ia2_project/devices/cabinet_*.toml` device files at the real RTU-to-TCP gateway
+IP + slave addresses (02/03/04/05/06), and align the channel addresses/scales to
+the real I/O map. The PLC program, iomap, and bridge env run unchanged against
+real hardware.
