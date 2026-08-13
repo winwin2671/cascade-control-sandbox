@@ -76,10 +76,13 @@ heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advec
 
 > **Simulation status:** `mock_cabinet.py` models the heated serial-cascade rig
 > from the approved electrical BOM ([Electrical_BOM_for_heated_tanks.md](Electrical_BOM_for_heated_tanks.md)).
-> Tank geometry (37.24 L acrylic boxes) and the heat-loss coefficient are set;
-> pump flow and valve Cv are placeholders pending datasheets (flagged in
-> `ia2_config.json`). The final deployment runs on a **Mac mini** connected to
-> the real I/O via the RTU-to-TCP gateway.
+> Tank geometry (37.24 L, 0.0784 m²), pump flow (4 m³/h, quadratic pump curve),
+> heat-loss (4.0 W/K estimate), gravity_drop (0.3 m), and safety trips are set.
+> Valve Cv is an interim estimate pending datasheets. Physics equations are
+> aligned with the AIO-Gym v0.2 three_tank model (orifice valve flow, pump
+> curve, hydraulic overflow, 8-dim state incl. a finite 150 L reservoir). The
+> final deployment runs on a **Mac mini** connected to the real I/O via the
+> RTU-to-TCP gateway.
 
 ### Process & register map
 

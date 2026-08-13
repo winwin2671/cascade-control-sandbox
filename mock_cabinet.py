@@ -155,6 +155,17 @@ class PhysicsParams:
     t_ambient: float    # ambient (heat-sink) temperature, degC
     reservoir_base: float    # reservoir cross-section (0.6 x 0.5 m), m^2
     reservoir_height: float  # reservoir wall height, m
+    gravity_drop: float      # fixed elevation head between tanks (0 = same elevation), m
+    high_level_trip: float   # hardware LSH float trip (DI overflow threshold), m
+    low_level_trip: float    # hardware LSL float trip (DI dry-fire threshold), m
+    temperature_trip: float  # L4 capillary thermostat trip, degC
+    pump_power_max: float    # pump electrical power (energy KPI), W
+    nominal_level: float     # nominal operating level, m
+    pump_static_head: float  # pump curve: head at rated flow, m
+    pump_shutoff_head: float # pump curve: head at zero flow (shutoff), m
+    overflow_level: float    # level that opens the hydraulic overflow path, m
+    cv_overflow: float       # overflow path flow coefficient
+    overflow_head_floor: float  # numerical floor for overflow head
 
     @classmethod
     def from_contract(cls, contract: dict) -> "PhysicsParams":
@@ -169,19 +180,31 @@ class PhysicsParams:
             t_ambient=float(p["t_ambient_c"]),
             reservoir_base=float(p.get("reservoir_base_m2", 0.30)),
             reservoir_height=float(p.get("reservoir_height_m", 0.50)),
+            gravity_drop=float(p.get("gravity_drop_m", 0.0)),
+            high_level_trip=float(p.get("high_level_trip_m", 0.45)),
+            low_level_trip=float(p.get("low_level_trip_m", 0.05)),
+            temperature_trip=float(p.get("temperature_trip_c", 70.0)),
+            pump_power_max=float(p.get("pump_power_max_w", 370.0)),
+            nominal_level=float(p.get("nominal_level_m", 0.30)),
+            pump_static_head=float(p.get("pump_static_head_m", 1.7)),
+            pump_shutoff_head=float(p.get("pump_shutoff_head_m", 10.0)),
+            overflow_level=float(p.get("overflow_level_m", 0.46)),
+            cv_overflow=float(p.get("cv_overflow", 0.001)),
+            overflow_head_floor=float(p.get("overflow_head_floor", 1e-9)),
         )
 
 
-def _valve_flow(h_from: float, h_to: float, c_v: float, frac: float) -> float:
-    """Unidirectional, valve-modulated Torricelli volumetric flow (m^3/s).
+def _valve_flow(h_upstream: float, c_v: float, frac: float,
+                gravity_drop: float = 0.0) -> float:
+    """Valve flow (m^3/s) — aligned with xinji's AIO-Gym model.
 
-    Only flows downhill (h_from > h_to); `frac` in [0,1] is the valve position
-    (1.0 for the manual V-3 which is fixed open). `c_v` is the effective orifice.
-    """
-    dh = h_from - h_to
-    if dh <= 1e-9:
+    q = frac × cv × √(upstream_level + gravity_drop). The head is the upstream
+    tank's absolute level + the fixed elevation drop (free discharge into the lower
+    tank — downstream level doesn't create backpressure). No 2g (absorbed into cv)."""
+    head = h_upstream + gravity_drop
+    if head <= 1e-9:
         return 0.0
-    return _clamp(frac, 0.0, 1.0) * c_v * math.sqrt(2.0 * G * dh)
+    return _clamp(frac, 0.0, 1.0) * c_v * math.sqrt(head)
 
 
 @dataclass
@@ -219,17 +242,26 @@ class TankProcess:
         """
         # --- hydraulics ---
         vfd_frac = _clamp(vfd_cmd / 10000.0, 0.0, 1.0)
-        q_pump = vfd_frac * p.q_max                                   # P-101 -> Tank1
+        # pump curve (aligned with xinji): q = pump_flow_max × √((shutoff×u²−static)/(shutoff−static))
+        head_margin = p.pump_shutoff_head - p.pump_static_head
+        normalized_head = (p.pump_shutoff_head * vfd_frac ** 2 - p.pump_static_head) / head_margin
+        q_pump = p.q_max * math.sqrt(max(normalized_head, 0.0))    # P-101 -> Tank1
         v12_frac = _clamp(v12_cmd / 10000.0, 0.0, 1.0)
         v23_frac = _clamp(v23_cmd / 10000.0, 0.0, 1.0)
         v33_frac = _clamp(v33_cmd / 10000.0, 0.0, 1.0)
-        q_12 = _valve_flow(self.h1, self.h2, p.c_v12, v12_frac)       # Tank1 -> Tank2
-        q_23 = _valve_flow(self.h2, self.h3, p.c_v23, v23_frac)       # Tank2 -> Tank3
-        q_3r = _valve_flow(self.h3, 0.0, p.c_v33, v33_frac)           # Tank3 -> reservoir (V-33 control)
+        q_12 = _valve_flow(self.h1, p.c_v12, v12_frac, p.gravity_drop)
+        q_23 = _valve_flow(self.h2, p.c_v23, v23_frac, p.gravity_drop)
+        q_3r = _valve_flow(self.h3, p.c_v33, v33_frac, p.gravity_drop)
 
-        self.h1 += (q_pump - q_12) * dt / p.a_tank
-        self.h2 += (q_12 - q_23) * dt / p.a_tank
-        self.h3 += (q_23 - q_3r) * dt / p.a_tank
+        # hydraulic overflow (aligned with xinji): spills when level > overflow_level
+        q_ovf = []
+        for h in (self.h1, self.h2, self.h3):
+            head = h - p.overflow_level
+            q_ovf.append(p.cv_overflow * math.sqrt(max(head, p.overflow_head_floor)) if head > 0.0 else 0.0)
+
+        self.h1 += (q_pump - q_12 - q_ovf[0]) * dt / p.a_tank
+        self.h2 += (q_12 - q_23 - q_ovf[1]) * dt / p.a_tank
+        self.h3 += (q_23 - q_3r - q_ovf[2]) * dt / p.a_tank
         for attr in ("h1", "h2", "h3"):
             setattr(self, attr, _clamp(getattr(self, attr), 0.0, p.h_max))
 
@@ -253,8 +285,8 @@ class TankProcess:
         self._step_reservoir(adv_res, dt, p)
 
         # --- emulated safety flags (real ones are hardwired; mock reflects state) ---
-        self.di_dryfire = 1 if self.h1 < 0.05 else 0
-        self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > 0.45 else 0
+        self.di_dryfire = 1 if self.h1 < p.low_level_trip else 0
+        self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > p.high_level_trip else 0
         self.di_heater_contactor = 1 if Qh1 > 0.0 else 0
         self.di_pump_contactor = 1 if q_pump > 0.0 else 0
         self.di_estop = 0

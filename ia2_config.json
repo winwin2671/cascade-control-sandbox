@@ -514,9 +514,9 @@
     "t_supply_c": 25.0,
     "a_tank_m2": 0.0784,
     "vfd_max_hz": 50.0,
-    "c_v12": 0.000833,
-    "c_v23": 0.000833,
-    "c_v33": 0.000833,
+    "c_v12": 0.00143,
+    "c_v23": 0.00143,
+    "c_v33": 0.00143,
     "cp_j_per_kgk": 4180.0,
     "rho_kg_per_m3": 1000.0,
     "q_heat_max_w": 2000.0,
@@ -532,7 +532,18 @@
     "_drift_warning": "mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py hand-mirror these ODEs; all three must change together.",
     "_valve_note": "c_v* scaled 5.6x with the real pump flow (4 m^3/h) to keep the sim balanced; refine with valve datasheet Cv.",
     "reservoir_base_m2": 0.3,
-    "reservoir_height_m": 0.5
+    "reservoir_height_m": 0.5,
+    "high_level_trip_m": 0.45,
+    "low_level_trip_m": 0.05,
+    "temperature_trip_c": 70.0,
+    "gravity_drop_m": 0.3,
+    "pump_power_max_w": 370.0,
+    "nominal_level_m": 0.3,
+    "overflow_level_m": 0.46,
+    "cv_overflow": 0.001,
+    "overflow_head_floor": 1e-09,
+    "pump_static_head_m": 1.7,
+    "pump_shutoff_head_m": 10.0
   },
   "control": {
     "setpoints_m": {

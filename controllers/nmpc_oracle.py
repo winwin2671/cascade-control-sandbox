@@ -30,42 +30,50 @@ RHO_CP = 1000.0 * 4186.0
 # x = [h1, T1, h2, T2, h3, T3]; u = [pump, V-12, V-23, V-33, heater] in [0,1];
 # d = [t_cold, t_amb]; p = ThreeTankModel.p.
 # ----------------------------------------------------------------------------
-def _valve_flow_sym(h_from, h_to, c_v, frac, p):
-    """Unidirectional valve-modulated Torricelli flow (symbolic, downhill only).
-
-    q = frac * c_v * sqrt(2g * max(dh, 0)); frac in [0,1] is the valve position,
-    c_v the effective orifice. The sqrt argument is floored at 1e-9 (NOT 0) so its
-    derivative stays finite in IPOPT's constraint Jacobian. Downhill-only, so the
-    advection term always carries the upstream temperature (no backward split)."""
-    dh = h_from - h_to
-    return frac * c_v * ca.sqrt(2 * p["G"]) * ca.sqrt(ca.fmax(dh, 1e-9))
+def _valve_flow_sym(h_upstream, c_v, frac, p):
+    """Valve flow (symbolic) — aligned with xinji's model.
+    q = frac × cv × √(upstream_level + gravity_drop). No 2g."""
+    head = h_upstream + p.get("gravity_drop", 0.0)
+    return frac * c_v * ca.sqrt(ca.fmax(head, 1e-9))
 
 
-def _dT_sym(T, h, q_heat, adv, t_amb, p):
+def _dT_sym(T, h, q_heat, adv, t_amb, p, area=None):
+    area = p["A_TANK"] if area is None else area
     h = ca.fmax(h, p["h_floor"])
-    m_cp = p["rho"] * p["A_TANK"] * h * p["cp"]
+    m_cp = p["rho"] * area * h * p["cp"]
     q_loss = p["ua"] * (T - t_amb)
-    return (q_heat - q_loss) / m_cp + adv / (p["A_TANK"] * h)
+    return (q_heat - q_loss) / m_cp + adv / (area * h)
 
 
 def _f_threetank(x, u, d, p):
     t_cold, t_amb = d[0], d[1]
     h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
-    q_pump = u[0] * p["q_max"]                                      # P-101 -> Tank1
-    q_12 = _valve_flow_sym(h1, h2, p["C_V12"], u[1], p)            # V-12: Tank1 -> Tank2
-    q_23 = _valve_flow_sym(h2, h3, p["C_V23"], u[2], p)            # V-23: Tank2 -> Tank3
-    q_3r = _valve_flow_sym(h3, 0.0, p["C_V33"], u[3], p)           # V-33: Tank3 -> reservoir
-    dh1 = (q_pump - q_12) / p["A_TANK"]
-    dh2 = (q_12 - q_23) / p["A_TANK"]
-    dh3 = (q_23 - q_3r) / p["A_TANK"]
+    h_res, T_res = x[6], x[7]  # finite reservoir state (internal, unmeasured)
+    _hm = p["pump_shutoff_head"] - p["pump_static_head"]
+    _nh = (p["pump_shutoff_head"] * u[0] * u[0] - p["pump_static_head"]) / _hm
+    q_pump = p["q_max"] * ca.sqrt(ca.fmax(_nh, 0.0))               # P-101 pump curve (xinji)
+    q_12 = _valve_flow_sym(h1, p["C_V12"], u[1], p)            # V-12: Tank1 -> Tank2
+    q_23 = _valve_flow_sym(h2, p["C_V23"], u[2], p)            # V-23: Tank2 -> Tank3
+    q_3r = _valve_flow_sym(h3, p["C_V33"], u[3], p)           # V-33: Tank3 -> reservoir
+    # hydraulic overflow (aligned with xinji): smooth fmax gate + sqrt
+    _ovf1 = p["cv_overflow"] * ca.sqrt(ca.fmax(h1 - p["overflow_level"], p["overflow_head_floor"]))
+    _ovf2 = p["cv_overflow"] * ca.sqrt(ca.fmax(h2 - p["overflow_level"], p["overflow_head_floor"]))
+    _ovf3 = p["cv_overflow"] * ca.sqrt(ca.fmax(h3 - p["overflow_level"], p["overflow_head_floor"]))
+    dh1 = (q_pump - q_12 - _ovf1) / p["A_TANK"]
+    dh2 = (q_12 - q_23 - _ovf2) / p["A_TANK"]
+    dh3 = (q_23 - q_3r - _ovf3) / p["A_TANK"]
     Qh1 = u[4] * p["q_heat_max"]                                    # single heater in Tank1
-    adv1 = q_pump * (t_cold - T1)        # recirc returns reservoir-temp water
+    adv1 = q_pump * (T_res - T1)        # finite reservoir: pump draws at T_res
     adv2 = q_12 * (T1 - T2)             # hot Tank1 outflow -> Tank2
     adv3 = q_23 * (T2 - T3)             # Tank2 outflow -> Tank3
     dT1 = _dT_sym(T1, h1, Qh1, adv1, t_amb, p)
     dT2 = _dT_sym(T2, h2, 0.0, adv2, t_amb, p)
     dT3 = _dT_sym(T3, h3, 0.0, adv3, t_amb, p)
-    return ca.vertcat(dh1, dT1, dh2, dT2, dh3, dT3)
+    # finite reservoir dynamics (symbolic, internal, unmeasured)
+    dh_res = (q_3r - q_pump) / p["reservoir_base"]
+    _adv_res = q_3r * (T3 - T_res)
+    dT_res = _dT_sym(T_res, h_res, 0.0, _adv_res, t_amb, p, p["reservoir_base"])
+    return ca.vertcat(dh1, dT1, dh2, dT2, dh3, dT3, dh_res, dT_res)
 
 
 _DYN = {"threetank": _f_threetank}
@@ -184,6 +192,8 @@ class OracleAgent:
         x = []                                             # interleave h, T
         for i in range(self.model.n):
             x += [meas["levels"][i], meas["temps"][i]]
+        # finite reservoir (unmeasured — nominal estimate)
+        x += [0.30, meas.get("t_cold", 25.0)]  # h_res, T_res
         return x
 
     def compute(self, meas, sp, dt):

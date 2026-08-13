@@ -50,6 +50,9 @@ class MPCAgent:
         for i in range(self.m.n):
             x[2 * i] = meas["levels"][i]
             x[2 * i + 1] = meas["temps"][i]
+        if self.nx > 2 * self.m.n:  # finite reservoir (unmeasured internal state)
+            x[2 * self.m.n] = 0.30                  # h_res nominal
+            x[2 * self.m.n + 1] = meas.get("t_cold", 25.0)  # T_res ≈ supply temp
         return x
 
     def _cv(self, x):
