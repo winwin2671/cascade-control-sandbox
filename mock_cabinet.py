@@ -34,7 +34,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import signal
 import struct
 from dataclasses import dataclass
@@ -194,18 +193,6 @@ class PhysicsParams:
         )
 
 
-def _valve_flow(h_upstream: float, c_v: float, frac: float,
-                gravity_drop: float = 0.0) -> float:
-    """Valve flow (m^3/s) — aligned with xinji's AIO-Gym model.
-
-    q = frac × cv × √(upstream_level + gravity_drop). The head is the upstream
-    tank's absolute level + the fixed elevation drop (free discharge into the lower
-    tank — downstream level doesn't create backpressure). No 2g (absorbed into cv)."""
-    head = h_upstream + gravity_drop
-    if head <= 1e-9:
-        return 0.0
-    return _clamp(frac, 0.0, 1.0) * c_v * math.sqrt(head)
-
 
 @dataclass
 class TankProcess:
@@ -235,79 +222,53 @@ class TankProcess:
              e101_cmd: int, dt: float, p: PhysicsParams) -> None:
         """Advance one Euler step given the 4 actuator commands.
 
-        Hydraulics: pump recirculation into Tank1 + unidirectional valve-modulated
-        Torricelli cascade T1->T2->T3->reservoir. Thermal: first law per tank
-        (m.cp.dT/dt = Q_heat - Q_loss + advection) with the heater only in Tank1;
-        Tank2/Tank3 warm solely via downstream hot-water advection.
+        Physics delegates to the shared threetank_dynamics module so the mock,
+        MPC model, and NMPC oracle use ONE set of equations — no drift. What stays
+        mock-only: u16->fraction conversion, Euler integration + state clamps, the
+        FT sensor publication, and the emulated hardware DI flags.
         """
-        # --- hydraulics ---
-        vfd_frac = _clamp(vfd_cmd / 10000.0, 0.0, 1.0)
-        # pump curve (aligned with xinji): q = pump_flow_max × √((shutoff×u²−static)/(shutoff−static))
-        head_margin = p.pump_shutoff_head - p.pump_static_head
-        normalized_head = (p.pump_shutoff_head * vfd_frac ** 2 - p.pump_static_head) / head_margin
-        q_pump = p.q_max * math.sqrt(max(normalized_head, 0.0))    # P-101 -> Tank1
-        v12_frac = _clamp(v12_cmd / 10000.0, 0.0, 1.0)
-        v23_frac = _clamp(v23_cmd / 10000.0, 0.0, 1.0)
-        v33_frac = _clamp(v33_cmd / 10000.0, 0.0, 1.0)
-        q_12 = _valve_flow(self.h1, p.c_v12, v12_frac, p.gravity_drop)
-        q_23 = _valve_flow(self.h2, p.c_v23, v23_frac, p.gravity_drop)
-        q_3r = _valve_flow(self.h3, p.c_v33, v33_frac, p.gravity_drop)
+        from controllers.threetank_dynamics import (
+            dynamics, compute_flows, build_params, NUMERIC_OPS)
 
-        # hydraulic overflow (aligned with xinji): spills when level > overflow_level
-        q_ovf = []
-        for h in (self.h1, self.h2, self.h3):
-            head = h - p.overflow_level
-            q_ovf.append(p.cv_overflow * math.sqrt(max(head, p.overflow_head_floor)) if head > 0.0 else 0.0)
+        pump_frac = _clamp(vfd_cmd / 10000.0, 0.0, 1.0)
+        valve_fracs = [_clamp(v12_cmd / 10000.0, 0.0, 1.0),
+                       _clamp(v23_cmd / 10000.0, 0.0, 1.0),
+                       _clamp(v33_cmd / 10000.0, 0.0, 1.0)]
+        heater_frac = _clamp(e101_cmd / 10000.0, 0.0, 1.0)
 
-        self.h1 += (q_pump - q_12 - q_ovf[0]) * dt / p.a_tank
-        self.h2 += (q_12 - q_23 - q_ovf[1]) * dt / p.a_tank
-        self.h3 += (q_23 - q_3r - q_ovf[2]) * dt / p.a_tank
-        for attr in ("h1", "h2", "h3"):
-            setattr(self, attr, _clamp(getattr(self, attr), 0.0, p.h_max))
+        # flat dynamics params are stable for the cabinet's lifetime; cache them.
+        dp = getattr(self, "_dyn_params", None)
+        if dp is None or getattr(self, "_dyn_params_id", None) != id(p):
+            dp = build_params(p)
+            dp["t_ambient"] = p.t_ambient
+            self._dyn_params = dp
+            self._dyn_params_id = id(p)
 
-        self.q12_lpm = q_12 * 60000.0
-        self.q23_lpm = q_23 * 60000.0
-        self.q3r_lpm = q_3r * 60000.0
+        x = [self.h1, self.T1, self.h2, self.T2, self.h3, self.T3, self.h_res, self.T_res]
+        flows = compute_flows(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS)
+        dx = dynamics(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS)
 
-        # --- thermal: single heater in Tank1; chain advection ---
-        Qh1 = _clamp(e101_cmd / 10000.0, 0.0, 1.0) * p.q_heat_max
-        adv1 = q_pump * (self.T_res - self.T1)      # finite reservoir: pump draws at T_res
-        adv2 = q_12 * (self.T1 - self.T2)           # hot Tank1 outflow -> Tank2
-        adv3 = q_23 * (self.T2 - self.T3)           # Tank2 outflow -> Tank3 (Tank3 loses via q_3r: outflow drops out)
-        self._step_thermal("T1", "h1", Qh1, adv1, dt, p)
-        self._step_thermal("T2", "h2", 0.0, adv2, dt, p)
-        self._step_thermal("T3", "h3", 0.0, adv3, dt, p)
+        # Euler integration + clamps (levels bounded by tank height; temps by 0..100).
+        self.h1 = _clamp(self.h1 + dx[0] * dt, 0.0, p.h_max)
+        self.T1 = _clamp(self.T1 + dx[1] * dt, 0.0, 100.0)
+        self.h2 = _clamp(self.h2 + dx[2] * dt, 0.0, p.h_max)
+        self.T2 = _clamp(self.T2 + dx[3] * dt, 0.0, 100.0)
+        self.h3 = _clamp(self.h3 + dx[4] * dt, 0.0, p.h_max)
+        self.T3 = _clamp(self.T3 + dx[5] * dt, 0.0, 100.0)
+        self.h_res = _clamp(self.h_res + dx[6] * dt, 0.0, p.reservoir_height)
+        self.T_res = _clamp(self.T_res + dx[7] * dt, 0.0, 100.0)
 
-        # --- finite reservoir: mass balance + thermal (NOT instrumented; internal state) ---
-        self.h_res += (q_3r - q_pump) * dt / p.reservoir_base
-        self.h_res = _clamp(self.h_res, 0.0, p.reservoir_height)
-        adv_res = q_3r * (self.T3 - self.T_res)     # warm Tank3 return -> reservoir
-        self._step_reservoir(adv_res, dt, p)
+        # FT sensors (m^3/s -> L/min) from the shared flows.
+        self.q12_lpm = flows["q_12"] * 60000.0
+        self.q23_lpm = flows["q_23"] * 60000.0
+        self.q3r_lpm = flows["q_3r"] * 60000.0
 
-        # --- emulated safety flags (real ones are hardwired; mock reflects state) ---
+        # emulated safety flags (real ones are hardwired; mock reflects state).
         self.di_dryfire = 1 if self.h1 < p.low_level_trip else 0
         self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > p.high_level_trip else 0
-        self.di_heater_contactor = 1 if Qh1 > 0.0 else 0
-        self.di_pump_contactor = 1 if q_pump > 0.0 else 0
+        self.di_heater_contactor = 1 if flows["Qh1"] > 0.0 else 0
+        self.di_pump_contactor = 1 if flows["q_pump"] > 0.0 else 0
         self.di_estop = 0
-
-    def _step_thermal(self, t_attr: str, h_attr: str, q_heat: float,
-                      adv: float, dt: float, p: PhysicsParams) -> None:
-        T = getattr(self, t_attr)
-        h = max(getattr(self, h_attr), 0.02)        # guard against empty-tank /0
-        m_cp = p.rho * p.a_tank * h * p.cp           # thermal capacitance, J/K
-        q_loss = p.ua * (T - p.t_ambient)            # Newton cooling, W
-        dT = (q_heat - q_loss) / m_cp * dt + adv / (p.a_tank * h) * dt
-        setattr(self, t_attr, _clamp(T + dT, 0.0, 100.0))
-
-    def _step_reservoir(self, adv: float, dt: float, p: PhysicsParams) -> None:
-        """Reservoir thermal step (no heater, well-mixed, level-coupled mass).
-        NOT instrumented — internal state that sets the pump inflow temperature."""
-        h = max(self.h_res, 0.02)
-        m_cp = p.rho * p.reservoir_base * h * p.cp
-        q_loss = p.ua * (self.T_res - p.t_ambient)
-        dT = (-q_loss) / m_cp * dt + adv / (p.reservoir_base * h) * dt
-        self.T_res = _clamp(self.T_res + dT, 0.0, 100.0)
 
     def snapshot(self) -> dict:
         return {

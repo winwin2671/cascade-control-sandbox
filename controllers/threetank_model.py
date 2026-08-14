@@ -104,43 +104,15 @@ class ThreeTankModel:
                 [x[1], x[3], x[5]])
 
     def derivatives(self, x, act, env):
-        """ODE RHS [dh1, dT1, dh2, dT2, dh3, dT3] given state + action + env."""
-        h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
-        h_res, T_res = x[6], x[7]  # finite reservoir (internal, unmeasured)
-        self._last_t_res = T_res    # cache for ideal_power
-        pumps, valves, heaters = act["pumps"], act["valves"], act["heaters"]
-        t_cold = env.get("t_cold", self.t_supply)
-        t_amb = env.get("t_amb", self.t_ambient)
-
-        # hydraulics: pump recirc into Tank1 + unidirectional valve cascade to reservoir
-        # pump curve (aligned with xinji): q = pump_flow_max × √((shutoff×u²−static)/(shutoff−static))
-        _hm = self.pump_shutoff_head - self.pump_static_head
-        _nh = (self.pump_shutoff_head * pumps[0] ** 2 - self.pump_static_head) / _hm
-        q_pump = self.q_max * max(_nh, 0.0) ** 0.5               # P-101 pump curve
-        q_12 = _valve_flow(h1, self.c_v12, valves[0], self.gravity_drop)
-        q_23 = _valve_flow(h2, self.c_v23, valves[1], self.gravity_drop)
-        q_3r = _valve_flow(h3, self.c_v33, valves[2], self.gravity_drop)
-        # hydraulic overflow (aligned with xinji): spills when level > overflow_level
-        def _ovf(h):
-            head = h - self.overflow_level
-            return self.cv_overflow * max(head, self.overflow_head_floor) ** 0.5 if head > 0.0 else 0.0
-        dh1 = (q_pump - q_12 - _ovf(h1)) / self.a_tank
-        dh2 = (q_12 - q_23 - _ovf(h2)) / self.a_tank
-        dh3 = (q_23 - q_3r - _ovf(h3)) / self.a_tank
-
-        # thermal: ONE heater in Tank1; chain advection carries heat downstream
-        adv1 = q_pump * (T_res - T1)      # finite reservoir: pump draws at T_res      # recirc returns reservoir-temp water to Tank1
-        adv2 = q_12 * (T1 - T2)            # hot Tank1 outflow -> Tank2
-        adv3 = q_23 * (T2 - T3)            # Tank2 outflow -> Tank3 (Tank3 loses via q_3r: outflow drops out)
-        dT1 = self._dT(T1, h1, heaters[0] * self.q_heat_max, adv1, t_amb)
-        dT2 = self._dT(T2, h2, 0.0, adv2, t_amb)
-        dT3 = self._dT(T3, h3, 0.0, adv3, t_amb)
-
-        # finite reservoir dynamics (internal, unmeasured — same as mock_cabinet)
-        dh_res = (q_3r - q_pump) / self.reservoir_base
-        adv_res = q_3r * (T3 - T_res)
-        dT_res = self._dT(T_res, h_res, 0.0, adv_res, t_amb, self.reservoir_base)
-        return [dh1, dT1, dh2, dT2, dh3, dT3, dh_res, dT_res]
+        """ODE RHS (8-dim) given state + action + env. Delegates to the shared
+        threetank_dynamics module so the model, mock, and oracle never drift."""
+        from controllers.threetank_dynamics import dynamics, build_params, NUMERIC_OPS
+        if not hasattr(self, '_dynamics_params'):
+            self._dynamics_params = build_params(self)
+        self._last_t_res = x[7]  # cache for ideal_power
+        self._dynamics_params["t_ambient"] = env.get("t_amb", self.t_ambient)
+        return dynamics(x, act["pumps"][0], list(act["valves"]), act["heaters"][0],
+                        self._dynamics_params, NUMERIC_OPS)
 
     def _dT(self, T, h, q_heat, adv, t_amb, area=None):
         area = area if area is not None else self.a_tank

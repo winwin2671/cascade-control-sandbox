@@ -46,34 +46,12 @@ def _dT_sym(T, h, q_heat, adv, t_amb, p, area=None):
 
 
 def _f_threetank(x, u, d, p):
-    t_cold, t_amb = d[0], d[1]
-    h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
-    h_res, T_res = x[6], x[7]  # finite reservoir state (internal, unmeasured)
-    _hm = p["pump_shutoff_head"] - p["pump_static_head"]
-    _nh = (p["pump_shutoff_head"] * u[0] * u[0] - p["pump_static_head"]) / _hm
-    q_pump = p["q_max"] * ca.sqrt(ca.fmax(_nh, 0.0))               # P-101 pump curve (xinji)
-    q_12 = _valve_flow_sym(h1, p["C_V12"], u[1], p)            # V-12: Tank1 -> Tank2
-    q_23 = _valve_flow_sym(h2, p["C_V23"], u[2], p)            # V-23: Tank2 -> Tank3
-    q_3r = _valve_flow_sym(h3, p["C_V33"], u[3], p)           # V-33: Tank3 -> reservoir
-    # hydraulic overflow (aligned with xinji): smooth fmax gate + sqrt
-    _ovf1 = p["cv_overflow"] * ca.sqrt(ca.fmax(h1 - p["overflow_level"], p["overflow_head_floor"]))
-    _ovf2 = p["cv_overflow"] * ca.sqrt(ca.fmax(h2 - p["overflow_level"], p["overflow_head_floor"]))
-    _ovf3 = p["cv_overflow"] * ca.sqrt(ca.fmax(h3 - p["overflow_level"], p["overflow_head_floor"]))
-    dh1 = (q_pump - q_12 - _ovf1) / p["A_TANK"]
-    dh2 = (q_12 - q_23 - _ovf2) / p["A_TANK"]
-    dh3 = (q_23 - q_3r - _ovf3) / p["A_TANK"]
-    Qh1 = u[4] * p["q_heat_max"]                                    # single heater in Tank1
-    adv1 = q_pump * (T_res - T1)        # finite reservoir: pump draws at T_res
-    adv2 = q_12 * (T1 - T2)             # hot Tank1 outflow -> Tank2
-    adv3 = q_23 * (T2 - T3)             # Tank2 outflow -> Tank3
-    dT1 = _dT_sym(T1, h1, Qh1, adv1, t_amb, p)
-    dT2 = _dT_sym(T2, h2, 0.0, adv2, t_amb, p)
-    dT3 = _dT_sym(T3, h3, 0.0, adv3, t_amb, p)
-    # finite reservoir dynamics (symbolic, internal, unmeasured)
-    dh_res = (q_3r - q_pump) / p["reservoir_base"]
-    _adv_res = q_3r * (T3 - T_res)
-    dT_res = _dT_sym(T_res, h_res, 0.0, _adv_res, t_amb, p, p["reservoir_base"])
-    return ca.vertcat(dh1, dT1, dh2, dT2, dh3, dT3, dh_res, dT_res)
+    """CasADi dynamics — delegates to the shared threetank_dynamics module."""
+    from controllers.threetank_dynamics import dynamics, casadi_ops
+    t_amb = d[1]
+    p["t_ambient"] = t_amb
+    dx = dynamics(x, u[0], [u[1], u[2], u[3]], u[4], p, casadi_ops(ca))
+    return ca.vertcat(*dx)
 
 
 _DYN = {"threetank": _f_threetank}
@@ -99,10 +77,12 @@ class NMPCOracle:
         self.q_temp, self.q_level, self.r_move = q_temp, q_level, r_move
         self.t_safe = 70.0          # match the L5 shield's high-temp cutoff
         self.u_prev = np.full(self.nu, 0.5)
+        from controllers.threetank_dynamics import build_params
+        self._dyn_params = build_params(self.model)
         self._build()
 
     def _rk4(self, x, u, d):
-        f = lambda xx: _DYN[self.scenario](xx, u, d, self.p)
+        f = lambda xx: _DYN[self.scenario](xx, u, d, self._dyn_params)
         nsub = max(1, min(6, int(round(self.dt / self.model.dt_micro))))
         h = self.dt / nsub
         for _ in range(nsub):
