@@ -528,8 +528,8 @@
       "c_v33",
       "ua_w_per_k"
     ],
-    "_placeholder_note": "Physics values not yet measured. a_tank_m2 (tank diameter), q_max_m3s (pump curve), c_v* (valve Cv), ua_w_per_k (heat loss) must be refined from the mechanical drawings + pump/valve datasheets + bench SAT. q_heat_max_w=2000 is the real 2kW heater; h_max_m=0.5 from the level sensor span.",
-    "_drift_warning": "mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py hand-mirror these ODEs; all three must change together.",
+    "_placeholder_note": "c_v* (valve Cv) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.0784 (300x300mm tank, 10mm walls), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
+    "_drift_warning": "The ODEs live in ONE place: controllers/threetank_dynamics.py (dynamics + compute_flows). mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py all import from it — edit there and all three follow.",
     "_valve_note": "c_v* scaled 5.6x with the real pump flow (4 m^3/h) to keep the sim balanced; refine with valve datasheet Cv.",
     "reservoir_base_m2": 0.3,
     "reservoir_height_m": 0.5,

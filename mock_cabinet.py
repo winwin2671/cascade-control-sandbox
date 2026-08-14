@@ -47,7 +47,8 @@ CONFIG_PATH = Path(__file__).resolve().parent / "ia2_config.json"
 
 # --------------------------------------------------------------------------- #
 # Physics constants (gravity only is universal; geometry/coeffs come from the
-# contract process block — they are PLACEHOLDERS until the rig is measured).
+# contract process block — tank geometry + pump curve are from the BOM/
+# datasheets; only c_v* and ua_w_per_k remain physics estimates pending SAT).
 # --------------------------------------------------------------------------- #
 G = 9.81  # gravity, m/s^2
 
