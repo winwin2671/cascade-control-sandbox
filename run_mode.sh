@@ -13,7 +13,7 @@
 #   ./run_mode.sh nmpc           # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
 #   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
 #   ./run_mode.sh gui            # interactive manual control GUI (tkinter sliders + live plot)
-#   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo> and --train_track <numpy|modbus>
+#   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo>, --train_track <numpy|modbus>, --residual
 #   ./run_mode.sh pid --steps 40 # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
@@ -32,6 +32,7 @@ fi
 # Default RL attributes and Steps (fallback to STEPS env var if set)
 ALGO="sac"
 TRAIN_TRACK="numpy"
+RESIDUAL=false
 STEPS="${STEPS:-20}"
 
 # Parse optional flags
@@ -44,6 +45,10 @@ while [[ $# -gt 0 ]]; do
     --train_track)
       TRAIN_TRACK="${2:-numpy}"
       shift 2
+      ;;
+    --residual)
+      RESIDUAL=true
+      shift
       ;;
     --step|--steps)
       STEPS="$2"
@@ -58,7 +63,7 @@ done
 
 case "$MODE" in
   pid|manual|rl|mpc|nmpc|modbus|gui) ;;
-  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--steps N]  (got: $MODE)"; exit 2 ;;
+  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--residual] [--steps N]  (got: $MODE)"; exit 2 ;;
 esac
 
 # Determine if we need the IA2 server running
@@ -117,20 +122,28 @@ case "$MODE" in
   pid|manual)
     python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
   rl)
-    # Determine policy path and backend based on train_track and algo
-    if [ "$TRAIN_TRACK" = "modbus" ]; then
+    # Determine policy path, backend, and action mode from train_track / residual.
+    if [ "$RESIDUAL" = true ]; then
+      POLICY="$ROOT/controllers/policies/${ALGO}_residual.zip"
+      ACTION_MODE="residual"
+    elif [ "$TRAIN_TRACK" = "modbus" ]; then
       POLICY="$ROOT/controllers/policies/${ALGO}_cascade.zip"
-      BACKEND="modbus"
+      ACTION_MODE="${RL_ACTION_MODE:-setpoint}"
     else
       POLICY="$ROOT/controllers/policies/${ALGO}_threetank.zip"
+      ACTION_MODE="${RL_ACTION_MODE:-setpoint}"
+    fi
+    if [ "$TRAIN_TRACK" = "modbus" ]; then
+      BACKEND="modbus"
+    else
       BACKEND="ia2"
     fi
 
-    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, policy=$POLICY, backend=$BACKEND"
+    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, residual=$RESIDUAL, policy=$POLICY, backend=$BACKEND, action_mode=$ACTION_MODE"
     if [ -f "$POLICY" ]; then
       python3 -u "$ROOT/controllers/run_rl.py" --policy "$POLICY" \
         --backend "$BACKEND" \
-        --action-mode "${RL_ACTION_MODE:-setpoint}" --steps "${STEPS:-40}"
+        --action-mode "$ACTION_MODE" --steps "${STEPS:-40}"
     else
       echo "(no trained policy at $POLICY; running random RL demo)"
       python3 -u "$ROOT/aio_bridge_env.py" --backend "$BACKEND" --mode rl --steps "$STEPS"

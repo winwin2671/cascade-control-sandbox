@@ -71,7 +71,8 @@ def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
 
 
 def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
-            plant_dt: float, total_timesteps: int, device: str = "auto") -> int:
+            plant_dt: float, total_timesteps: int, device: str = "auto",
+            residual: bool = False) -> int:
     """Train SAC or PPO on the Modbus track using SB3's own vec env (B1 fix).
 
     SB3 cannot accept gymnasium AsyncVectorEnv — it needs its own VecEnv.
@@ -96,8 +97,23 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
     # policy sees setpoints + t_cold/t_amb, not just the raw 6-dim sensors.
     # R3 fix: SubprocVecEnv (not DummyVecEnv) — each env steps in its own process,
     # so the per-step sleeps overlap (restoring the 0.5 s control period + N× throughput).
-    venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
-        base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
+    if residual:
+        from controllers.residual_rl import ResidualEnvWrapper
+        from controllers.threetank_model import ThreeTankModel
+        from gymnasium.wrappers import TimeLimit
+        _model = ThreeTankModel()
+        _ref = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"], *tsp]
+        # bridge obs is interleaved (contract sensor order) → default level/temp idx OK.
+        # bridge action order is [V-12, V-23, E-101, V-33, VFD]; canonical physical is
+        # [pump, V-12, V-23, V-33, heater], so map each canonical slot to its env slot.
+        venv = SubprocVecEnv([lambda i=i: TimeLimit(
+            ResidualEnvWrapper(
+                CascadeBridgeEnv(backend="modbus", port=base_port + i, control_dt=wall_dt),
+                _model, _ref, act_idx=(4, 0, 1, 3, 2)), max_episode_steps=200)
+            for i in range(n_envs)])
+    else:
+        venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
+            base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
 
     if algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,
@@ -108,13 +124,14 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
                     policy_kwargs=dict(net_arch=[256, 256]))
 
     model.learn(total_timesteps=total_timesteps)
-    out = str(ROOT / "controllers" / "policies" / f"{algo}_cascade")
+    suffix = "residual" if residual else "cascade"
+    out = str(ROOT / "controllers" / "policies" / f"{algo}_{suffix}")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
     import json
     with open(out + ".json", "w") as f:
-        json.dump({"action_mode": "actuator", "reward_mode": "track",
-                   "algo": algo, "track": "modbus"}, f)
+        json.dump({"action_mode": "residual" if residual else "actuator",
+                   "reward_mode": "track", "algo": algo, "track": "modbus"}, f)
     print(f"{algo.upper()} trained for {total_timesteps} steps; saved to {out}.zip")
     print("(validate it in the IA2 track: load the policy + run it via the RL mode.)")
     return 0
@@ -129,6 +146,8 @@ def main() -> None:
     ap.add_argument("--algo", default="random", choices=["random", "ppo", "sac"])
     ap.add_argument("--total-timesteps", type=int, default=20000, help="PPO total timesteps")
     ap.add_argument("--device", default="auto", help="cuda | cpu | mps (default: auto)")
+    ap.add_argument("--residual", action="store_true",
+                    help="use xinji's residual RL (2D action: V-33 + heater on top of model feedforward)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.WARNING,
@@ -140,7 +159,8 @@ def main() -> None:
         pool = CabinetPool(args.n_envs, args.time_scale).start()
         try:
             rc = run_sb3(args.algo, pool, args.n_envs, 5200, args.time_scale,
-                         args.plant_dt, args.total_timesteps, device=args.device)
+                         args.plant_dt, args.total_timesteps, device=args.device,
+                         residual=args.residual)
         finally:
             pool.close()
     else:

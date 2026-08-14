@@ -175,15 +175,62 @@ For the **RL mode** (`./run_mode.sh rl`), you can specify the following attribut
 | NMPC | `NMPCOracle` (CasADi) | Python supervisor | `*_cmd_req` |
 | RL | Trained SAC/PPO | Python supervisor | `*_cmd_req` (actuator) or `*_sp` (setpoint) |
 
-### RL training & benchmark (AIO-Gym integration)
+### RL training & benchmark
 
-The plant is registered as a `threetank` scenario in AIO-Gym via runtime registry
-injection (`controllers/aiogym_register.py`) — so AIO-Gym's env, trainers, scorer,
-and `evaluate()` all work unchanged against our plant.
+The plant supports **two RL paradigms** and **four reward modes**, aligned with the
+AIO-Gym v0.2 model (xinji's three_tank). Physics equations are shared across the
+mock, MPC model, and NMPC oracle via [`controllers/threetank_dynamics.py`](controllers/threetank_dynamics.py).
 
-**Train:**
+#### Two RL paradigms
+
+The single flag `--residual` selects the paradigm on **either** track:
+
+| Paradigm | `--residual` | Action dim | What the RL controls | Reward |
+|---|---|---|---|---|
+| **Direct actuator** | *off* (omit) | **5D** | all MVs: pump + V-12 + V-23 + V-33 + heater | configurable (`--reward-mode`) |
+| **Residual** (xinji-aligned) | **on** | **2D** | only V-33 + heater (on top of model feedforward + inline PID) | regulation (tracking + feedforward) |
+
+Both paradigms are wired into **both** trainers — `train_sb3.py` (numpy) and
+`train_rl.py` (modbus) — so you can compare 5D vs 2D on the **same** environment
+and isolate the paradigm (not the track):
+
 ```bash
-python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n-envs 8
+# numpy track: SAME env, SAME step budget, SAME seeds → fair 5D-vs-2D bake-off
+python3 controllers/train_sb3.py --algo sac --action-mode actuator --reward-mode regulation --steps 500000   # → sac_threetank.zip  (5D)
+python3 controllers/train_sb3.py --algo sac --residual --reward-mode regulation --steps 500000               # → sac_residual.zip   (2D)
+```
+
+The **residual paradigm** (from xinji's v0.2) trains faster and is more stable:
+the RL agent only adjusts 2 actuators (V-33 drain + heater), while a model-based
+feedforward controller (`tracking_steady_state_action`) + inline PID handle the
+upstream hydraulics (pump, V-12, V-23). The reward penalizes deviation from the
+model-predicted action (feedforward term), keeping the RL near the physics-optimal
+baseline unless it can improve tracking.
+
+> **Fair comparison rule:** never compare a numpy-trained policy against a
+> modbus-trained policy directly — the tracks differ in speed, step budget, and
+> observation/latency, which confounds the result. Hold the track constant
+> (pick one) and vary only `--residual` on/off.
+
+#### Reward modes
+
+| Mode | Formula | Tracks |
+|---|---|---|
+| `economic` (v0.1 default) | `-(w_energy × heater_power + w_viol × band_violations)` | numpy |
+| `kpi` | composite KPI score (tracking + energy + safety) | numpy |
+| `track` | `-(level_MSE + temp_MSE + action_cost)` | numpy + modbus |
+| **`regulation`** (xinji-aligned) | `-(tracking + 0.1 × feedforward_deviation)` | **numpy + modbus** (drift-free) |
+
+The `regulation` reward is the **recommended mode** — it's aligned with xinji's
+v0.2 model and produces the same reward on both tracks (eliminating the reward
+drift between numpy and modbus training).
+
+**Train (modbus track — sim-to-real, slower):**
+```bash
+# 2D residual (xinji-aligned: V-33 + heater on top of model feedforward)
+python3 controllers/train_rl.py --residual --algo sac --total-timesteps 50000 --device cuda
+# 5D direct actuator (EnrichedObs)
+python3 controllers/train_rl.py --algo sac --total-timesteps 50000
 ```
 
 **Benchmark (compare all controllers on the same KPI):**
@@ -192,53 +239,51 @@ python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --r
 # add --nmpc for the CasADi NMPC oracle (slow)
 ```
 
-Output (AIO-Gym-style KPI table, ranked):
-```
-=== Benchmark (mode=kpi, 5 eps x 200 steps) ===
-controller     kpi   ±std temp_err  lvl_cm excess_kwh interlock
----------------------------------------------------------------
-RL-SAC       97.09   0.63     0.51    1.94      0.019      0.00
-MPC          86.33   1.32     3.41    2.79      0.256      0.00
-PID          83.35   1.57     4.20    2.33      0.355      0.00
-Manual       54.93   2.49     9.65    9.24      0.434      0.18
-```
+**Validate (sim-to-real gate — trained policy on the live track):**
 
-> NMPC is excluded by default (CasADi + IPOPT is ~1–4 s/step, adding ~20 min to
-> the benchmark). Include it with `--nmpc`:
-> ```bash
-> python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --nmpc --reward-mode kpi
-> ```
+Any of the four train combinations validates the same way — `--train_track` selects
+numpy (IA2 backend) or modbus, and `--residual` selects the 2D policy (off = 5D):
 
-**Validate (sim-to-real gate — trained policy on the real IA2 track):**
+| Train combination | Validate command |
+|---|---|
+| numpy + 5D direct | `./run_mode.sh rl` |
+| numpy + 2D residual | `./run_mode.sh rl --residual` |
+| modbus + 5D direct | `./run_mode.sh rl --train_track modbus` |
+| modbus + 2D residual | `./run_mode.sh rl --train_track modbus --residual` |
+
 ```bash
-./run_mode.sh rl     # runs the default SAC policy through the 50 ms scan + L5 shield
-# Or specify attributes:
-./run_mode.sh rl --algo ppo
-./run_mode.sh rl --train_track modbus --algo sac
+./run_mode.sh rl                       # default: numpy-track, 5D, algo=sac → sac_threetank.zip
+./run_mode.sh rl --residual            # numpy-track, 2D residual            → sac_residual.zip
+./run_mode.sh rl --train_track modbus  # modbus-track, 5D                    → sac_cascade.zip
+./run_mode.sh rl --algo ppo            # swap algorithm
 ```
+
+`run_mode.sh` resolves the policy file (`${algo}_threetank` / `_residual` / `_cascade`)
+and the action mode (5D `actuator` / 2D `residual`) automatically; `run_rl.py` wraps
+the eval env with `ResidualEnvWrapper` for a 2D policy so its action expands to the
+full 5D physical action before stepping the plant. The wrapper's 17D observation is
+backend-agnostic, so a numpy-trained residual policy validates on either backend.
 
 Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/`.
 
 ### Training & validation workflow
 
-The end-to-end flow — train on the fast numpy plant, benchmark against
-classical controllers, then validate the winner on the real IA2 track:
-
 ```
   1. TRAIN                          2. BENCHMARK                      3. VALIDATE
   ─────────                         ────────────                      ──────────
-  train_sb3.py                      benchmark.py                      run_mode.sh rl
-  SAC on numpy plant                PID / MPC / RL ranked             policy on IA2 track
-  (in-process, fast)                by KPI score                      (50 ms scan + L5 shield)
+  train_sb3.py (numpy)              benchmark.py                      run_mode.sh rl
+  or train_rl.py (modbus)           PID / MPC / RL ranked             policy on IA2 track
+                                     by KPI score                      (50 ms scan + L5 shield)
        │                                  │                                  │
        ▼                                  ▼                                  ▼
   sac_threetank.zip               KPI table + CSV + PNG              sim-to-real gap
-  + .json (action mode)           (controllers/runs/)                (numpy KPI vs IA2 KPI)
+  or sac_residual.zip             (controllers/runs/)                (numpy KPI vs IA2 KPI)
 ```
 
 ```bash
-# step 1 — train SAC on the numpy plant (fast; ~5 min for 500k steps on GPU)
-python3 controllers/train_sb3.py --algo sac --reward-mode kpi --steps 500000 --n-envs 8
+# step 1 — train (numpy track, ~5 min for 500k steps on GPU)
+python3 controllers/train_sb3.py --algo sac --reward-mode regulation \
+    --action-mode actuator --steps 500000 --n-envs 8
 
 # step 2 — benchmark: PID vs MPC vs RL on the same KPI yardstick
 python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --reward-mode kpi
