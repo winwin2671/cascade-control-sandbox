@@ -110,12 +110,19 @@ are FC02 discretes. The single source of truth is [`ia2_config.json`](ia2_config
 | **L5** | **Software shield** — clamps + interlocks every actuator | **`threetank.st` (this repo)** |
 
 The L5 shield runs in the PLC scan loop. The supervisor writes `*_cmd_req` (REAL
-0–100 %); the PLC converts to uint16 raw (×100 → 0–10000), clamps, and forces the
-mapped output to 0 based on the 5 hardware DI flags + software level/temp limits:
+0–100 %); the PLC converts to uint16 raw (×100 → 0–10000), clamps, and applies
+the interlock latches (5 hardware DI flags + software level/temp limits):
 
-- **Pump/VFD OFF** on overflow or e-stop (DI flags)
-- **Valves V-12/V-23/V-33 spring-close** on overflow (RLY-101 cuts valve power)
+- **Pump/VFD OFF** on overflow or e-stop (DI flags) — overflow stops *inflow* only
+- **Drains stay available in a latch** — valves are never cut on overflow (cutting
+  them sustained the overflow and made the latch unrecoverable); while a tank is
+  above the 0.40 recovery threshold its drain is forced open so the level can fall
 - **Heater E-101 OFF** on dry-fire, over-temp (>70 °C), or e-stop
+
+> Design rule: a trip may only inhibit the actuator that *aggravates* it. Note the
+> BOM's RLY-101 relay still cuts valve power on overflow **in hardware** — the
+> software shield deliberately doesn't; recommend repurposing that relay to the
+> pump contactor before commissioning so both layers agree.
 
 ### Control modes
 
@@ -152,7 +159,7 @@ python3 controllers/run_mpc.py --backend modbus
 python3 controllers/manual_gui.py --backend edge:my_edge --control-dt 2.0
 
 # Example: Validate a policy on the IA2 track, explicitly enforcing the backend
-python3 controllers/validate_policy.py --policy controllers/policies/sac_threetank.zip --backend ia2
+python3 controllers/validate_policy.py --policy controllers/policies/sac_threetank_numpy.zip --backend ia2
 ```
 
 For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
@@ -196,8 +203,8 @@ and isolate the paradigm (not the track):
 
 ```bash
 # numpy track: SAME env, SAME step budget, SAME seeds → fair 5D-vs-2D bake-off
-python3 controllers/train_sb3.py --algo sac --action-mode actuator --reward-mode regulation --steps 500000   # → sac_threetank.zip  (5D)
-python3 controllers/train_sb3.py --algo sac --residual --reward-mode regulation --steps 500000               # → sac_residual.zip   (2D)
+python3 controllers/train_sb3.py --algo sac --action-mode actuator --reward-mode regulation --steps 500000   # → sac_threetank_numpy.zip  (5D)
+python3 controllers/train_sb3.py --algo sac --residual --reward-mode regulation --steps 500000               # → sac_residual_numpy.zip  (2D)
 ```
 
 The **residual paradigm** (from xinji's v0.2) trains faster and is more stable:
@@ -219,7 +226,7 @@ baseline unless it can improve tracking.
 | `economic` (v0.1 default) | `-(w_energy × heater_power + w_viol × band_violations)` | numpy |
 | `kpi` | composite KPI score (tracking + energy + safety) | numpy |
 | `track` | `-(level_MSE + temp_MSE + action_cost)` | numpy + modbus |
-| **`regulation`** (xinji-aligned) | `-(tracking + 0.1 × feedforward_deviation)` | **numpy + modbus** (drift-free) |
+| **`regulation`** (xinji-aligned) | `-(tracking + 0.03 × feedforward_deviation)` | **numpy + modbus** (drift-free) |
 
 The `regulation` reward is the **recommended mode** — it's aligned with xinji's
 v0.2 model and produces the same reward on both tracks (eliminating the reward
@@ -235,7 +242,7 @@ python3 controllers/train_rl.py --algo sac --total-timesteps 50000
 
 **Benchmark (compare all controllers on the same KPI):**
 ```bash
-python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --reward-mode kpi
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank_numpy.zip --reward-mode kpi
 # add --nmpc for the CasADi NMPC oracle (slow)
 ```
 
@@ -252,16 +259,17 @@ numpy (IA2 backend) or modbus, and `--residual` selects the 2D policy (off = 5D)
 | modbus + 2D residual | `./run_mode.sh rl --train_track modbus --residual` |
 
 ```bash
-./run_mode.sh rl                       # default: numpy-track, 5D, algo=sac → sac_threetank.zip
-./run_mode.sh rl --residual            # numpy-track, 2D residual            → sac_residual.zip
-./run_mode.sh rl --train_track modbus  # modbus-track, 5D                    → sac_cascade.zip
+./run_mode.sh rl                       # default: numpy-track, 5D, algo=sac → sac_threetank_numpy.zip
+./run_mode.sh rl --residual            # numpy-track, 2D residual            → sac_residual_numpy.zip
+./run_mode.sh rl --train_track modbus  # modbus-track, 5D                    → sac_threetank_modbus.zip
 ./run_mode.sh rl --algo ppo            # swap algorithm
 ```
 
-`run_mode.sh` resolves the policy file (`${algo}_threetank` / `_residual` / `_cascade`)
+`run_mode.sh` resolves the policy file (`${algo}_threetank_<track>` / `_residual_<track>`)
 and the action mode (5D `actuator` / 2D `residual`) automatically; `run_rl.py` wraps
 the eval env with `ResidualEnvWrapper` for a 2D policy so its action expands to the
-full 5D physical action before stepping the plant. The wrapper's 17D observation is
+full 5D physical action before stepping the plant. The wrapper's 23-D observation (17 +
+6 integral-of-error terms — the I-term for warm-up persistence and offset-free holding) is
 backend-agnostic, so a numpy-trained residual policy validates on either backend.
 
 Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/`.
@@ -276,8 +284,8 @@ Each run produces a **KPI report + CSV + matplotlib plot** in `controllers/runs/
                                      by KPI score                      (50 ms scan + L5 shield)
        │                                  │                                  │
        ▼                                  ▼                                  ▼
-  sac_threetank.zip               KPI table + CSV + PNG              sim-to-real gap
-  or sac_residual.zip             (controllers/runs/)                (numpy KPI vs IA2 KPI)
+  sac_threetank_numpy.zip         KPI table + CSV + PNG              sim-to-real gap
+  or sac_residual_numpy.zip       (controllers/runs/)                (numpy KPI vs IA2 KPI)
 ```
 
 ```bash
@@ -286,7 +294,7 @@ python3 controllers/train_sb3.py --algo sac --reward-mode regulation \
     --action-mode actuator --steps 500000 --n-envs 8
 
 # step 2 — benchmark: PID vs MPC vs RL on the same KPI yardstick
-python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip --reward-mode kpi
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank_numpy.zip --reward-mode kpi
 
 # step 3 — validate: run the trained policy on the real IA2 track (boots everything)
 ./run_mode.sh rl                                  # defaults to --algo sac --train_track numpy
@@ -338,19 +346,22 @@ python3 mock_cabinet.py --time-scale 10
 > (per-op overhead dominates tiny matmuls). Pass `--device cpu` for PPO; SAC
 > benefits from CUDA (`--device cuda`).
 
-After training on the Modbus track, the **benchmark + validation steps are
-identical** to the primary workflow above — just point at the Modbus-trained
-policy using the `./run_mode.sh rl` attributes:
+After training on the Modbus track, **validation is identical** to the primary
+workflow above — just point at the Modbus-trained policy using the `./run_mode.sh rl`
+attributes:
 
 ```bash
-# benchmark (same KPI scorer, same plant comparison)
-python3 controllers/benchmark.py --rl controllers/policies/sac_cascade.zip --reward-mode kpi
-
 # validate (runs policy directly on mock_cabinet via Modbus backend)
 ./run_mode.sh rl --train_track modbus --algo sac
 # or for PPO trained on Modbus:
 ./run_mode.sh rl --train_track modbus --algo ppo
 ```
+
+> `benchmark.py` accepts numpy-trained policies (and residual policies of either
+> track) but **rejects modbus-trained direct policies** up front: their
+> EnrichedObs includes bridge-only sensors (3 flows + 5 DI flags) the numpy env
+> doesn't produce. Evaluate those on the bridge instead:
+> `python3 controllers/run_rl.py --policy controllers/policies/sac_threetank_modbus.zip --backend ia2`
 
 ~37× real-time with 4 envs × 10× time-scale (random throughput check). The IA2
 validation track stays single-instance (one PROGRAM per server).
@@ -369,6 +380,7 @@ cascade-control-sandbox/
 │   └── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
 ├── controllers/
 │   ├── threetank_model.py     # numpy heated serial-cascade plant (AIO-Gym model interface)
+│   ├── threetank_dynamics.py  # shared 8-dim ODE (numpy + CasADi ops) — one physics source
 │   ├── mpc_agent.py           # numpy MPC (box-QP)
 │   ├── nmpc_oracle.py         # CasADi+IPOPT NMPC (symbolic plant)
 │   ├── run_mpc.py             # MPC supervisor (IA2 track)
@@ -376,6 +388,7 @@ cascade-control-sandbox/
 │   ├── run_rl.py              # RL supervisor (trained policy on IA2 track)
 │   ├── train_sb3.py           # SAC/PPO training (AIO-Gym env + SB3)
 │   ├── train_rl.py            # vectorized training (Modbus track)
+│   ├── residual_rl.py         # residual RL wrappers (2D action + regulation reward + inline PID)
 │   ├── benchmark.py           # KPI benchmark (PID/MPC/NMPC/RL ranked)
 │   ├── aiogym_register.py     # register "threetank" in AIO-Gym's registries
 │   ├── validate_policy.py     # sim-to-real validation gate
@@ -450,7 +463,7 @@ pip3 install --user torch stable_baselines3    # see CUDA notes per-OS below
 ./run_mode.sh pid
 
 # benchmark all controllers
-python3 controllers/benchmark.py --rl controllers/policies/sac_threetank.zip
+python3 controllers/benchmark.py --rl controllers/policies/sac_threetank_numpy.zip
 
 # interactive manual control GUI
 ./run_mode.sh gui

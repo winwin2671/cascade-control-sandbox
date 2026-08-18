@@ -29,14 +29,18 @@ from stable_baselines3 import SAC, PPO  # noqa: E402
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor  # noqa: E402
 
 
-def make_env(seed, reward_mode, action_mode, episode_steps, residual=False):
+def make_env(seed, reward_mode, action_mode, episode_steps, residual=False, integral_obs=True):
     def _f():
         # residual paradigm needs the raw 5D actuator action expanded from the 2D
         # residual, so the underlying env must be in actuator mode regardless of
         # the --action-mode the user passed.
         eff_mode = "actuator" if residual else action_mode
+        # integral_obs appends ∫(sp−meas)dt terms to the observation so a memoryless
+        # policy can do offset-free tracking (the I-term it otherwise lacks). Helps
+        # the DIRECT 5D path hold levels; ResidualEnvWrapper ignores it (PID integrates).
         env = AIOGymNativeEnv("threetank", reward_mode=reward_mode, action_mode=eff_mode,
-                              episode_steps=episode_steps, randomize_plant=True, dynamic=True)
+                              episode_steps=episode_steps, randomize_plant=True, dynamic=True,
+                              integral_obs=integral_obs)
         from controllers.threetank_model import ThreeTankModel
         _m = ThreeTankModel()
         _hsp, _tsp = _m.default_setpoints()
@@ -79,6 +83,9 @@ def main():
                          "feedforward + inline PID. Forces actuator mode. Compare against "
                          "5D direct (no --residual) on the SAME numpy env — same physics, "
                          "same step budget, so the gap isolates the paradigm, not the track.")
+    ap.add_argument("--no-integral-obs", action="store_true",
+                    help="disable the ∫(sp−meas)dt observation terms. On by default for the "
+                         "direct 5D path (offset-free level tracking); ignored under --residual.")
     ap.add_argument("--n-envs", type=int, default=4)
     ap.add_argument("--steps", type=int, default=30000)
     ap.add_argument("--episode-steps", type=int, default=400)
@@ -87,14 +94,19 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    integral_obs = not args.no_integral_obs
     venv = SubprocVecEnv([make_env(1000 + i, args.reward_mode, args.action_mode,
-                                   args.episode_steps, residual=args.residual)
+                                   args.episode_steps, residual=args.residual,
+                                   integral_obs=integral_obs)
                           for i in range(args.n_envs)])
     venv = VecMonitor(venv)
 
     device = args.device or best_device()
     paradigm = "residual (2D)" if args.residual else f"direct ({args.action_mode})"
-    print(f"device: {device}  paradigm: {paradigm}  reward: {args.reward_mode}")
+    # residual: the WRAPPER's integral obs (23-D) is always on; direct: env flag (20-D)
+    integ = "wrapper (23-D)" if args.residual else integral_obs
+    print(f"device: {device}  paradigm: {paradigm}  reward: {args.reward_mode}  "
+          f"integral_obs: {integ}")
 
     if args.algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,
@@ -106,7 +118,9 @@ def main():
 
     model.learn(total_timesteps=args.steps, progress_bar=False)
 
-    suffix = "residual" if args.residual else "threetank"
+    # suffix carries the track so numpy/modbus policies never collide on disk
+    # (train_rl.py uses _threetank_modbus / _residual_modbus for the same reason)
+    suffix = "residual_numpy" if args.residual else "threetank_numpy"
     out = args.out or str(ROOT / "controllers" / "policies" / f"{args.algo}_{suffix}")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)

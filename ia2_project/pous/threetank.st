@@ -140,7 +140,10 @@ PROGRAM ThreeTank
   out_v33 := msta_v33.out;  out_h1 := msta_h1.out;
 
   (* ---------- L5 shield: 0..100% -> UINT 0..10000 (x100) + hardware/software interlocks.
-     R2 fix: 3 independent latches (overflow / dry-fire / over-temp). ---------- *)
+     R2 fix: 3 independent latches (overflow / dry-fire / over-temp).
+     Recovery rule: a trip may only inhibit the actuator that AGGRAVATES it —
+     overflow cuts the pump (inflow) but never the drains, dry-fire/over-temp cut
+     the heater. Cutting the recovery path would latch the trip forever. ---------- *)
   IF di_overflow OR di_estop THEN overflow_trip := TRUE; END_IF;
   IF (tank1_level < 0.40) AND (tank2_level < 0.40) AND (tank3_level < 0.40)
      AND NOT di_overflow AND NOT di_estop THEN overflow_trip := FALSE; END_IF;
@@ -151,7 +154,7 @@ PROGRAM ThreeTank
   IF (tank1_temp > 70.0) OR di_estop THEN overtemp_trip := TRUE; END_IF;
   IF (tank1_temp < 65.0) AND NOT di_estop THEN overtemp_trip := FALSE; END_IF;
 
-  (* pump VFD: cut on overflow / e-stop *)
+  (* pump VFD: cut on overflow / e-stop — stop INFLOW so the tank can drain *)
   IF overflow_trip THEN
     vfd_cmd := 0;
   ELSIF out_vfd > 100.0 THEN
@@ -160,27 +163,31 @@ PROGRAM ThreeTank
     vfd_cmd := REAL_TO_INT(out_vfd * 100.0);
   END_IF;
 
-  (* V-12: spring-close on overflow, else clamp 0..10000 *)
-  IF overflow_trip THEN
-    v_12_cmd := 0;
+  (* V-12: NOT cut on overflow — cutting the drains would sustain the overflow
+     (pump off + valves shut = frozen level). While the latch is held and Tank1 is
+     still above the 0.40 recovery threshold, the drain is FORCED open — the pump
+     is cut so this valve is the only recovery path, and leaving it to the
+     controller (which may command it shut) would latch forever. *)
+  IF overflow_trip AND (tank1_level > 0.40) THEN
+    v_12_cmd := 10000;
   ELSIF out_v12 > 100.0 THEN
     v_12_cmd := 10000;
   ELSE
     v_12_cmd := REAL_TO_INT(out_v12 * 100.0);
   END_IF;
 
-  (* V-23: same as V-12 *)
-  IF overflow_trip THEN
-    v_23_cmd := 0;
+  (* V-23: same pattern — forced open only while Tank2 is above 0.40 in a latch *)
+  IF overflow_trip AND (tank2_level > 0.40) THEN
+    v_23_cmd := 10000;
   ELSIF out_v23 > 100.0 THEN
     v_23_cmd := 10000;
   ELSE
     v_23_cmd := REAL_TO_INT(out_v23 * 100.0);
   END_IF;
 
-  (* V-33 (Tank3 -> reservoir): spring-close on overflow, else clamp *)
-  IF overflow_trip THEN
-    v_33_cmd := 0;
+  (* V-33 (Tank3 -> reservoir): same pattern — forced open while Tank3 > 0.40 *)
+  IF overflow_trip AND (tank3_level > 0.40) THEN
+    v_33_cmd := 10000;
   ELSIF out_v33 > 100.0 THEN
     v_33_cmd := 10000;
   ELSE

@@ -1,0 +1,1 @@
+{"action_mode": "residual", "reward_mode": "regulation", "algo": "sac", "track": "numpy"}

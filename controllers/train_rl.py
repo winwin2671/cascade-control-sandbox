@@ -27,7 +27,7 @@ from aio_bridge_env import CascadeBridgeEnv  # noqa: E402
 LOG = logging.getLogger("train_rl")
 
 
-def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb):
+def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb, episode_steps=4000):
     """Wrap CascadeBridgeEnv to append setpoint + ambient context to the raw obs.
 
     The raw bridge obs is 14-dim (3 levels + 3 temps + 3 flows + 5 DI). We append
@@ -53,7 +53,7 @@ def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb):
         def observation(self, obs):
             return np.concatenate([obs, np.array(ctx, dtype=np.float32)])
 
-    return TimeLimit(EnrichedObs(base), max_episode_steps=200)
+    return TimeLimit(EnrichedObs(base), max_episode_steps=episode_steps)
 
 
 def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
@@ -72,7 +72,7 @@ def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
 
 def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
             plant_dt: float, total_timesteps: int, device: str = "auto",
-            residual: bool = False) -> int:
+            residual: bool = False, episode_steps: int = 4000) -> int:
     """Train SAC or PPO on the Modbus track using SB3's own vec env (B1 fix).
 
     SB3 cannot accept gymnasium AsyncVectorEnv — it needs its own VecEnv.
@@ -109,11 +109,12 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
         venv = SubprocVecEnv([lambda i=i: TimeLimit(
             ResidualEnvWrapper(
                 CascadeBridgeEnv(backend="modbus", port=base_port + i, control_dt=wall_dt),
-                _model, _ref, act_idx=(4, 0, 1, 3, 2)), max_episode_steps=200)
+                _model, _ref, act_idx=(4, 0, 1, 3, 2)), max_episode_steps=episode_steps)
             for i in range(n_envs)])
     else:
         venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
-            base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
+            base_port + i, wall_dt, hsp, tsp, t_cold, t_amb, episode_steps)
+            for i in range(n_envs)])
 
     if algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,
@@ -124,7 +125,9 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
                     policy_kwargs=dict(net_arch=[256, 256]))
 
     model.learn(total_timesteps=total_timesteps)
-    suffix = "residual" if residual else "cascade"
+    # suffix carries the track so modbus policies never collide with the numpy
+    # ones (train_sb3.py writes _threetank_numpy / _residual_numpy)
+    suffix = "residual_modbus" if residual else "threetank_modbus"
     out = str(ROOT / "controllers" / "policies" / f"{algo}_{suffix}")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
@@ -145,10 +148,20 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=200, help="vec-steps (random policy)")
     ap.add_argument("--algo", default="random", choices=["random", "ppo", "sac"])
     ap.add_argument("--total-timesteps", type=int, default=20000, help="PPO total timesteps")
+    ap.add_argument("--episode-steps", type=int, default=4000,
+                    help="steps per episode (4000 = 2000 s plant time; the thermal loop "
+                         "needs >=4000 for the temperature term to be learnable — at 200 "
+                         "steps temp rises ~2 C and the policy learns nothing about heat)")
     ap.add_argument("--device", default="auto", help="cuda | cpu | mps (default: auto)")
     ap.add_argument("--residual", action="store_true",
                     help="use xinji's residual RL (2D action: V-33 + heater on top of model feedforward)")
     args = ap.parse_args()
+
+    # footgun guard: --algo defaults to "random" (throughput check). Someone
+    # passing --residual / --episode-steps almost certainly meant to train.
+    if args.algo == "random" and (args.residual or args.episode_steps != ap.get_default("episode_steps")):
+        ap.error("--residual/--episode-steps require --algo sac|ppo (default algo is 'random', "
+                 "which only runs the throughput check)")
 
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -160,7 +173,7 @@ def main() -> None:
         try:
             rc = run_sb3(args.algo, pool, args.n_envs, 5200, args.time_scale,
                          args.plant_dt, args.total_timesteps, device=args.device,
-                         residual=args.residual)
+                         residual=args.residual, episode_steps=args.episode_steps)
         finally:
             pool.close()
     else:

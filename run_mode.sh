@@ -122,16 +122,18 @@ case "$MODE" in
   pid|manual)
     python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
   rl)
-    # Determine policy path, backend, and action mode from train_track / residual.
+    # Policy path + backend come from train_track / residual. The action mode is
+    # auto-detected from the policy's .json sidecar by run_rl.py — only force it
+    # for residual, or if the user overrides via RL_ACTION_MODE (setpoint/actuator).
     if [ "$RESIDUAL" = true ]; then
-      POLICY="$ROOT/controllers/policies/${ALGO}_residual.zip"
+      POLICY="$ROOT/controllers/policies/${ALGO}_residual_${TRAIN_TRACK}.zip"
       ACTION_MODE="residual"
     elif [ "$TRAIN_TRACK" = "modbus" ]; then
-      POLICY="$ROOT/controllers/policies/${ALGO}_cascade.zip"
-      ACTION_MODE="${RL_ACTION_MODE:-setpoint}"
+      POLICY="$ROOT/controllers/policies/${ALGO}_threetank_modbus.zip"
+      ACTION_MODE="${RL_ACTION_MODE:-}"
     else
-      POLICY="$ROOT/controllers/policies/${ALGO}_threetank.zip"
-      ACTION_MODE="${RL_ACTION_MODE:-setpoint}"
+      POLICY="$ROOT/controllers/policies/${ALGO}_threetank_numpy.zip"
+      ACTION_MODE="${RL_ACTION_MODE:-}"
     fi
     if [ "$TRAIN_TRACK" = "modbus" ]; then
       BACKEND="modbus"
@@ -139,11 +141,12 @@ case "$MODE" in
       BACKEND="ia2"
     fi
 
-    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, residual=$RESIDUAL, policy=$POLICY, backend=$BACKEND, action_mode=$ACTION_MODE"
+    EXTRA=""
+    [ -n "$ACTION_MODE" ] && EXTRA="--action-mode $ACTION_MODE"
+    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, residual=$RESIDUAL, policy=$POLICY, backend=$BACKEND${ACTION_MODE:+, action_mode=$ACTION_MODE (else sidecar auto-detect)}"
     if [ -f "$POLICY" ]; then
       python3 -u "$ROOT/controllers/run_rl.py" --policy "$POLICY" \
-        --backend "$BACKEND" \
-        --action-mode "$ACTION_MODE" --steps "${STEPS:-40}"
+        --backend "$BACKEND" $EXTRA --steps "${STEPS:-40}"
     else
       echo "(no trained policy at $POLICY; running random RL demo)"
       python3 -u "$ROOT/aio_bridge_env.py" --backend "$BACKEND" --mode rl --steps "$STEPS"

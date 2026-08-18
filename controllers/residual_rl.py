@@ -3,15 +3,17 @@
 The RL agent outputs a 2D residual (V-33 drain valve + heater correction) on top
 of a model-based feedforward baseline. The feedforward inverts the plant model to
 find the steady-state action for the reference target. An inline PID provides
-level-tracking feedback for the upstream actuators (pump, V-12). The RL only
-adjusts the 2 hardest actuators (V-33 + heater) — the ones the model+PID struggle
-with (Tank3 level + the under-actuated temperature cascade).
+level-tracking feedback for the flow actuators (pump→T1, V-12→T2, V-23→T3 — the
+same SISO pairing as the PLC program). The RL only adjusts the 2 hardest actuators
+(V-33 + heater): the drain that sets the loop flow-load and the under-actuated
+temperature cascade. With h3 under classical feedback, ALL three levels are
+PID-grade by construction and the RL can focus on temperature.
 
 This is a Gymnasium Wrapper that sits between the RL agent and the existing
 CascadeBridgeEnv / AIOGymNativeEnv. The agent sees:
   - action: 2D residual [-1, 1] (V-33 + heater)
-  - observation: 17D normalized [0, 1] (output + reference + prev_action)
-  - reward: regulation (tracking + 0.1 × feedforward)
+  - observation: 23D normalized [0, 1] (output + reference + prev_action + 6 integral terms)
+  - reward: regulation (tracking + _FEEDFORWARD_WEIGHT × feedforward; 0.03)
 
 Adapted from xinji's AIO-Gym v0.2 control.py + definition.py.
 """
@@ -27,18 +29,33 @@ from gymnasium import spaces
 # ---- Constants (from xinji's TANK3_INTERNAL_CONTROL + definition.py) ----
 _PUMP_KP = 0.08           # pump PID gain (Tank1 level tracking)
 _V12_KP = 0.08            # V-12 PID gain (Tank2 level tracking)
+_V23_KP = 0.08            # V-23 PID gain (Tank3 level tracking — closes the last
+                          # un-feedback level loop; pairing matches the PLC POU)
 _LEVEL_TOL = 0.01         # level tolerance for PID scaling, m
 _MAX_CORRECTION = 0.25    # max PID correction per actuator
-_FEEDFORWARD_WEIGHT = 0.1  # weight on the feedforward penalty in the reward
+# RL authority on V-33. Loop flow is conserved (q_pump = q_12 = q_23 = q_33), so a
+# sustained V-33 above ~0.45 effective demands more cascade flow than the capped
+# upstream PID loops can supply — Tank3 MUST drain, no feedback can absorb it.
+# Clamping the V-33 swing to what the classical layer can absorb makes "all three
+# levels held" a structural guarantee; the heater keeps FULL authority.
+_V33_MAX_SWING = 0.30
+# Feedforward penalty weight. Was 0.1 (xinji's value); 0.03 lets the policy pay
+# the penalty to saturate the heater during warm-up (where tracking gain >> the
+# steady-state-anchored feedforward) without the reward fighting the transient.
+_FEEDFORWARD_WEIGHT = 0.03
 _OUTPUT_SCALES = np.asarray((0.5, 0.5, 0.5, 100.0, 100.0, 100.0))   # obs normalization
 _ERROR_SCALES = np.asarray((0.4, 0.4, 0.4, 10.0, 10.0, 10.0))      # reward normalization
+# Integral-of-error obs: the I-term a memoryless policy otherwise lacks. Clamps
+# double as anti-windup and obs normalizers (same values as aiogym's env).
+_I_TEMP_MAX = 300.0
+_I_LEVEL_MAX = 8.0
 
 
 def regulation_reward(levels, temps, reference, action, model_optimal_action):
     """Xinji's regulation reward: tracking + feedforward penalty.
 
     tracking = mean(((output − reference) / error_scales)²)
-    feedforward = 0.1 × sum((action − model_optimal)²)
+    feedforward = _FEEDFORWARD_WEIGHT × sum((action − model_optimal)²)
     reward = -(tracking + feedforward)
     """
     output = np.concatenate([np.asarray(levels[:3]), np.asarray(temps[:3])])
@@ -129,9 +146,16 @@ def tracking_steady_state_action(model, y_sp):
 
 
 class ResidualEnvWrapper(gym.Wrapper):
-    """Combined residual RL wrapper: 2D action → 5D physical, 17D normalized obs,
-    regulation reward. The RL agent adjusts only V-33 (drain) + heater on top of
-    a model feedforward + inline PID.
+    """Combined residual RL wrapper: 2D action → 5D physical, 23D normalized obs
+    (17D base + 6 integral-of-error terms), regulation reward. The RL agent
+    adjusts only V-33 (drain) + heater on top of a model feedforward + inline PID.
+
+    The integral terms give the memoryless policy its I-term: during the thermal
+    warm-up the growing ∫(sp−T) tells it to keep the heater saturated, and at
+    steady state they enable offset-free holding (mirrors aiogym's integral_obs).
+
+    integral_dt is PLANT seconds per env step (not wall): 0.5 on the numpy env,
+    and 0.5 on the modbus track (wall 0.05 s × time-scale 10). Same default for both.
 
     Layout-agnostic — the wrapped env's obs/action order is passed in so the same
     wrapper runs on either track:
@@ -140,7 +164,7 @@ class ResidualEnvWrapper(gym.Wrapper):
     canonical physical action = [pump, V-12, V-23, V-33, heater]."""
 
     def __init__(self, env, model, reference, level_idx=(0, 2, 4), temp_idx=(1, 3, 5),
-                 act_idx=(0, 1, 2, 3, 4)):
+                 act_idx=(0, 1, 2, 3, 4), integral_obs=True, integral_dt=0.5):
         super().__init__(env)
         self.model = model
         self.reference = np.asarray(reference, dtype=float)  # 6D: 3 levels + 3 temps
@@ -148,12 +172,26 @@ class ResidualEnvWrapper(gym.Wrapper):
         self.temp_idx = list(temp_idx)
         # act_idx[k] = where canonical slot k lands in the wrapped env's action vector
         self.act_idx = list(act_idx)
+        self.integral_obs = bool(integral_obs)
+        self.integral_dt = float(integral_dt)
         self._n_act = int(env.action_space.shape[0])
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(0.0, 1.0, shape=(17,), dtype=np.float32)
+        n_obs = 23 if self.integral_obs else 17
+        self.observation_space = spaces.Box(0.0, 1.0, shape=(n_obs,), dtype=np.float32)
         self._prev_physical = np.zeros(5, dtype=np.float32)
         self._model_optimal = np.zeros(5, dtype=np.float32)
         self._last_raw_obs = None
+        self._itemp = [0.0, 0.0, 0.0]
+        self._ilevel = [0.0, 0.0, 0.0]
+
+    def _reset_episodic_state(self):
+        """Zero per-episode wrapper state. Called by reset(); ALSO call this if you
+        drive the wrapper's internals directly (e.g. benchmark.py's RLAgent) after
+        resetting the raw env, or the obs will carry stale episode state."""
+        self._prev_physical = np.zeros(5, dtype=np.float32)
+        self._last_raw_obs = None
+        self._itemp = [0.0, 0.0, 0.0]
+        self._ilevel = [0.0, 0.0, 0.0]
 
     def _resolve_action(self, residual):
         """2D residual → canonical 5D physical [pump, V-12, V-23, V-33, heater]
@@ -164,21 +202,30 @@ class ResidualEnvWrapper(gym.Wrapper):
         self._model_optimal = baseline.copy()
         physical = baseline.copy()
 
-        # Layer 2: inline PID (pump → Tank1 level, V-12 → Tank2 level)
+        # Layer 2: inline PID (pump → T1, V-12 → T2, V-23 → T3 levels). Corrections
+        # are capped at ±_MAX_CORRECTION around the feedforward, so the loops absorb
+        # disturbances gently and can never run away against the RL's V-33 excursions.
         if self._last_raw_obs is not None and len(self._last_raw_obs) > max(self.level_idx):
             h1 = float(self._last_raw_obs[self.level_idx[0]])
             h2 = float(self._last_raw_obs[self.level_idx[1]])
+            h3 = float(self._last_raw_obs[self.level_idx[2]])
             pump_corr = np.clip(
                 _PUMP_KP * (self.reference[0] - h1) / _LEVEL_TOL, -_MAX_CORRECTION, _MAX_CORRECTION)
             v12_corr = np.clip(
                 _V12_KP * (self.reference[1] - h2) / _LEVEL_TOL, -_MAX_CORRECTION, _MAX_CORRECTION)
+            v23_corr = np.clip(
+                _V23_KP * (self.reference[2] - h3) / _LEVEL_TOL, -_MAX_CORRECTION, _MAX_CORRECTION)
             physical[0] += pump_corr
             physical[1] += v12_corr
+            physical[2] += v23_corr
 
-        # Layer 3: RL residual (V-33 [canonical index 3] + heater [canonical index 4])
-        for idx, val in zip((3, 4), residual):
-            base = float(physical[idx])
-            physical[idx] = base + val * (1.0 - base) if val >= 0 else base + val * base
+        # Layer 3: RL residual — V-33 with clamped authority (see _V33_MAX_SWING),
+        # heater with full authority (multiplicative toward the rails).
+        base33 = float(physical[3])
+        physical[3] = float(np.clip(base33 + residual[0] * _V33_MAX_SWING, 0.0, 1.0))
+        base_h = float(physical[4])
+        val = residual[1]
+        physical[4] = base_h + val * (1.0 - base_h) if val >= 0 else base_h + val * base_h
 
         return np.clip(physical, 0.0, 1.0).astype(np.float32)
 
@@ -189,16 +236,30 @@ class ResidualEnvWrapper(gym.Wrapper):
             env_action[eidx] = physical[canon]
         return env_action
 
-    def _make_obs(self, raw_obs):
-        """Raw sensor obs → 17D normalized (output + reference + prev_action)."""
+    def _make_obs(self, raw_obs, accumulate=True):
+        """Raw sensor obs → 23D normalized (output + reference + prev_action + ∫err).
+
+        accumulate=True (default, per-step calls): integrate ∫(sp−meas)dt from the
+        post-step state first — matches aiogym's step() timing. Pass False for the
+        reset obs (aiogym's reset returns zero integrals)."""
         self._last_raw_obs = np.asarray(raw_obs, dtype=float)
         levels = self._last_raw_obs[self.level_idx]
         temps = self._last_raw_obs[self.temp_idx]
+        if self.integral_obs and accumulate:
+            dt = self.integral_dt
+            self._itemp = [float(np.clip(self._itemp[i] + (self.reference[3 + i] - temps[i]) * dt,
+                                         -_I_TEMP_MAX, _I_TEMP_MAX)) for i in range(3)]
+            self._ilevel = [float(np.clip(self._ilevel[j] + (self.reference[j] - levels[j]) * dt,
+                                          -_I_LEVEL_MAX, _I_LEVEL_MAX)) for j in range(3)]
         output = np.concatenate([levels, temps])
         norm_output = np.clip(output / _OUTPUT_SCALES, 0, 1)
         norm_ref = np.clip(self.reference / _OUTPUT_SCALES, 0, 1)
         norm_action = np.clip(self._prev_physical, 0, 1)
-        return np.concatenate([norm_output, norm_ref, norm_action]).astype(np.float32)
+        parts = [norm_output, norm_ref, norm_action]
+        if self.integral_obs:
+            parts.append(np.clip(np.asarray(self._itemp) / _I_TEMP_MAX, -1, 1))
+            parts.append(np.clip(np.asarray(self._ilevel) / _I_LEVEL_MAX, -1, 1))
+        return np.concatenate(parts).astype(np.float32)
 
     def _regulation_reward(self, raw_obs, physical_action):
         """Regulation reward: tracking + feedforward penalty (canonical action)."""
@@ -211,9 +272,9 @@ class ResidualEnvWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         raw_obs, info = self.env.reset(**kwargs)
-        self._prev_physical = np.zeros(5, dtype=np.float32)
+        self._reset_episodic_state()
         self._model_optimal = tracking_steady_state_action(self.model, self.reference)
-        return self._make_obs(raw_obs), info
+        return self._make_obs(raw_obs, accumulate=False), info
 
     def step(self, action):
         physical = self._resolve_action(action)           # canonical [pump,V12,V23,V33,heater]
