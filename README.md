@@ -417,6 +417,7 @@ cascade-control-sandbox/
 │   ├── manual_gui.py          # tkinter manual control GUI
 │   └── policies/              # trained RL policies (.zip) + action-mode .json sidecars (.zip gitignored)
 ├── tests/
+│   ├── shield_regression.py   # ST safety layer under test (boots the real IA2 chain)
 │   ├── smoke_reset.py         # reset snaps levels to targets
 │   ├── smoke_heater.py        # heater raises temp; cold pump inflow slows it
 │   ├── smoke_env.py           # env reset/step/reward over Modbus
@@ -535,6 +536,29 @@ python3 aio_bridge_env.py --backend ia2 --mode rl  --steps 200
 - `smoke_reset.py` — reset snaps tank levels to requested targets
 - `smoke_heater.py` — heater raises temp; cold pump inflow slows it (the cascade)
 - `smoke_env.py` — env resets (randomized), steps, and rewards over Modbus
+
+### Shield regression test
+
+```bash
+python3 tests/shield_regression.py   # ~90 s (4x time-scale; SHIELD_TIME_SCALE=1 for real-time)
+```
+
+The smoke suite bypasses IA2, so it cannot see the PLC safety layer — the E-stop
+polarity bug (#6 B1) sat exactly in that blind spot. This test closes it: it boots
+the **real chain** (cabinet + ia2-server + the ThreeTank POU via `cs`) and asserts
+the L5 shield through the physical path (commands → physics → sensors/DI → shield
+→ mapped outputs):
+
+- **S0 healthy passthrough** — no latch with all DIs healthy (B1 regression guard)
+- **S1 overflow** — pump cut (inflow stopped), drains forced open against a shut
+  command, autonomous recovery below the 0.40 threshold
+- **S2 dry-fire** — heater cut, pump NOT cut (fails safe, recoverable)
+- **S3 e-stop** — pressed via `cs runtime force` (NC: 0 = pressed) cuts pump +
+  heater; released recovers
+
+Falsifiability is verified by mutation: reverting the B1 polarity line makes three
+scenarios fail loudly. Run it before any PR that touches `threetank.st` — it is
+kept out of `run_smoke.sh` on purpose (needs the full chain, ~90 s vs seconds).
 
 ### Deployment (sim → hardware)
 
