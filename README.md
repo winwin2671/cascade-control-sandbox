@@ -17,7 +17,7 @@ Gymnasium environment bridges an RL agent to IA2.
 **Plant topology:** pump P-101 → Tank1 →(valve V-12)→ Tank2 →(valve V-23)→
 Tank3 →(valve V-33)→ Reservoir →(P-101 on VFD)→ Tank1 (recirculation). One 2 kW
 heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advection
-(an under-actuated temperature problem: 4 actuators for 3 levels + 3 temps).
+(an under-actuated temperature problem: 5 actuators for 3 levels + 3 temps).
 
 ### Highlights
 
@@ -94,7 +94,8 @@ slaves with segregated function codes:
 | --- | --- | --- | --- | --- |
 | 02 | AI | FC04 input reg | f32 | LT-101/201/301 level (0–0.5 m), TT-101/201 temp (0–100 °C), FT-101/201/301 flow (0–50 L/min) |
 | 05 | AI #2 | FC04 input reg | f32 | TT-301 temp (slave 02 full at 8 ch) |
-| 03 | AO + reset | FC06 holding | u16 | V-12/V-23/E-101/V-33 cmd (0–10000 = 0–100 %), reset_cmd, init_h1–3 |
+| 03 | AO | FC06 holding | u16 | V-12/V-23/E-101/V-33 cmd (0–10000 = 0–100 %) |
+| 01 | sim-only | FC06 holding | u16 | reset_cmd, init_h1–3 (episode reset; a unit id the real gateway doesn't occupy) |
 | 04 | DI | FC02 discrete | bool | dry-fire, overflow, heater/pump contactor, e-stop |
 | 06 | VFD | FC06 holding | u16 | vfd_cmd — Inovance MD200 freq ref (addr 0x1000, 0–10000 = 0–100 % of F0-10) |
 

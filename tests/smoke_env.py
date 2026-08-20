@@ -39,6 +39,15 @@ def main() -> int:
         # cabinet holds init levels while reset_cmd is asserted, so obs == init
         if not all(abs(a - b) <= 0.02 for a, b in zip(obs_levels, init)):
             fails.append(f"ep{ep}: obs levels {obs_levels} != sampled init {init}")
+        # B1/#6 guard: DIs must publish their HEALTHY states at nominal levels —
+        # di_estop is an NC chain (1 = healthy, 0 = pressed). The old mock
+        # published 0, which matched the old inverted ST reading and hid the
+        # polarity bug from every sim run.
+        sidx = {n: i for i, n in enumerate(env.sensor_names)}
+        if float(obs[sidx["di_estop"]]) != 1.0:
+            fails.append(f"ep{ep}: di_estop reads {obs[sidx['di_estop']]} — healthy NC chain must read 1")
+        if float(obs[sidx["di_dryfire"]]) != 0.0 or float(obs[sidx["di_overflow"]]) != 0.0:
+            fails.append(f"ep{ep}: dryfire/overflow flags set at nominal levels")
         action = env.action_space.sample()
         obs2, reward, terminated, truncated, info2 = env.step(action)
         act_str = [round(float(a), 2) for a in action]

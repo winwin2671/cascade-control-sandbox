@@ -50,7 +50,10 @@ T_AMB = float(CFG["process"]["t_ambient_c"])
 
 # Actuator variables for Manual mode (REAL PLC vars; slider 0..100 -> eng range).
 MANUAL_VARS = ["manual_vfd", "manual_v12", "manual_v23", "manual_v33", "manual_h1"]
-MANUAL_MAX = {"manual_vfd": 50.0, "manual_v12": 100.0, "manual_v23": 100.0,
+# Minor/#6: manual_vfd is a PERCENT duty (POU REAL 0..100) — the old 50.0 was a
+# Hz leftover that capped the pump at half duty, and with the pump curve's dead
+# band below u≈0.41 only the top ~18% of the slider produced any flow at all.
+MANUAL_MAX = {"manual_vfd": 100.0, "manual_v12": 100.0, "manual_v23": 100.0,
               "manual_v33": 100.0, "manual_h1": 100.0}
 DI_VARS = ["di_dryfire", "di_overflow", "di_heater_contactor", "di_pump_contactor", "di_estop"]
 

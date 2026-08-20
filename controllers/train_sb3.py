@@ -38,8 +38,16 @@ def make_env(seed, reward_mode, action_mode, episode_steps, residual=False, inte
         # integral_obs appends ∫(sp−meas)dt terms to the observation so a memoryless
         # policy can do offset-free tracking (the I-term it otherwise lacks). Helps
         # the DIRECT 5D path hold levels; ResidualEnvWrapper ignores it (PID integrates).
+        # M5/#6: with a regulation reward (or the residual wrapper) the score is
+        # computed against the FIXED config reference — randomized per-episode
+        # setpoints (and dynamic's within-episode setpoint steps) would train the
+        # direct path on a corrupted signal while the residual scores a reference
+        # its env isn't holding. Fixed setpoints for those modes.
+        fixed_ref = (reward_mode == "regulation") or residual
         env = AIOGymNativeEnv("threetank", reward_mode=reward_mode, action_mode=eff_mode,
-                              episode_steps=episode_steps, randomize_plant=True, dynamic=True,
+                              episode_steps=episode_steps, randomize_plant=True,
+                              dynamic=not fixed_ref,
+                              randomize_setpoints=not fixed_ref,
                               integral_obs=integral_obs)
         from controllers.threetank_model import ThreeTankModel
         _m = ThreeTankModel()

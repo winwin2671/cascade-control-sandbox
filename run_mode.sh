@@ -35,15 +35,24 @@ TRAIN_TRACK="numpy"
 RESIDUAL=false
 STEPS="${STEPS:-20}"
 
-# Parse optional flags
+# Parse optional flags (Minor/#6: missing values get a clear message instead of a
+# silent set -e death or a raw unbound-variable abort)
+need_val() {
+  if [ $# -lt 2 ]; then
+    echo "ERROR: option $1 needs a value." >&2
+    exit 2
+  fi
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --algo)
-      ALGO="${2:-sac}"
+      need_val "$@"
+      ALGO="$2"
       shift 2
       ;;
     --train_track)
-      TRAIN_TRACK="${2:-numpy}"
+      need_val "$@"
+      TRAIN_TRACK="$2"
       shift 2
       ;;
     --residual)
@@ -51,6 +60,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --step|--steps)
+      need_val "$@"
       STEPS="$2"
       shift 2
       ;;
@@ -94,6 +104,12 @@ if ! kill -0 "$CAB_PID" 2>/dev/null; then
 fi
 
 if [ "$NEEDS_IA2" = true ]; then
+  # Minor/#6: distinguish "binary not built" from "port busy" up front
+  if [ ! -x "$IA2/server" ]; then
+    echo "ERROR: $IA2/server not found or not executable — the vendored IA2 engine"
+    echo "       is gitignored and must be built first (cargo build --release in ia2/)."
+    exit 1
+  fi
   echo "==> starting ia2-server (:3001)"
   "$IA2/server" --bind 127.0.0.1:3001 &
   SRV_PID=$!

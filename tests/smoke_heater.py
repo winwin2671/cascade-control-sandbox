@@ -69,9 +69,14 @@ def main() -> int:
     fails = []
     if d_no_pump < 0.10:
         fails.append(f"heater raised T1 only {d_no_pump:.2f} C in 10s (expected >=0.10; 2kW, ~23.5L at 0.30m)")
-    if d_no_pump - d_pump < 0.01:
+    # M7/#6: 0.01 passed with the pump->T1 advection term DELETED (margin +0.037
+    # from thermal-mass growth alone — h1 rises during the pump phase, which slows
+    # heating without any coupling). 0.06 sits above the no-coupling margin and
+    # well below the real one, restoring the with/without discrimination this
+    # test exists for (#2's H4).
+    if d_no_pump - d_pump < 0.06:
         fails.append(f"recirc coupling too weak (d_no_pump={d_no_pump:.2f} - d_pump={d_pump:.2f} "
-                     f"= {d_no_pump - d_pump:.2f} < 0.01; advection coupling may be missing)")
+                     f"= {d_no_pump - d_pump:.2f} < 0.06; advection coupling may be missing)")
     if fails:
         print(f"\n{RED}{BOLD}FAIL{RESET}: " + "; ".join(fails))
         return 1

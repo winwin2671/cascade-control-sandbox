@@ -1,13 +1,10 @@
 """Heated serial-cascade plant model for the MPC controllers (AIO-Gym MPCAgent).
 
-Mirrors `mock_cabinet.py`'s physics — pump recirculation into Tank1, valve-modulated
-Torricelli cascade (V-12 -> V-23 -> V-33), and a first-law thermal balance with a
-SINGLE heater in Tank1 (Tank2/Tank3 warm via downstream advection) — so the MPC's
-internal predictor matches the simulated plant. Params come from `ia2_config.json`
-(single source). MUST stay drift-free with mock_cabinet.py and nmpc_oracle.py
-(shared cleanup deferred to Phase 5).
+Physics DELEGATES to the shared `controllers/threetank_dynamics.py` (one
+implementation serving the mock, this model, and the NMPC oracle — no drift).
+Params come from `ia2_config.json` (single source).
 
-State layout (interleaved, like AIO-Gym's cascade): x = [h1, T1, h2, T2, h3, T3].
+State layout (interleaved + finite reservoir): x = [h1, T1, h2, T2, h3, T3, h_res, T_res].
 Actions: pumps=[p1], valves=[V-12, V-23, V-33], heaters=[E-101] (each 0..1).
 """
 from __future__ import annotations
@@ -19,17 +16,6 @@ from pathlib import Path
 # Gravity is universal; geometry + valve coefficients come from the contract.
 G = 9.81
 CONFIG = Path(__file__).resolve().parents[1] / "ia2_config.json"
-
-
-def _valve_flow(h_upstream: float, c_v: float, frac: float,
-                gravity_drop: float = 0.0) -> float:
-    """Valve flow (m^3/s) — aligned with xinji's model. MUST match mock_cabinet._valve_flow.
-    q = frac × cv × √(upstream_level + gravity_drop). No 2g (absorbed into cv)."""
-    head = h_upstream + gravity_drop
-    if head <= 1e-9:
-        return 0.0
-    frac = max(0.0, min(frac, 1.0))
-    return frac * c_v * math.sqrt(head)
 
 
 class ThreeTankModel:
@@ -114,13 +100,6 @@ class ThreeTankModel:
         return dynamics(x, act["pumps"][0], list(act["valves"]), act["heaters"][0],
                         self._dynamics_params, NUMERIC_OPS)
 
-    def _dT(self, T, h, q_heat, adv, t_amb, area=None):
-        area = area if area is not None else self.a_tank
-        h = max(h, 0.02)
-        m_cp = self.rho * area * h * self.cp
-        q_loss = self.ua * (T - t_amb)
-        return (q_heat - q_loss) / m_cp + adv / (area * h)
-
     # ---- AIO-Gym env / KPIScorer interface (KPI + economic reward) ----
     def default_setpoints(self):
         return dict(self._hsp), list(self._tsp)
@@ -136,13 +115,26 @@ class ThreeTankModel:
         """Thermodynamic floor for the excess-energy KPI: power to warm the cold
         recirc inflow into Tank1 to t_sp[0] and cover Tank1's heat loss. Tank2/Tank3
         are warmed only by advection (no direct heater), so they are not in the floor."""
-        # pump curve (must match derivatives — was linear, which inflated the floor)
-        _hm = self.pump_shutoff_head - self.pump_static_head
-        _nh = (self.pump_shutoff_head * act["pumps"][0] ** 2 - self.pump_static_head) / _hm
-        q_pump = self.q_max * max(_nh, 0.0) ** 0.5
+        # Minor/#6: reuse the ONE pump-curve implementation (compute_flows) — the
+        # inline mirror was exactly the drift the consolidation was meant to end.
+        # q_pump depends only on the duty + reservoir availability (nominal here).
+        from controllers.threetank_dynamics import compute_flows, build_params, NUMERIC_OPS
+        if not hasattr(self, '_dynamics_params'):
+            self._dynamics_params = build_params(self)
+        f = compute_flows([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0],
+                          act["pumps"][0], [0.0, 0.0, 0.0], 0.0,
+                          self._dynamics_params, NUMERIC_OPS)
+        q_pump = float(f["q_pump"])
         rho_cp = self.rho * self.cp
         t_amb = env["t_amb"]
-        t_inflow = self._last_t_res  # finite reservoir temp (cached from derivatives)
+        # M2/#6: inflow temp from the MEASURED T3 (the reservoir return feeds the
+        # pump). The old _last_t_res cache only updated inside derivatives(), so
+        # scorer-only instances (validate_policy / rollout_report / manual_gui)
+        # froze it at t_supply and ideal_w was ~93 kW vs a 2 kW heater — the
+        # excess-energy KPI registered nothing on those paths. T3 slightly
+        # overestimates T_res (the reservoir cools a little), so the floor errs
+        # low and excess flags waste early — the conservative direction.
+        t_inflow = temps[2] if len(temps) >= 3 else self._last_t_res
         return max(0.0, rho_cp * q_pump * (t_sp[0] - t_inflow) + self.ua * (t_sp[0] - t_amb))
 
     def clamp_state(self, x):

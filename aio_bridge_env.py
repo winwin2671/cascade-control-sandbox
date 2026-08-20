@@ -162,16 +162,24 @@ class ModbusBackend(Backend):
 
     def read_raw(self) -> dict:
         out: dict = {}
-        # batch reads by (slave_id, fc) — each group is one contiguous block.
+        # batch reads by (slave_id, read-fc) — each group is one block.
+        # M2/#6: write-direction registers are read back TOO (FC06/FC16 writes
+        # live in readable holding registers) — the applied-duty machinery in
+        # run_rl/validate_policy/rollout_report reads post-command actuator
+        # values from this dict; skipping them zeroed applied_duty across the
+        # whole modbus track (a regression vs main).
         groups: dict[tuple, list[dict]] = {}
         for r in self.regs_by_name.values():
-            if r["direction"] != "read":
-                continue
-            groups.setdefault((r["slave_id"], r["fc"]), []).append(r)
+            read_fc = 3 if r["fc"] in (6, 16) else r["fc"]
+            if r["direction"] == "write" and r["fc"] not in (6, 16):
+                continue                      # coil writes have no read-back path here
+            groups.setdefault((r["slave_id"], read_fc), []).append(r)
         for (sid, fc), regs in groups.items():
             regs = sorted(regs, key=lambda r: r["address"])
             base = regs[0]["address"]
-            count = sum(int(r["count"]) for r in regs)
+            # span the address RANGE (the AO value registers sit at odd addresses
+            # 1/3/5/7 — gaps must be covered, not summed)
+            count = regs[-1]["address"] + int(regs[-1]["count"]) - base
             if fc == 4:
                 rr = self.client.read_input_registers(base, count=count, device_id=sid)
                 raw = rr.registers
@@ -240,7 +248,11 @@ class _IA2HttpBase(Backend):
         directly. Floats -> bit-cast, ints/bools -> as-is."""
         if isinstance(value, bool):
             return 1 if value else 0
-        if isinstance(value, float):
+        # M3/#6: np.float32/np.float64 are NOT Python floats (only float64
+        # subclasses float) — without np.floating they fall through to int(value)
+        # (truncation), which wrote level_sp=0 from float32 setpoint actions and
+        # drained the plant in the setpoint validation gate.
+        if isinstance(value, (float, np.floating)):
             return struct.unpack("<i", struct.pack("<f", float(value)))[0]
         return int(value)
 

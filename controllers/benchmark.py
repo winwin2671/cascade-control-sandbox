@@ -93,10 +93,17 @@ class RLAgent:
             self.wrapper._reset_episodic_state()
             self.wrapper._model_optimal = tracking_steady_state_action(
                 self.wrapper.model, self.wrapper.reference)
+            # Minor/#6: the first obs after reset must NOT accumulate the integral
+            # (wrapper.reset() passes accumulate=False; training never integrates
+            # the reset state). Direct-driving _make_obs with its default would
+            # add one extra ∫err step the policy never saw in training.
+            self._first_obs = True
 
     def compute(self, meas, sp, dt):
         if self.wrapper is not None:             # residual paradigm: 23-D obs (17 base + 6 integral), 2-D action
-            obs = self.wrapper._make_obs(self.env._obs())
+            acc = not getattr(self, "_first_obs", False)
+            self._first_obs = False
+            obs = self.wrapper._make_obs(self.env._obs(), accumulate=acc)
             action, _ = self.model.predict(np.asarray(obs, dtype=np.float32), deterministic=True)
             action = np.clip(np.asarray(action, dtype=np.float64).flatten(), -1.0, 1.0)
             physical = self.wrapper._resolve_action(action)   # canonical [pump,v12,v23,v33,heater]
@@ -127,7 +134,9 @@ def main():
     args = ap.parse_args()
 
     env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
-                          action_mode="actuator", episode_steps=args.episode_steps)
+                          action_mode="actuator", episode_steps=args.episode_steps,
+                          randomize_setpoints=False)   # M5/#6: fixed-reference rows
+                                  # must not be scored against setpoints they cannot see
     pairs = [(FixedAgent(env.model), env), (PIDAgent(env.model), env), (MPCAgent(env.model), env)]
     if args.nmpc:
         from controllers.nmpc_oracle import OracleAgent
@@ -157,8 +166,20 @@ def main():
                   "numpy-trained policy, or evaluate this one on the bridge: "
                   f"python3 controllers/run_rl.py --policy {args.rl} --backend ia2")
             sys.exit(1)
+        # M6/#6: setpoint-mode policies output SUPERVISORY setpoints, not duties —
+        # this benchmark applies the raw action as actuator fractions, which turns
+        # temperature setpoints into pump/valve duties and silently slices the 6th
+        # dim. (train_sb3's default is setpoint, so this is easy to hit.)
+        if meta.get("action_mode") == "setpoint":
+            print(f"ERROR: {args.rl} is a setpoint-mode policy (6-D supervisory output). "
+                  "The benchmark evaluates direct duties only — retrain with "
+                  "--action-mode actuator (or --residual), or validate this policy on "
+                  f"the bridge: python3 controllers/run_rl.py --policy {args.rl} "
+                  "--action-mode setpoint --backend ia2")
+            sys.exit(1)
         rl_env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
                                  action_mode="actuator", episode_steps=args.episode_steps,
+                                 randomize_setpoints=False,          # M5/#6: match the base env
                                  integral_obs=(rl_model.observation_space.shape == (20,)))
         # residual policy (2-D action): attach the SAME wrapper used in training
         # (numpy env -> grouped obs indices + canonical action order) so the 2-D

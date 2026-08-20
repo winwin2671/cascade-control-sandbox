@@ -124,7 +124,15 @@ def tracking_steady_state_action(model, y_sp):
             q = numerator / denominator
             if math.isfinite(q) and q > 0.0:
                 flow_candidates.append(q)
-    q = float(np.mean(flow_candidates)) if flow_candidates else model.q_max * 0.2
+    if flow_candidates:
+        q = float(np.mean(flow_candidates))
+    else:
+        # Minor/#6: equal setpoints (the shipped 45/45/45) zero every inversion
+        # denominator, so the old 0.2*q_max fallback was the branch that ALWAYS
+        # ran — an arbitrary flow. With equal targets the inter-tank stage drop
+        # is ua*(T - t_amb)/(rho_cp*q), which SHRINKS with flow: pick the flow
+        # that holds the per-stage drop at ~0.5 C instead.
+        q = model.ua * (temps[0] - t_amb) / (rho_cp * 0.5) if temps[0] > t_amb else model.q_max * 0.2
 
     pump = math.sqrt(
         (model.pump_static_head
@@ -177,7 +185,10 @@ class ResidualEnvWrapper(gym.Wrapper):
         self._n_act = int(env.action_space.shape[0])
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         n_obs = 23 if self.integral_obs else 17
-        self.observation_space = spaces.Box(0.0, 1.0, shape=(n_obs,), dtype=np.float32)
+        # Minor/#6: the 6 integral dims are normalized to [-1, 1] (signed ∫err),
+        # so the 23-D space must be Box(-1, 1) — Box(0, 1) mis-declared them.
+        lo = -1.0 if self.integral_obs else 0.0
+        self.observation_space = spaces.Box(lo, 1.0, shape=(n_obs,), dtype=np.float32)
         self._prev_physical = np.zeros(5, dtype=np.float32)
         self._model_optimal = np.zeros(5, dtype=np.float32)
         self._last_raw_obs = None

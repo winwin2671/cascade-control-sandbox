@@ -147,15 +147,23 @@ def main():
     scorer.reset()
     rewards = []
     for k in range(args.steps):
-        # build the obs the policy expects
+        # build the obs the policy expects — M4/#6: route on the sidecar TRACK
+        # first, never on shape. A numpy policy trained with --no-integral-obs is
+        # 14-D, which shape-matched the old "raw bridge obs" branch and was fed
+        # interleaved sensors where it trained on grouped — same length, garbage
+        # semantics. (No genuine raw-14 bridge policy can exist: the modbus
+        # trainer always wraps EnrichedObs, and pre-wrap policies are archived
+        # in policies/legacy/.)
         if action_mode == "residual":
             full_obs = np.asarray(obs, dtype=np.float32)       # wrapper's policy obs (23D/17D)
+        elif track == "numpy":                                  # 14/20-D reconstruction
+            full_obs = numpy_obs()
         elif expected_shape == (n_raw + len(ctx_enriched),):      # EnrichedObs (train_rl modbus)
             full_obs = np.concatenate([obs, np.array(ctx_enriched, dtype=np.float32)])
-        elif expected_shape == (n_raw,):                        # raw 14-dim bridge obs
-            full_obs = np.asarray(obs, dtype=np.float32)
-        else:                                                   # numpy-track obs (14/20-D reconstruction)
-            full_obs = numpy_obs()
+        else:
+            LOG.error("policy obs shape %s matches no known format for track=%r",
+                      tuple(expected_shape), track)
+            sys.exit(1)
         action, _ = model.predict(full_obs, deterministic=True)
         lo, hi = (-1.0, 1.0) if action_mode == "residual" else (0.0, 1.0)
         action = np.clip(np.asarray(action, dtype=np.float32).flatten(), lo, hi)

@@ -16,8 +16,7 @@
     "server_url": "http://127.0.0.1:3001",
     "health_path": "/api/health",
     "project_name": "cascade_control_sandbox",
-    "application_pou": "ThreeTank",
-    "device_name": "mock_cabinet"
+    "application_pou": "ThreeTank"
   },
   "slaves": {
     "ai": {
@@ -63,7 +62,7 @@
     },
     {
       "name": "tank1_temp",
-      "plc": 30002,
+      "plc": 30003,
       "slave_id": 2,
       "address": 2,
       "table": "input",
@@ -82,7 +81,7 @@
     },
     {
       "name": "tank2_level",
-      "plc": 30003,
+      "plc": 30005,
       "slave_id": 2,
       "address": 4,
       "table": "input",
@@ -101,7 +100,7 @@
     },
     {
       "name": "tank2_temp",
-      "plc": 30004,
+      "plc": 30007,
       "slave_id": 2,
       "address": 6,
       "table": "input",
@@ -120,7 +119,7 @@
     },
     {
       "name": "tank3_level",
-      "plc": 30005,
+      "plc": 30009,
       "slave_id": 2,
       "address": 8,
       "table": "input",
@@ -139,7 +138,7 @@
     },
     {
       "name": "tank1_flow",
-      "plc": 30006,
+      "plc": 30011,
       "slave_id": 2,
       "address": 10,
       "table": "input",
@@ -159,7 +158,7 @@
     },
     {
       "name": "tank2_flow",
-      "plc": 30007,
+      "plc": 30013,
       "slave_id": 2,
       "address": 12,
       "table": "input",
@@ -179,7 +178,7 @@
     },
     {
       "name": "tank3_flow",
-      "plc": 30008,
+      "plc": 30015,
       "slave_id": 2,
       "address": 14,
       "table": "input",
@@ -296,7 +295,7 @@
     {
       "name": "reset_cmd",
       "plc": 40009,
-      "slave_id": 3,
+      "slave_id": 1,
       "address": 8,
       "table": "holding",
       "fc": 6,
@@ -308,12 +307,13 @@
       "max": 65535.0,
       "direction": "write",
       "group": "reset",
-      "ia2_variable": "ThreeTank.reset_cmd"
+      "ia2_variable": "ThreeTank.reset_cmd",
+      "note": "sim-only episode-reset register on slave 1 (a unit id the real gateway does not occupy) \u2014 kept off slave 3 so the runtime never writes the physical QX-AO04 beyond its four real value registers"
     },
     {
       "name": "init_h1",
       "plc": 40010,
-      "slave_id": 3,
+      "slave_id": 1,
       "address": 9,
       "table": "holding",
       "fc": 6,
@@ -325,12 +325,13 @@
       "max": 0.5,
       "direction": "write",
       "group": "reset",
-      "ia2_variable": "ThreeTank.init_h1"
+      "ia2_variable": "ThreeTank.init_h1",
+      "note": "sim-only episode-reset register on slave 1 (a unit id the real gateway does not occupy) \u2014 kept off slave 3 so the runtime never writes the physical QX-AO04 beyond its four real value registers"
     },
     {
       "name": "init_h2",
       "plc": 40011,
-      "slave_id": 3,
+      "slave_id": 1,
       "address": 10,
       "table": "holding",
       "fc": 6,
@@ -342,12 +343,13 @@
       "max": 0.5,
       "direction": "write",
       "group": "reset",
-      "ia2_variable": "ThreeTank.init_h2"
+      "ia2_variable": "ThreeTank.init_h2",
+      "note": "sim-only episode-reset register on slave 1 (a unit id the real gateway does not occupy) \u2014 kept off slave 3 so the runtime never writes the physical QX-AO04 beyond its four real value registers"
     },
     {
       "name": "init_h3",
       "plc": 40012,
-      "slave_id": 3,
+      "slave_id": 1,
       "address": 11,
       "table": "holding",
       "fc": 6,
@@ -359,7 +361,8 @@
       "max": 0.5,
       "direction": "write",
       "group": "reset",
-      "ia2_variable": "ThreeTank.init_h3"
+      "ia2_variable": "ThreeTank.init_h3",
+      "note": "sim-only episode-reset register on slave 1 (a unit id the real gateway does not occupy) \u2014 kept off slave 3 so the runtime never writes the physical QX-AO04 beyond its four real value registers"
     },
     {
       "name": "vfd_cmd",
@@ -508,7 +511,7 @@
     "mechanism": "reset_cmd lives on slave 03 (holding). Env writes a fresh nonzero nonce to reset_cmd (any value change triggers); cabinet snaps levels to init_h* and HOLDS while reset_cmd != 0; writing 0 resumes stepping. physics_loop must union regvals across all slaves to see reset_cmd."
   },
   "process": {
-    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. Reservoir modeled as infinite (constant level, constant temp = supply).",
+    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. Reservoir is finite (0.3 m2 x 0.5 m, ~150 L max), internal/uninstrumented; the pump draws at T_res and overflow returns to it.",
     "q_max_m3s": 0.00111,
     "h_max_m": 0.475,
     "t_supply_c": 25.0,
@@ -529,7 +532,7 @@
       "ua_w_per_k"
     ],
     "_placeholder_note": "c_v* (valve Cv) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.0784 (300x300mm tank, 10mm walls), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
-    "_drift_warning": "The ODEs live in ONE place: controllers/threetank_dynamics.py (dynamics + compute_flows). mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py all import from it — edit there and all three follow.",
+    "_drift_warning": "The ODEs live in ONE place: controllers/threetank_dynamics.py (dynamics + compute_flows). mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py all import from it \u2014 edit there and all three follow.",
     "_valve_note": "c_v* scaled 5.6x with the real pump flow (4 m^3/h) to keep the sim balanced; refine with valve datasheet Cv.",
     "reservoir_base_m2": 0.3,
     "reservoir_height_m": 0.5,

@@ -12,6 +12,8 @@ with our ThreeTankModel, and `_DYN` extended with `_f_threetank`.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 try:
@@ -22,6 +24,8 @@ except Exception:                       # pragma: no cover
 
 from controllers.threetank_model import ThreeTankModel
 
+LOG = logging.getLogger("nmpc_oracle")
+
 RHO_CP = 1000.0 * 4186.0
 
 
@@ -30,20 +34,8 @@ RHO_CP = 1000.0 * 4186.0
 # x = [h1, T1, h2, T2, h3, T3]; u = [pump, V-12, V-23, V-33, heater] in [0,1];
 # d = [t_cold, t_amb]; p = ThreeTankModel.p.
 # ----------------------------------------------------------------------------
-def _valve_flow_sym(h_upstream, c_v, frac, p):
-    """Valve flow (symbolic) — aligned with xinji's model.
-    q = frac × cv × √(upstream_level + gravity_drop). No 2g."""
-    head = h_upstream + p.get("gravity_drop", 0.0)
-    return frac * c_v * ca.sqrt(ca.fmax(head, 1e-9))
-
-
-def _dT_sym(T, h, q_heat, adv, t_amb, p, area=None):
-    area = p["A_TANK"] if area is None else area
-    h = ca.fmax(h, p["h_floor"])
-    m_cp = p["rho"] * area * h * p["cp"]
-    q_loss = p["ua"] * (T - t_amb)
-    return (q_heat - q_loss) / m_cp + adv / (area * h)
-
+# Minor/#6: the pre-consolidation _valve_flow_sym/_dT_sym mirrors were removed —
+# _f_threetank delegates to the shared threetank_dynamics module.
 
 def _f_threetank(x, u, d, p):
     """CasADi dynamics — delegates to the shared threetank_dynamics module."""
@@ -77,6 +69,7 @@ class NMPCOracle:
         self.q_temp, self.q_level, self.r_move = q_temp, q_level, r_move
         self.t_safe = 70.0          # match the L5 shield's high-temp cutoff
         self.u_prev = np.full(self.nu, 0.5)
+        self.solve_fails = 0
         from controllers.threetank_dynamics import build_params
         self._dyn_params = build_params(self.model)
         self._build()
@@ -116,6 +109,13 @@ class NMPCOracle:
               "h_sp": [hsp[i] for i in range(self.model.n)]}
         J = 0
         opti.subject_to(X[:, 0] == x0)
+        # B2/#6: physical envelope on X — without it the solver iterates into
+        # h = −gravity_drop (the sqrt-floor kink) and negative levels, which is
+        # where the max-iter stalls came from. Levels [0, h_max]; temps sane.
+        for i in range(self.model.n):
+            opti.subject_to(opti.bounded(0.0, X[2 * i, :], self.model.h_max))
+            opti.subject_to(opti.bounded(5.0, X[2 * i + 1, :], 90.0))
+        opti.subject_to(opti.bounded(0.0, X[6, :], 0.5))               # h_res
         slack = opti.variable(1, N)                                    # soft cap slack
         opti.subject_to(slack >= 0)
         for k in range(N):
@@ -135,6 +135,7 @@ class NMPCOracle:
 
     def reset(self):
         self.u_prev = np.full(self.nu, 0.5)
+        self.solve_fails = 0                               # B2/#6: surfaced, not silent
 
     def solve(self, x, t_cold, t_amb, t_sp, h_sp):
         o = self.opti
@@ -149,7 +150,14 @@ class NMPCOracle:
             o.set_initial(self.X, np.tile(np.asarray(x, float).reshape(-1, 1), (1, self.N + 1)))
             sol = o.solve()
             u = np.clip(sol.value(self.U)[:, 0], 0.0, 1.0)
-        except Exception:
+        except Exception as e:
+            # B2/#6: a dead oracle must not masquerade as a working one — log the
+            # failure (first few verbosely, then a running count) instead of the
+            # old bare except that returned u_prev forever with no signal.
+            self.solve_fails += 1
+            if self.solve_fails <= 3 or self.solve_fails % 50 == 0:
+                LOG.warning("IPOPT solve failed (%d total): %s — holding u_prev",
+                            self.solve_fails, str(e).strip().splitlines()[-1][:120])
             u = self.u_prev                                # keep last on solver failure
         self.u_prev = np.asarray(u, float).reshape(-1)
         return {"pumps": list(self.u_prev[:self.nP]),

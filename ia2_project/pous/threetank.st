@@ -82,6 +82,13 @@ PROGRAM ThreeTank
     overflow_trip : BOOL;
     dryfire_trip  : BOOL;
     overtemp_trip : BOOL;
+    (* Minor/#6: per-valve forced-drain latches + release dwells (anti-chatter) *)
+    v12_force : BOOL;
+    v23_force : BOOL;
+    v33_force : BOOL;
+    v12_dwell : INT;
+    v23_dwell : INT;
+    v33_dwell : INT;
     (* heartbeat *)
     scan_count : UDINT;
   END_VAR
@@ -143,16 +150,20 @@ PROGRAM ThreeTank
      R2 fix: 3 independent latches (overflow / dry-fire / over-temp).
      Recovery rule: a trip may only inhibit the actuator that AGGRAVATES it —
      overflow cuts the pump (inflow) but never the drains, dry-fire/over-temp cut
-     the heater. Cutting the recovery path would latch the trip forever. ---------- *)
-  IF di_overflow OR di_estop THEN overflow_trip := TRUE; END_IF;
+     the heater. Cutting the recovery path would latch the trip forever.
+     B1 fix (#6): di_estop is an NC chain — 0 = PRESSED, 1 = healthy — so the
+     tripped condition is NOT di_estop. (The old TRUE-as-tripped reading latched
+     every trip on the first scan of healthy hardware, and only PRESSING the
+     E-stop could unlatch them — the safety function was inverted.) ---------- *)
+  IF di_overflow OR NOT di_estop THEN overflow_trip := TRUE; END_IF;
   IF (tank1_level < 0.40) AND (tank2_level < 0.40) AND (tank3_level < 0.40)
-     AND NOT di_overflow AND NOT di_estop THEN overflow_trip := FALSE; END_IF;
+     AND NOT di_overflow AND di_estop THEN overflow_trip := FALSE; END_IF;
 
-  IF di_dryfire OR di_estop THEN dryfire_trip := TRUE; END_IF;
-  IF (tank1_level > 0.06) AND NOT di_dryfire AND NOT di_estop THEN dryfire_trip := FALSE; END_IF;
+  IF di_dryfire OR NOT di_estop THEN dryfire_trip := TRUE; END_IF;
+  IF (tank1_level > 0.06) AND NOT di_dryfire AND di_estop THEN dryfire_trip := FALSE; END_IF;
 
-  IF (tank1_temp > 70.0) OR di_estop THEN overtemp_trip := TRUE; END_IF;
-  IF (tank1_temp < 65.0) AND NOT di_estop THEN overtemp_trip := FALSE; END_IF;
+  IF (tank1_temp > 70.0) OR NOT di_estop THEN overtemp_trip := TRUE; END_IF;
+  IF (tank1_temp < 65.0) AND di_estop THEN overtemp_trip := FALSE; END_IF;
 
   (* pump VFD: cut on overflow / e-stop — stop INFLOW so the tank can drain *)
   IF overflow_trip THEN
@@ -165,10 +176,16 @@ PROGRAM ThreeTank
 
   (* V-12: NOT cut on overflow — cutting the drains would sustain the overflow
      (pump off + valves shut = frozen level). While the latch is held and Tank1 is
-     still above the 0.40 recovery threshold, the drain is FORCED open — the pump
+     still above the recovery threshold, the drain is FORCED open — the pump
      is cut so this valve is the only recovery path, and leaving it to the
-     controller (which may command it shut) would latch forever. *)
-  IF overflow_trip AND (tank1_level > 0.40) THEN
+     controller (which may command it shut) would latch forever.
+     Minor/#6: hysteresis (force above 0.40, release below 0.35) — a level riding
+     the threshold with inflow otherwise toggles the forcing at scan rate
+     (measured 0.05 s chatter; 129 trip/re-trip cycles in 900 s under a
+     persistent refill). *)
+  IF overflow_trip AND (tank1_level > 0.40) THEN v12_force := TRUE; END_IF;
+  IF (NOT overflow_trip) OR (tank1_level < 0.35) THEN v12_force := FALSE; END_IF;
+  IF v12_force OR (v12_dwell > 0) THEN
     v_12_cmd := 10000;
   ELSIF out_v12 > 100.0 THEN
     v_12_cmd := 10000;
@@ -176,8 +193,10 @@ PROGRAM ThreeTank
     v_12_cmd := REAL_TO_INT(out_v12 * 100.0);
   END_IF;
 
-  (* V-23: same pattern — forced open only while Tank2 is above 0.40 in a latch *)
-  IF overflow_trip AND (tank2_level > 0.40) THEN
+  (* V-23: same pattern (hysteresis band + force latch) on Tank2 *)
+  IF overflow_trip AND (tank2_level > 0.40) THEN v23_force := TRUE; END_IF;
+  IF (NOT overflow_trip) OR (tank2_level < 0.35) THEN v23_force := FALSE; END_IF;
+  IF v23_force OR (v23_dwell > 0) THEN
     v_23_cmd := 10000;
   ELSIF out_v23 > 100.0 THEN
     v_23_cmd := 10000;
@@ -185,8 +204,10 @@ PROGRAM ThreeTank
     v_23_cmd := REAL_TO_INT(out_v23 * 100.0);
   END_IF;
 
-  (* V-33 (Tank3 -> reservoir): same pattern — forced open while Tank3 > 0.40 *)
-  IF overflow_trip AND (tank3_level > 0.40) THEN
+  (* V-33 (Tank3 -> reservoir): same pattern on Tank3 *)
+  IF overflow_trip AND (tank3_level > 0.40) THEN v33_force := TRUE; END_IF;
+  IF (NOT overflow_trip) OR (tank3_level < 0.35) THEN v33_force := FALSE; END_IF;
+  IF v33_force OR (v33_dwell > 0) THEN
     v_33_cmd := 10000;
   ELSIF out_v33 > 100.0 THEN
     v_33_cmd := 10000;
@@ -202,6 +223,13 @@ PROGRAM ThreeTank
   ELSE
     e_101_cmd := REAL_TO_INT(out_h1 * 100.0);
   END_IF;
+
+  (* Minor/#6: release dwell — after the force latch drops, keep the drain open
+     for 20 more scans (1 s) so a level hovering at the 0.35 release threshold
+     can't re-latch at scan rate. Reloaded to 20 while forced, counts down after. *)
+  IF v12_force THEN v12_dwell := 20; ELSIF v12_dwell > 0 THEN v12_dwell := v12_dwell - 1; END_IF;
+  IF v23_force THEN v23_dwell := 20; ELSIF v23_dwell > 0 THEN v23_dwell := v23_dwell - 1; END_IF;
+  IF v33_force THEN v33_dwell := 20; ELSIF v33_dwell > 0 THEN v33_dwell := v33_dwell - 1; END_IF;
 
   scan_count := scan_count + 1;
 END_PROGRAM

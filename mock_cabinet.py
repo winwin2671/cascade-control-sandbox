@@ -7,9 +7,11 @@ Modbus slaves (one SimDevice per unit_id) with segregated function codes:
 
     slave 2  AI     FC04 input registers  (3 levels + 2 temps + 3 flows, float)
     slave 5  AI #2  FC04 input registers  (TT-301, float)
-    slave 3  AO+    FC06/FC16 holding     (V-12, V-23, E-101 cmds [float] + reset [uint16])
+    slave 3  AO     FC06 holding, u16     (V-12, V-23, E-101, V-33 cmds, raw 0..10000)
+    slave 1  SIM    FC06 holding, u16     (reset_cmd + init_h1-3 — sim-only, not on
+                                            the real gateway; kept off the AO card)
     slave 4  DI     FC02 discrete inputs  (5 hardware-safety-status flags)
-    slave 6  VFD    FC16 holding          (P-101 frequency cmd, float)
+    slave 6  VFD    FC06 holding, u16     (P-101 duty, 0..10000 = 0..100% of F0-10)
 
 Process topology — heated serial cascade with recirculation:
 
@@ -214,7 +216,8 @@ class TankProcess:
     di_overflow: int = 0
     di_heater_contactor: int = 0
     di_pump_contactor: int = 0
-    di_estop: int = 0
+    di_estop: int = 1     # NC chain: 1 = healthy, 0 = pressed (B1/#6 — the mock
+                          # must publish the same polarity the hardware will)
     # reservoir (finite, internal — NOT instrumented; affects pump inflow temp)
     h_res: float = 0.30
     T_res: float = 25.0
@@ -269,7 +272,7 @@ class TankProcess:
         self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > p.high_level_trip else 0
         self.di_heater_contactor = 1 if flows["Qh1"] > 0.0 else 0
         self.di_pump_contactor = 1 if flows["q_pump"] > 0.0 else 0
-        self.di_estop = 0
+        self.di_estop = 1      # NC chain healthy (never pressed in sim; 0 = pressed)
 
     def snapshot(self) -> dict:
         return {
@@ -315,6 +318,18 @@ def apply_reset(proc: TankProcess, regval: dict, layout: Layout, params: Physics
     for attr in ("T1", "T2", "T3"):
         setattr(proc, attr, RESET_TEMP_C)
     proc.T_res = RESET_TEMP_C   # finite reservoir temp -> warm start (level persists)
+    # Minor/#6: refresh DI flags + FT sensors for the SNAPPED state. They only
+    # update in proc.step, which is skipped while the reset holds — so the next
+    # episode's first observation carried the previous episode's dry-fire/
+    # overflow flags and flow readings (and on IA2 the stale DI could latch ST
+    # trips for the ~10-scan hold window). During the hold the actuators are
+    # zeroed by the env, so flows are 0 and the contactor flags drop out.
+    proc.q12_lpm = proc.q23_lpm = proc.q3r_lpm = 0.0
+    proc.di_dryfire = 1 if proc.h1 < params.low_level_trip else 0
+    proc.di_overflow = 1 if max(proc.h1, proc.h2, proc.h3) > params.high_level_trip else 0
+    proc.di_heater_contactor = 0
+    proc.di_pump_contactor = 0
+    proc.di_estop = 1          # NC chain healthy
 
 
 def _decode_holding(raw_vals: list[int], regs: list[dict]) -> dict:
