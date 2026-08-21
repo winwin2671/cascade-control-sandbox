@@ -344,7 +344,8 @@ class CascadeBridgeEnv(gym.Env):
 
     observation = the 14 sensors in ia2_config.json order (engineering units):
                   3 levels, 3 temps, 3 flows, 5 digital safety flags.
-    action      = 4 actuator fractions in [0,1] (v_12, v_23, e_101, vfd).
+    action      = 5 actuator fractions in [0,1] in bridge write order
+                  (v_12, v_23, e_101, v_33, vfd).
     reward      = -(level + temp tracking error vs setpoints + action cost).
     """
 

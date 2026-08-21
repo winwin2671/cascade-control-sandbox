@@ -24,6 +24,17 @@ _SQRT_FLOOR = 1e-9
 # tank cannot deliver water (the old head = level + gravity_drop kept ~47 L/min
 # flowing at level 0) and the pump cannot draw from an empty reservoir.
 _LEVEL_EPS = 0.02
+# P1/#6-re: pump gate ramp width in net head (dimensionless, nh spans [-0.2, 1]).
+# 0.01 spans duty u* -> u*+0.003 (~0.3% of the action box) where the true curve
+# delivers <= 7 L/min on a 67 L/min pump. Narrower (5e-4) left curvature ~1/eps
+# that stalled IPOPT on high-level starts; wider is curve-fidelity loss for
+# nothing. See compute_flows.
+_PUMP_GATE_EPS = 0.01
+# P1/#6-re: the weir gates get their own, much narrower ramp. The tank-drain
+# _LEVEL_EPS (0.02 m) is wider than the entire reachable weir band
+# (0.46 -> 0.475 = 0.015 m), so relief flow was attenuated 25-87% everywhere
+# the weir can physically operate.
+_OVF_EPS = 0.002
 
 
 # ---- ops backends ----
@@ -114,8 +125,27 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
     # B2/#6: the sqrt argument must stay strictly positive — d/dx sqrt(x) is
     # infinite at 0, which NaNs the NMPC Jacobian over the whole u_pump <= 0.41
     # band. _smax(nh, 0) is smooth AND bounded below by sqrt(eps)/2 > 0.
+    # P1/#6-re: but that floor is itself a phantom — _smax(nh, 0) is strictly
+    # positive for nh < 0, so the pump delivered ~0.074 L/min at duty 0.0 (up to
+    # 1.5 L/min across the deadband): an idle plant slowly filled Tank1 (overflow
+    # trip after ~3 h), the NMPC treated the phantom band as real authority
+    # (nominal pump 0.365, inside the deadband), and the pump-contactor DI
+    # (formerly keyed on q_pump > 0) never dropped. Fix: multiply by a smooth
+    # availability ramp on net head — a pure _smin/_smax composition, C1
+    # EVERYWHERE. This matters: any exact-zero-below formulation (a hard clamp,
+    # or a constant-floor subtraction) has a slope jump 0 -> finite at nh = 0,
+    # and the NMPC's drain-regime optimum sits exactly on that corner — IPOPT
+    # cannot close the RK4 defects across it (measured: constraint-violation
+    # flutter at ~4e-4 out to max-iter, 40 s per stalled solve, on high-level
+    # starts). The C1 gate's price is a ~1e-5 L/min residue at duty 0.0 (2e-7 of
+    # q_max; idle drift < 0.002 cm/day, 10^6x below the phantom it kills) — so
+    # the mock's contactor DI is keyed on the pump COMMAND instead, which is the
+    # physical contactor anyway (it stays closed at sub-deadband speed with zero
+    # flow). Above the 0.01-wide ramp the curve is unbiased to ~1e-7 rel, and no
+    # constant-floor subtraction bias exists.
     # M1/#6: gated on the reservoir level — no pumping from an empty reservoir.
-    q_pump = p["q_max"] * _sqrt(_smax(nh, 0.0)) * _avail(h_res)
+    pump_gate = _smin(1.0, _smax(nh, 0.0) / _PUMP_GATE_EPS)
+    q_pump = p["q_max"] * _sqrt(_smax(nh, 0.0)) * pump_gate * _avail(h_res)
 
     q_12 = cvs[0] * valve_fracs[0] * _sqrt(_max(h1 + g_drop, _SQRT_FLOOR)) * _avail(h1)
     q_23 = cvs[1] * valve_fracs[1] * _sqrt(_max(h2 + g_drop, _SQRT_FLOOR)) * _avail(h2)
@@ -127,9 +157,12 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
     # sqrt(max(level - overflow_level, 1e-9)) bled ~8 L/day per tank with the
     # level below the weir. _smax keeps the sqrt argument (and its CasADi
     # derivative) strictly positive; the gate makes the flow exactly 0 below.
-    ovf1 = cv_ovf * _sqrt(_smax(h1 - ovf_level, _SQRT_FLOOR)) * _avail(h1 - ovf_level)
-    ovf2 = cv_ovf * _sqrt(_smax(h2 - ovf_level, _SQRT_FLOOR)) * _avail(h2 - ovf_level)
-    ovf3 = cv_ovf * _sqrt(_smax(h3 - ovf_level, _SQRT_FLOOR)) * _avail(h3 - ovf_level)
+    # P1/#6-re: the weir gates use _OVF_EPS (0.002 m), NOT the tank-drain
+    # _LEVEL_EPS — reusing the drain ramp width attenuated legitimate relief
+    # 25-87% across the whole 0.015 m weir band.
+    ovf1 = cv_ovf * _sqrt(_smax(h1 - ovf_level, _SQRT_FLOOR)) * _avail(h1 - ovf_level, _OVF_EPS)
+    ovf2 = cv_ovf * _sqrt(_smax(h2 - ovf_level, _SQRT_FLOOR)) * _avail(h2 - ovf_level, _OVF_EPS)
+    ovf3 = cv_ovf * _sqrt(_smax(h3 - ovf_level, _SQRT_FLOOR)) * _avail(h3 - ovf_level, _OVF_EPS)
 
     return {
         "q_pump": q_pump, "q_12": q_12, "q_23": q_23, "q_3r": q_3r,

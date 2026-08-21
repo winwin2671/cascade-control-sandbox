@@ -53,7 +53,7 @@ class NMPCOracle:
     """CasADi + IPOPT nonlinear MPC (multiple-shooting, RK4, tracking mode)."""
 
     def __init__(self, horizon=20, control_dt=0.5, du_max=0.4,
-                 q_temp=1.0, q_level=50.0, r_move=0.05):
+                 q_temp=0.04, q_level=400.0, r_move=0.05):
         if not _HAVE_CASADI:
             raise RuntimeError("casadi not installed — pip install casadi")
         self.scenario = "threetank"
@@ -67,6 +67,15 @@ class NMPCOracle:
         self.nu = nP + nV + nH
         self.nx = len(self.model.initial_state())
         self.q_temp, self.q_level, self.r_move = q_temp, q_level, r_move
+        # B2-weights/#6-re: normalized-quadratic weights — each term is ~1 at a
+        # "significant deviation" for its quantity (temp 5 K -> 0.04; level
+        # 0.05 m -> 400). The old q_temp=1/q_level=50 made the irreducible temp
+        # error (~1200/stage at 20 K, since 45 degC is unreachable in-horizon)
+        # dwarf the level term (~1/stage), so the genuine optimum shut the pump
+        # and let Tank1 drain to 0.143 m against its own 0.30 m setpoint — cold
+        # inflow hurt the dominant cost. With 0.04/400 the terms are the same
+        # order (16 vs 10 per stage at those errors), so level tracking is no
+        # longer traded away.
         self.t_safe = 70.0          # match the L5 shield's high-temp cutoff
         self.u_prev = np.full(self.nu, 0.5)
         self.solve_fails = 0

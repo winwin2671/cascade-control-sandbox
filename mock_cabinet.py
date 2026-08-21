@@ -21,8 +21,8 @@ Process topology — heated serial cascade with recirculation:
     heater E-101 (2 kW) --> Tank 1 only
 
 Tank1 is the only directly-heated tank; Tank2/Tank3 warm via downstream hot-water
-advection (the under-actuated temperature coupling). Reservoir is modeled as
-infinite (constant level, constant temp = supply).
+advection (the under-actuated temperature coupling). Reservoir is finite (level
+and temp are integrated states; tank overflows spill back into it).
 
 Config-driven. The register layout (names, slave_ids, addresses, function codes,
 data types, byte/word order) is read from ia2_config.json — the same single
@@ -271,7 +271,12 @@ class TankProcess:
         self.di_dryfire = 1 if self.h1 < p.low_level_trip else 0
         self.di_overflow = 1 if max(self.h1, self.h2, self.h3) > p.high_level_trip else 0
         self.di_heater_contactor = 1 if flows["Qh1"] > 0.0 else 0
-        self.di_pump_contactor = 1 if flows["q_pump"] > 0.0 else 0
+        # P1/#6-re: the contactor follows the RUN COMMAND, not the flow — a real
+        # contactor stays closed at sub-deadband speed with zero delivered flow,
+        # and drops at zero speed. Keying on q_pump > 0 also never dropped under
+        # the old phantom (and would flicker with the C1 gate's 0.0036 L/min
+        # residue); the command is what the physical aux contact actually wired.
+        self.di_pump_contactor = 1 if pump_frac > 0.0 else 0
         self.di_estop = 1      # NC chain healthy (never pressed in sim; 0 = pressed)
 
     def snapshot(self) -> dict:

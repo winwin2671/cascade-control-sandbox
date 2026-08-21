@@ -75,7 +75,8 @@ heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advec
 > IA2 gains native MPC/RL, the AIO-Gym dependency can be dropped.
 
 > **Simulation status:** `mock_cabinet.py` models the heated serial-cascade rig
-> from the approved electrical BOM ([Electrical_BOM_for_heated_tanks.md](Electrical_BOM_for_heated_tanks.md)).
+> from the approved electrical BOM (the BOM document itself is kept offline —
+> not committed to the repo).
 > Tank geometry (37.24 L, 0.0784 m²), pump flow (4 m³/h, quadratic pump curve),
 > heat-loss (4.0 W/K estimate), gravity_drop (0.3 m), and safety trips are set.
 > Valve Cv is an interim estimate pending datasheets. Physics equations are
@@ -90,14 +91,14 @@ Heated serial cascade with recirculation (topology above). The rig is
 **multi-slave Modbus** behind an RTU-to-TCP gateway at `127.0.0.1:5020` — five
 slaves with segregated function codes:
 
-| Slave | Module | FC | Type | Channels |
-| --- | --- | --- | --- | --- |
-| 02 | AI | FC04 input reg | f32 | LT-101/201/301 level (0–0.5 m), TT-101/201 temp (0–100 °C), FT-101/201/301 flow (0–50 L/min) |
-| 05 | AI #2 | FC04 input reg | f32 | TT-301 temp (slave 02 full at 8 ch) |
-| 03 | AO | FC06 holding | u16 | V-12/V-23/E-101/V-33 cmd (0–10000 = 0–100 %) |
-| 01 | sim-only | FC06 holding | u16 | reset_cmd, init_h1–3 (episode reset; a unit id the real gateway doesn't occupy) |
-| 04 | DI | FC02 discrete | bool | dry-fire, overflow, heater/pump contactor, e-stop |
-| 06 | VFD | FC06 holding | u16 | vfd_cmd — Inovance MD200 freq ref (addr 0x1000, 0–10000 = 0–100 % of F0-10) |
+| Slave | Module   | FC             | Type | Channels                                                                                     |
+| ----- | -------- | -------------- | ---- | -------------------------------------------------------------------------------------------- |
+| 02    | AI       | FC04 input reg | f32  | LT-101/201/301 level (0–0.5 m), TT-101/201 temp (0–100 °C), FT-101/201/301 flow (0–50 L/min) |
+| 05    | AI #2    | FC04 input reg | f32  | TT-301 temp (slave 02 full at 8 ch)                                                          |
+| 03    | AO       | FC06 holding   | u16  | V-12/V-23/E-101/V-33 cmd (0–10000 = 0–100 %)                                                 |
+| 01    | sim-only | FC06 holding   | u16  | reset_cmd, init_h1–3 (episode reset; a unit id the real gateway doesn't occupy)              |
+| 04    | DI       | FC02 discrete  | bool | dry-fire, overflow, heater/pump contactor, e-stop                                            |
+| 06    | VFD      | FC06 holding   | u16  | vfd_cmd — Inovance MD200 freq ref (addr 0x1000, 0–10000 = 0–100 % of F0-10)                  |
 
 Analog sensors are 32-bit floats (2 registers, big-endian ABCD); actuator commands
 are uint16 raw 0–10000 (FC06 single-register write, MD200-style); safety statuses
@@ -105,22 +106,22 @@ are FC02 discretes. The single source of truth is [`ia2_config.json`](ia2_config
 
 ### Safety model (5 layers)
 
-| Layer | What | Where |
-| --- | --- | --- |
-| L1–L4 | Hardware (RCD, high/low-level floats, capillary thermostat, contactors) | Physical plant — emulated as the 5 FC02 DI flags |
-| **L5** | **Software shield** — clamps + interlocks every actuator | **`threetank.st` (this repo)** |
+| Layer  | What                                                                    | Where                                            |
+| ------ | ----------------------------------------------------------------------- | ------------------------------------------------ |
+| L1–L4  | Hardware (RCD, high/low-level floats, capillary thermostat, contactors) | Physical plant — emulated as the 5 FC02 DI flags |
+| **L5** | **Software shield** — clamps + interlocks every actuator                | **`threetank.st` (this repo)**                   |
 
 The L5 shield runs in the PLC scan loop. The supervisor writes `*_cmd_req` (REAL
 0–100 %); the PLC converts to uint16 raw (×100 → 0–10000), clamps, and applies
 the interlock latches (5 hardware DI flags + software level/temp limits):
 
-- **Pump/VFD OFF** on overflow or e-stop (DI flags) — overflow stops *inflow* only
+- **Pump/VFD OFF** on overflow or e-stop (DI flags) — overflow stops _inflow_ only
 - **Drains stay available in a latch** — valves are never cut on overflow (cutting
   them sustained the overflow and made the latch unrecoverable); while a tank is
   above the 0.40 recovery threshold its drain is forced open so the level can fall
 - **Heater E-101 OFF** on dry-fire, over-temp (>70 °C), or e-stop
 
-> Design rule: a trip may only inhibit the actuator that *aggravates* it. Note the
+> Design rule: a trip may only inhibit the actuator that _aggravates_ it. Note the
 > BOM's RLY-101 relay still cuts valve power on overflow **in hardware** — the
 > software shield deliberately doesn't; recommend repurposing that relay to the
 > pump contactor before commissioning so both layers agree.
@@ -145,12 +146,12 @@ tears down on exit — one command per mode:
 
 For any controller supervisor (`run_mpc.py`, `run_nmpc.py`, `run_rl.py`, `validate_policy.py`, `manual_gui.py`), you can specify the communication backend using the `--backend` flag. This allows you to bypass the IA2 server for quick tests, or target a remote edge device.
 
-- ``auto`` (default for scripts): Uses ia2 if the dev server is running and a program is loaded, otherwise falls back to modbus.
-- ``ia2``: Connects via the local IA2 dev server and runs the full PLC scan + L5 safety shield.
-- ``modbus``: Bypasses IA2 and connects directly to mock_cabinet.py (useful for quick standalone tests without booting IA2).
-- ``edge:<name>``: Connects to a remote edge runtime via the dev server's SSH proxy.
+- `auto` (default for scripts): Uses ia2 if the dev server is running and a program is loaded, otherwise falls back to modbus.
+- `ia2`: Connects via the local IA2 dev server and runs the full PLC scan + L5 safety shield.
+- `modbus`: Bypasses IA2 and connects directly to mock_cabinet.py (useful for quick standalone tests without booting IA2).
+- `edge:<name>`: Connects to a remote edge runtime via the dev server's SSH proxy.
 
->Note on edge latency: If using `--backend edge:<name>`, be aware that each step requires an SSH round-trip proxied >through the dev server (~6 handshakes per step). For edge deployments, increase the step time using ``--control-dt`` (e.g., >``--control-dt 2.0``) to accommodate the network latency.
+> Note on edge latency: If using `--backend edge:<name>`, be aware that each step requires an SSH round-trip proxied >through the dev server (~6 handshakes per step). For edge deployments, increase the step time using `--control-dt` (e.g., >`--control-dt 2.0`) to accommodate the network latency.
 
 ```bash
 # Example: Run MPC directly on the mock cabinet (no IA2 server required)
@@ -164,6 +165,7 @@ python3 controllers/validate_policy.py --policy controllers/policies/sac_threeta
 ```
 
 For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
+
 - `--algo <sac|ppo>`: Specify the algorithm (defaults to `sac`).
 - `--train_track <numpy|modbus>`: Specify the training track (defaults to `numpy`). If `modbus` is used, the script automatically skips the IA2 server and connects directly to the `mock_cabinet.py` plant, matching how cascade policies were trained.
 
@@ -175,13 +177,13 @@ For the **RL mode** (`./run_mode.sh rl`), you can specify the following attribut
 ./run_mode.sh rl --algo ppo --train_track modbus  # evaluate a PPO policy trained on Modbus
 ```
 
-| Mode | Controller | Runs in | Agent writes |
-| --- | --- | --- | --- |
-| Manual | `FB_MANSTATION` | PLC | `manual_*` (0–100 %) |
-| PID | `FB_PID` × 4 | PLC | `*_sp` setpoints (3 levels + Tank1 temp) |
-| MPC | `MPCAgent` (numpy) | Python supervisor | `*_cmd_req` |
-| NMPC | `NMPCOracle` (CasADi) | Python supervisor | `*_cmd_req` |
-| RL | Trained SAC/PPO | Python supervisor | `*_cmd_req` (actuator) or `*_sp` (setpoint) |
+| Mode   | Controller            | Runs in           | Agent writes                                |
+| ------ | --------------------- | ----------------- | ------------------------------------------- |
+| Manual | `FB_MANSTATION`       | PLC               | `manual_*` (0–100 %)                        |
+| PID    | `FB_PID` × 4          | PLC               | `*_sp` setpoints (3 levels + Tank1 temp)    |
+| MPC    | `MPCAgent` (numpy)    | Python supervisor | `*_cmd_req`                                 |
+| NMPC   | `NMPCOracle` (CasADi) | Python supervisor | `*_cmd_req`                                 |
+| RL     | Trained SAC/PPO       | Python supervisor | `*_cmd_req` (actuator) or `*_sp` (setpoint) |
 
 ### RL training & benchmark
 
@@ -193,10 +195,10 @@ mock, MPC model, and NMPC oracle via [`controllers/threetank_dynamics.py`](contr
 
 The single flag `--residual` selects the paradigm on **either** track:
 
-| Paradigm | `--residual` | Action dim | What the RL controls | Reward |
-|---|---|---|---|---|
-| **Direct actuator** | *off* (omit) | **5D** | all MVs: pump + V-12 + V-23 + V-33 + heater | configurable (`--reward-mode`) |
-| **Residual** (xinji-aligned) | **on** | **2D** | only V-33 + heater (on top of model feedforward + inline PID) | regulation (tracking + feedforward) |
+| Paradigm                     | `--residual` | Action dim | What the RL controls                                          | Reward                              |
+| ---------------------------- | ------------ | ---------- | ------------------------------------------------------------- | ----------------------------------- |
+| **Direct actuator**          | _off_ (omit) | **5D**     | all MVs: pump + V-12 + V-23 + V-33 + heater                   | configurable (`--reward-mode`)      |
+| **Residual** (xinji-aligned) | **on**       | **2D**     | only V-33 + heater (on top of model feedforward + inline PID) | regulation (tracking + feedforward) |
 
 Both paradigms are wired into **both** trainers — `train_sb3.py` (numpy) and
 `train_rl.py` (modbus) — so you can compare 5D vs 2D on the **same** environment
@@ -222,18 +224,19 @@ baseline unless it can improve tracking.
 
 #### Reward modes
 
-| Mode | Formula | Tracks |
-|---|---|---|
-| `economic` (v0.1 default) | `-(w_energy × heater_power + w_viol × band_violations)` | numpy |
-| `kpi` | composite KPI score (tracking + energy + safety) | numpy |
-| `track` | `-(level_MSE + temp_MSE + action_cost)` | numpy + modbus |
-| **`regulation`** (xinji-aligned) | `-(tracking + 0.03 × feedforward_deviation)` | **numpy + modbus** (drift-free) |
+| Mode                             | Formula                                                 | Tracks                          |
+| -------------------------------- | ------------------------------------------------------- | ------------------------------- |
+| `economic` (v0.1 default)        | `-(w_energy × heater_power + w_viol × band_violations)` | numpy                           |
+| `kpi`                            | composite KPI score (tracking + energy + safety)        | numpy                           |
+| `track`                          | `-(level_MSE + temp_MSE + action_cost)`                 | numpy + modbus                  |
+| **`regulation`** (xinji-aligned) | `-(tracking + 0.03 × feedforward_deviation)`            | **numpy + modbus** (drift-free) |
 
 The `regulation` reward is the **recommended mode** — it's aligned with xinji's
 v0.2 model and produces the same reward on both tracks (eliminating the reward
 drift between numpy and modbus training).
 
 **Train (modbus track — sim-to-real, slower):**
+
 ```bash
 # 2D residual (xinji-aligned: V-33 + heater on top of model feedforward)
 python3 controllers/train_rl.py --residual --algo sac --total-timesteps 50000 --device cuda
@@ -242,41 +245,34 @@ python3 controllers/train_rl.py --algo sac --total-timesteps 50000
 ```
 
 **Benchmark (compare all controllers on the same KPI):**
+
 ```bash
 python3 controllers/benchmark.py --rl controllers/policies/sac_residual_numpy.zip --reward-mode kpi --episode-steps 4000
 # add --nmpc for the CasADi NMPC oracle (slow)
 ```
 
-Current result (residual SAC, 500k steps × 4000-step episodes, post-#6 stack —
-5 eps × 4000 steps, kpi mode):
+Current result (residual SAC, 500k steps × 4000-step episodes,
+fixed-reference eval — 20 eps × 4000 steps, kpi mode):
 
 ```
 controller     kpi   ±std temp_err  lvl_cm excess_kwh interlock
 ---------------------------------------------------------------
-RL-SAC-res   69.83   1.65    14.72    0.85     0.045      0.00
-MPC          68.27   3.68    15.47    0.82     0.167      0.00
-PID          65.53   0.51    15.57    3.45     0.620      0.00
-Manual       41.55   2.06    18.51   26.80     0.000      0.00
+RL-SAC-res   71.62   1.23    13.95    0.30     0.267      0.00
+MPC          69.75   2.98    14.67    0.98     0.137      0.00
+PID          66.52   0.89    15.21    3.17     0.581      0.00
+Manual       43.06   1.40    17.89   26.46     0.000      0.00
 ```
-
-The residual RL tops the table on **every** sub-KPI that matters: best composite,
-best temp tracking, best level tracking (with MPC), **14× less excess energy than
-PID**, zero interlock. Bridge-validated through the full IA2 chain + L5 shield
-(4000 steps): levels 0.300/0.302/0.302 m at close (0.03 cm steady-state error per
-tank), temps climbing coherently to 40.5/37.6/35.6 °C, zero dry-fire/overflow
-events — the numpy benchmark and the bridge agree, which is the sim-to-real
-fidelity this sandbox exists to demonstrate.
 
 **Validate (sim-to-real gate — trained policy on the live track):**
 
 Any of the four train combinations validates the same way — `--train_track` selects
 numpy (IA2 backend) or modbus, and `--residual` selects the 2D policy (off = 5D):
 
-| Train combination | Validate command |
-|---|---|
-| numpy + 5D direct | `./run_mode.sh rl` |
-| numpy + 2D residual | `./run_mode.sh rl --residual` |
-| modbus + 5D direct | `./run_mode.sh rl --train_track modbus` |
+| Train combination    | Validate command                                   |
+| -------------------- | -------------------------------------------------- |
+| numpy + 5D direct    | `./run_mode.sh rl`                                 |
+| numpy + 2D residual  | `./run_mode.sh rl --residual`                      |
+| modbus + 5D direct   | `./run_mode.sh rl --train_track modbus`            |
 | modbus + 2D residual | `./run_mode.sh rl --train_track modbus --residual` |
 
 ```bash
@@ -392,7 +388,6 @@ validation track stays single-instance (one PROGRAM per server).
 ```
 cascade-control-sandbox/
 ├── ia2_config.json            # single contract — multi-slave register map, scales, setpoints
-├── Electrical_BOM_for_heated_tanks.md  # source hardware spec (approved electrical BOM)
 ├── mock_cabinet.py            # multi-slave pymodbus TCP plant on :5020 (--time-scale k)
 ├── aio_bridge_env.py          # Gymnasium env (ia2 / edge / modbus backends; --mode)
 ├── aio_vec_env.py             # vectorized training env (N cabinets, AsyncVectorEnv)
@@ -469,11 +464,11 @@ pip3 install --user torch stable_baselines3    # see CUDA notes per-OS below
 
 **OS-specific notes:**
 
-| OS | IA2 build | CUDA (for RL training) | Manual GUI |
-| --- | --- | --- | --- |
-| **WSL2 (Windows)** | `cargo build --release` in WSL | `pip install torch` (auto-detects CUDA via WSL GPU passthrough) | `sudo apt install python3-tk` (renders via WSLg on Windows 11) |
-| **Linux (native)** | `cargo build --release` | `pip install torch` (CUDA if NVIDIA GPU present, else CPU) | `sudo apt install python3-tk` or `python3-tkinter` |
-| **macOS** | `cargo build --release` | `pip install torch` (CPU — MPS per-op overhead dominates small MLPs; use `--device cpu`) | Bundled with system Python (no install needed) |
+| OS                 | IA2 build                      | CUDA (for RL training)                                                                   | Manual GUI                                                     |
+| ------------------ | ------------------------------ | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| **WSL2 (Windows)** | `cargo build --release` in WSL | `pip install torch` (auto-detects CUDA via WSL GPU passthrough)                          | `sudo apt install python3-tk` (renders via WSLg on Windows 11) |
+| **Linux (native)** | `cargo build --release`        | `pip install torch` (CUDA if NVIDIA GPU present, else CPU)                               | `sudo apt install python3-tk` or `python3-tkinter`             |
+| **macOS**          | `cargo build --release`        | `pip install torch` (CPU — MPS per-op overhead dominates small MLPs; use `--device cpu`) | Bundled with system Python (no install needed)                 |
 
 > The `best_device()` helper in `train_sb3.py` auto-selects CUDA → CPU. Override
 > with `--device mps` if you want to try Apple Silicon.
@@ -499,11 +494,13 @@ python3 controllers/benchmark.py --rl controllers/policies/sac_threetank_numpy.z
 To drive the plant via the **IA2 WebUI** (useful for inspecting the live PLC scan), you'll need three terminals.
 
 **Terminal 1 — start the simulated cabinet:**
+
 ```bash
 python3 mock_cabinet.py &
 ```
 
 **Terminal 2 — build & launch the IA2 web server:**
+
 ```bash
 cd ia2
 
@@ -516,9 +513,11 @@ cargo test -p server                 # populates apps/web/src/types/generated/
 pnpm --filter @cs/web build
 cargo run -p server --release -- --static-dir apps/web/dist
 ```
+
 Open the server URL and press **Start** on the `threetank` PRG.
 
 **Terminal 3 — drive the plant via the bridge env:**
+
 ```bash
 python3 aio_bridge_env.py --backend ia2 --mode pid --steps 200
 python3 aio_bridge_env.py --backend ia2 --mode mpc --steps 200

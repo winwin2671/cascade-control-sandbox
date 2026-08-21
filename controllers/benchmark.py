@@ -135,8 +135,14 @@ def main():
 
     env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
                           action_mode="actuator", episode_steps=args.episode_steps,
-                          randomize_setpoints=False)   # M5/#6: fixed-reference rows
-                                  # must not be scored against setpoints they cannot see
+                          randomize_setpoints=False,   # M5/#6: fixed-reference rows
+                          dynamic=False)               # must not be scored against
+                                  # setpoints they cannot see. dynamic=False too
+                                  # (M5 re-review): the env default is True and its
+                                  # disturbance kind 3 is a mid-episode SETPOINT
+                                  # MOVE (h_sp/t_sp mutated in place) — 12/20 episodes
+                                  # moved the scored setpoints while the residual
+                                  # wrapper's reference stayed frozen.
     pairs = [(FixedAgent(env.model), env), (PIDAgent(env.model), env), (MPCAgent(env.model), env)]
     if args.nmpc:
         from controllers.nmpc_oracle import OracleAgent
@@ -180,6 +186,7 @@ def main():
         rl_env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
                                  action_mode="actuator", episode_steps=args.episode_steps,
                                  randomize_setpoints=False,          # M5/#6: match the base env
+                                 dynamic=False,                      # M5 re-review: ditto
                                  integral_obs=(rl_model.observation_space.shape == (20,)))
         # residual policy (2-D action): attach the SAME wrapper used in training
         # (numpy env -> grouped obs indices + canonical action order) so the 2-D
