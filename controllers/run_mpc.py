@@ -19,8 +19,6 @@ import logging
 import sys
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -40,6 +38,8 @@ def main():
     ap = argparse.ArgumentParser(description="MPC supervisor — drives the live IA2 plant.")
     ap.add_argument("--backend", default="ia2",
                     help="Backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
+    ap.add_argument("--steps", type=int, default=40,
+                    help="rollout length (default 40; wired from run_mode.sh --steps)")
     args = ap.parse_args()
 
     env = CascadeBridgeEnv(backend=args.backend, control_dt=0.5, mode="mpc")
@@ -54,10 +54,9 @@ def main():
 
     obs, _ = env.reset()
     LOG.info("MPC supervisor start — sp levels=%s m, temps=%s degC", sp["h_sp"], sp["t_sp"])
-    rewards = []
     steps_data = []
 
-    for k in range(40):
+    for k in range(args.steps):
         # obs = [h1, T1, h2, T2, h3, T3] in engineering units
         meas = {"levels": [float(obs[0]), float(obs[2]), float(obs[4])],
                 "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
@@ -69,25 +68,24 @@ def main():
                    "v_23_cmd": act["valves"][1], "v_33_cmd": act["valves"][2],
                    "e_101_cmd": act["heaters"][0]}
         a = [float(by_name[n]) for n in env.actuator_names]
-        obs, reward, _, _, info = env.step(a)
-        if k % 4 == 0 or k == 39:
+        obs, _, _, _, info = env.step(a)
+        if k % 4 == 0 or k == args.steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})
-            LOG.info("step %2d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f  r=%.3f",
+            LOG.info("step %2d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f",
                      k, [round(float(x), 2) for x in a],
                      lv.get("tank1_level", float("nan")),
                      lv.get("tank2_level", float("nan")),
                      lv.get("tank3_level", float("nan")),
                      tp.get("tank1_temp", float("nan")),
                      tp.get("tank2_temp", float("nan")),
-                     tp.get("tank3_temp", float("nan")), reward)
-        rewards.append(reward)
+                     tp.get("tank3_temp", float("nan")))
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in a], "reward": reward,
+            "action": [float(x) for x in a],
             "interlock": detect_interlock(info["raw"])})  # R1 fix: use stashed read
     env.close()
-    LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
+    LOG.info("rollout done — %d steps", len(steps_data))
     report(steps_data, tag="mpc")
 
 

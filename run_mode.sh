@@ -14,7 +14,8 @@
 #   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
 #   ./run_mode.sh gui            # interactive manual control GUI (tkinter sliders + live plot)
 #   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo>, --train_track <numpy|modbus>, --residual
-#   ./run_mode.sh pid --steps 40 # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+#   ./run_mode.sh pid --steps 40 # more steps (all modes; nmpc solves ~1-4 s/step,
+#                                # so long nmpc runs take hours)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
 # cabinet directly (the fast training path). See README "Control modes".
@@ -131,7 +132,7 @@ if [ "$NEEDS_IA2" = true ]; then
   "$IA2/cs" run
 fi
 
-echo "==> running mode=$MODE" $([ "$MODE" = mpc ] || [ "$MODE" = nmpc ] || [ "$MODE" = gui ] || echo "(steps=$STEPS)")
+echo "==> running mode=$MODE" $([ "$MODE" = gui ] || echo "(steps=$STEPS)")
 case "$MODE" in
   modbus)
     python3 -u "$ROOT/aio_bridge_env.py" --backend modbus --steps "$STEPS" ;;
@@ -169,9 +170,9 @@ case "$MODE" in
     fi
     ;;
   mpc)
-    python3 -u "$ROOT/controllers/run_mpc.py" ;;
+    python3 -u "$ROOT/controllers/run_mpc.py" --steps "$STEPS" ;;
   nmpc)
-    python3 -u "$ROOT/controllers/run_nmpc.py" ;;
+    python3 -u "$ROOT/controllers/run_nmpc.py" --steps "$STEPS" ;;
   gui)
     python3 -u "$ROOT/controllers/manual_gui.py" ;;
 esac

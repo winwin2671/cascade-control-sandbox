@@ -541,6 +541,9 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
     env = CascadeBridgeEnv(backend=backend, control_dt=control_dt, mode=mode)
     obs, info = env.reset()
     LOG.info("reset obs = %s  mode=%s", np.round(obs, 3), mode)
+    # reward is an RL concept — only the rl demo reports it (pid/manual/modbus
+    # controllers don't optimize one, so printing it there is misleading)
+    log_reward = mode == "rl"
     rewards = []
     steps_data = []
     pid_act = env.setpoint_action() if mode == "pid" else None
@@ -548,26 +551,32 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
         action = pid_act if pid_act is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
-        steps_data.append({
+        sd = {
             "step": k,
             "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
             "flows": [float(obs[6]), float(obs[7]), float(obs[8])],
             "action": [float(x) for x in action],
             "applied_duty": [float(info["raw"].get(n, 0.0)) / env._act_max[n]
-                              for n in env.actuator_names],
-            "reward": reward})
+                              for n in env.actuator_names]}
+        if log_reward:
+            sd["reward"] = reward
+        steps_data.append(sd)
         if k % 4 == 0 or k == steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  "
-                     "temps(C)=%.1f/%.1f/%.1f  r=%.4f",
+                     "temps(C)=%.1f/%.1f/%.1f%s",
                      k, np.round(action, 2),
                      lv.get("tank1_level", float("nan")), lv.get("tank2_level", float("nan")),
                      lv.get("tank3_level", float("nan")),
                      tp.get("tank1_temp", float("nan")), tp.get("tank2_temp", float("nan")),
-                     tp.get("tank3_temp", float("nan")), reward)
+                     tp.get("tank3_temp", float("nan")),
+                     f"  r={reward:.4f}" if log_reward else "")
     env.close()
-    LOG.info("rollout done — mean reward = %.4f over %d steps", float(np.mean(rewards)), steps)
+    if log_reward:
+        LOG.info("rollout done — mean reward = %.4f over %d steps", float(np.mean(rewards)), steps)
+    else:
+        LOG.info("rollout done — %d steps", steps)
     try:
         from controllers.rollout_report import report
         report(steps_data, tag=mode)

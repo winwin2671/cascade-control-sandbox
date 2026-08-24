@@ -132,17 +132,30 @@ PROGRAM ThreeTank
       up_vfd := 0.0;  up_v12 := 0.0;  up_v23 := 0.0;  up_v33 := 0.0;  up_h1 := 0.0;
   END_CASE;
 
-  (* ---------- FB_MANSTATION: bumpless manual<->auto (all 0..100%) ---------- *)
+  (* ---------- FB_MANSTATION: manual/auto switch + clamp (all 0..100%) ----------
+     balance := FALSE (corr always 0). With balance := (mode <= 1) the POU's
+     boot sequence poisoned every station: the POU starts in mode 0 (MANUAL,
+     outputs 0), then the supervisor writes mode=1 — that manual->auto EDGE
+     back-calculated corr := out - auto_in and HELD it for the whole PID
+     session. For V-33 (up_v33 = 100 vs manual 0) that meant corr = -100 and
+     out_v33 = 0 forever: the free drain never opened, T3 froze above its
+     setpoint, and every inflow PID above setpoint shut in a chain — the plant
+     deadlocked with T1 cooking alone (measured: levels frozen 0.33/0.39/0.40,
+     T1 -> 49 C, T2/T3 stuck at 25). The other four stations carried the same
+     corr = -(output at the flip) bias, just small. Cost of FALSE: a manual<->
+     PID mode switch is a step, not bumpless — acceptable while the supervisor
+     owns mode changes; revisit (one-scan balance pulse) if an operator panel
+     gets live mode authority. *)
   msta_vfd(auto_in := up_vfd, auto := (mode <> 0), manual_out := manual_vfd,
-           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+           out_min := 0.0, out_max := 100.0, balance := FALSE, dt_s := 0.05);
   msta_v12(auto_in := up_v12, auto := (mode <> 0), manual_out := manual_v12,
-           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+           out_min := 0.0, out_max := 100.0, balance := FALSE, dt_s := 0.05);
   msta_v23(auto_in := up_v23, auto := (mode <> 0), manual_out := manual_v23,
-           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+           out_min := 0.0, out_max := 100.0, balance := FALSE, dt_s := 0.05);
   msta_v33(auto_in := up_v33, auto := (mode <> 0), manual_out := manual_v33,
-           out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+           out_min := 0.0, out_max := 100.0, balance := FALSE, dt_s := 0.05);
   msta_h1(auto_in := up_h1, auto := (mode <> 0), manual_out := manual_h1,
-          out_min := 0.0, out_max := 100.0, balance := (mode <= 1), dt_s := 0.05);
+          out_min := 0.0, out_max := 100.0, balance := FALSE, dt_s := 0.05);
   out_vfd := msta_vfd.out;  out_v12 := msta_v12.out;  out_v23 := msta_v23.out;
   out_v33 := msta_v33.out;  out_h1 := msta_h1.out;
 

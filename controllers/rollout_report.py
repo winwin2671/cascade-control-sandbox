@@ -4,8 +4,12 @@ Each controller (run_mpc.py, run_rl.py, etc.) collects step-by-step data during
 its rollout, then calls report(steps_data, tag) at the end. This utility:
   1. Computes the KPI via AIO-Gym's KPIScorer (score, temp_err, level_err, etc.)
   2. Prints an AIO-Gym-style KPI table to the terminal
-  3. Saves a CSV (step, levels, temps, actions, reward)
-  4. Saves a 3-panel PNG plot (levels, temps, reward with setpoint lines)
+  3. Saves a CSV (step, levels, temps, actions [+ reward for RL runs])
+  4. Saves a PNG plot (levels, temps [+ reward panel for RL runs])
+
+The per-step "reward" key is OPTIONAL and RL-only — PID/MPC/NMPC/Manual don't
+optimize a reward, so their runs omit it and the report drops the mean-reward
+line, the CSV column, and the reward panel accordingly.
 
 Usage:
     from controllers.rollout_report import report, detect_interlock
@@ -54,7 +58,7 @@ def report(steps_data: list[dict], tag: str = "rollout",
 
     Each entry in steps_data must have:
         step (int), levels (list[3] m), temps (list[3] degC),
-        action (list[5] 0-1), reward (float)
+        action (list[5] 0-1)
     Optional per-step keys:
         applied_duty (list[5], 0-1) — post-L5-shield actuator/heater duty used for
             the energy KPI when `action` is NOT the applied duty (e.g. setpoint-
@@ -107,7 +111,9 @@ def report(steps_data: list[dict], tag: str = "rollout",
                              heat_w, ideal_w, sd.get("interlock", False), control_dt)
 
     rep = scorer.report()
-    mean_reward = float(np.mean([sd["reward"] for sd in steps_data]))
+    # RL-only: the per-step reward key is absent for PID/MPC/NMPC/Manual runs.
+    has_reward = bool(steps_data) and all("reward" in sd for sd in steps_data)
+    mean_reward = float(np.mean([sd["reward"] for sd in steps_data])) if has_reward else None
 
     # --- print KPI table ---
     print(f"\n=== KPI Report ({len(steps_data)} steps, {tag}) ===")
@@ -116,17 +122,23 @@ def report(steps_data: list[dict], tag: str = "rollout",
     print(f"  level_err:   {rep['avg_level_err_cm']:6.1f} cm (avg)")
     print(f"  excess_kwh:  {rep['excess_kwh']:6.3f}")
     print(f"  interlock:   {rep['interlock_frac'] * 100:5.1f}%")
-    print(f"  mean reward: {mean_reward:8.4f}")
+    if has_reward:
+        print(f"  mean reward: {mean_reward:8.4f}")
 
     # --- save CSV ---
     csv_path = out_dir / f"{tag}_rollout.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["step", "h1", "h2", "h3", "T1", "T2", "T3",
-                     "act1", "act2", "act3", "act4", "act5", "reward"])
+        header = ["step", "h1", "h2", "h3", "T1", "T2", "T3",
+                  "act1", "act2", "act3", "act4", "act5"]
+        if has_reward:
+            header.append("reward")
+        w.writerow(header)
         for sd in steps_data:
-            w.writerow([sd["step"], *sd["levels"], *sd["temps"],
-                        *sd["action"], sd["reward"]])
+            row = [sd["step"], *sd["levels"], *sd["temps"], *sd["action"]]
+            if has_reward:
+                row.append(sd["reward"])
+            w.writerow(row)
     print(f"\n  saved: {csv_path}")
 
     # --- save PNG ---
@@ -138,10 +150,10 @@ def report(steps_data: list[dict], tag: str = "rollout",
         steps = [sd["step"] for sd in steps_data]
         H = np.array([[sd["levels"][j] for sd in steps_data] for j in range(3)]).T
         T_arr = np.array([[sd["temps"][j] for sd in steps_data] for j in range(3)]).T
-        R = [sd["reward"] for sd in steps_data]
         colors = ["#2196F3", "#4CAF50", "#FF9800"]
 
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        fig, axes = plt.subplots(3 if has_reward else 2, 1,
+                                 figsize=(10, 8 if has_reward else 6), sharex=True)
         # levels + setpoints
         for j in range(3):
             axes[0].plot(steps, H[:, j], color=colors[j], label=f"h{j + 1}")
@@ -156,12 +168,16 @@ def report(steps_data: list[dict], tag: str = "rollout",
         axes[1].axhline(t_sp[0], color="gray", ls="--", alpha=0.4, label="SP")
         axes[1].set_ylabel("Temp (°C)")
         axes[1].legend(loc="upper right", fontsize=8)
-        # reward
-        axes[2].plot(steps, R, "#E91E63", label="reward")
-        axes[2].axhline(0, color="gray", ls=":", alpha=0.3)
-        axes[2].set_ylabel("Reward")
-        axes[2].set_xlabel("Step")
-        axes[2].legend(loc="upper right", fontsize=8)
+        if has_reward:
+            # reward (RL runs only)
+            R = [sd["reward"] for sd in steps_data]
+            axes[2].plot(steps, R, "#E91E63", label="reward")
+            axes[2].axhline(0, color="gray", ls=":", alpha=0.3)
+            axes[2].set_ylabel("Reward")
+            axes[2].set_xlabel("Step")
+            axes[2].legend(loc="upper right", fontsize=8)
+        else:
+            axes[-1].set_xlabel("Step")
 
         plt.tight_layout()
         png_path = out_dir / f"{tag}_rollout.png"
