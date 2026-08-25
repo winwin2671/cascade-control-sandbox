@@ -1,7 +1,7 @@
 {
   "$schema": "cascade-control-sandbox/ia2_config/v2",
   "project": "cascade_control_sandbox",
-  "description": "Register <-> engineering-variable map for the HEATED SERIAL-CASCADE + recirculation plant. Single contract shared by mock_cabinet.py (encoder), the IA2 Modbus iomap (ia2_project/, via tools/gen_ia2_artifacts.py), and aio_bridge_env.py (decoder). Topology: tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; one 2kW heater (E-101) in tank1. Multi-slave via an RTU-to-TCP gateway; analog values are 32-bit floats (2 regs, big-endian ABCD); safety statuses are FC02 discretes.",
+  "description": "Register <-> engineering-variable map for the HEATED SERIAL-CASCADE + recirculation plant. Single contract shared by mock_cabinet.py (encoder), the IA2 Modbus iomap (ia2_project/, via tools/gen_ia2_artifacts.py), and aio_bridge_env.py (decoder). Topology: tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; one 2kW heater (E-101) in tank1. Multi-slave via an RTU-to-TCP gateway; analog values are 32-bit floats (2 regs, big-endian ABCD); safety statuses are FC02 discretes; on/off interlock-test solenoids SV-1..3 are FC05 coils on the DO module (slave 07).",
   "modbus": {
     "transport": "tcp",
     "gateway": "127.0.0.1:5020",
@@ -38,6 +38,10 @@
     "vfd": {
       "slave_id": 6,
       "role": "Inovance MD200 VFD (holding) \u2014 pump P-101 speed"
+    },
+    "do": {
+      "slave_id": 7,
+      "role": "DO relay module (FC05 coils, bool) \u2014 SV-1..3 on/off interlock-test solenoids"
     }
   },
   "registers": [
@@ -472,6 +476,63 @@
       "group": "safety",
       "ia2_variable": "ThreeTank.di_estop",
       "note": "0 = E-Stop pressed (NC)"
+    },
+    {
+      "name": "sv_1_cmd",
+      "plc": 1,
+      "slave_id": 7,
+      "address": 0,
+      "table": "coil",
+      "fc": 5,
+      "type": "bool",
+      "count": 1,
+      "scale": 1.0,
+      "units": "flag",
+      "min": 0.0,
+      "max": 1.0,
+      "direction": "write",
+      "group": "test_actuators",
+      "physical": "valve_sv1_open",
+      "ia2_variable": "ThreeTank.sv_1_cmd",
+      "note": "SV-1 on/off solenoid (DO-101 ch 0), PARALLEL to V-12 (Tank1->Tank2): full-bore bypass for scripting interlock-test level transients (LSH/LSL trips) without touching the control-path valves. Test instrumentation — deliberately NOT in `actuators`, so it is outside the RL action space (see top-level test_actuators; drive via env.set_test_valve)."
+    },
+    {
+      "name": "sv_2_cmd",
+      "plc": 2,
+      "slave_id": 7,
+      "address": 1,
+      "table": "coil",
+      "fc": 5,
+      "type": "bool",
+      "count": 1,
+      "scale": 1.0,
+      "units": "flag",
+      "min": 0.0,
+      "max": 1.0,
+      "direction": "write",
+      "group": "test_actuators",
+      "physical": "valve_sv2_open",
+      "ia2_variable": "ThreeTank.sv_2_cmd",
+      "note": "SV-2 on/off solenoid (DO-101 ch 1), PARALLEL to V-23 (Tank2->Tank3). Same test-instrumentation status as sv_1_cmd."
+    },
+    {
+      "name": "sv_3_cmd",
+      "plc": 3,
+      "slave_id": 7,
+      "address": 2,
+      "table": "coil",
+      "fc": 5,
+      "type": "bool",
+      "count": 1,
+      "scale": 1.0,
+      "units": "flag",
+      "min": 0.0,
+      "max": 1.0,
+      "direction": "write",
+      "group": "test_actuators",
+      "physical": "valve_sv3_open",
+      "ia2_variable": "ThreeTank.sv_3_cmd",
+      "note": "SV-3 on/off solenoid (DO-101 ch 2), PARALLEL to V-33 (Tank3->reservoir). Same test-instrumentation status as sv_1_cmd."
     }
   ],
   "sensors": [
@@ -497,6 +558,12 @@
     "v_33_cmd",
     "vfd_cmd"
   ],
+  "test_actuators": [
+    "sv_1_cmd",
+    "sv_2_cmd",
+    "sv_3_cmd"
+  ],
+  "_test_actuators_note": "On/off interlock-test solenoids SV-1..3 (DO slave 07), each parallel to its modulating valve. Operator/test-harness writes ONLY (env.set_test_valve / set_test_valves_enabled) — deliberately excluded from `actuators` so the RL action space, trained policies, and benchmark KPIs are unaffected while all SVs stay closed.",
   "reset": {
     "command_register": "reset_cmd",
     "init_levels": [
@@ -511,7 +578,7 @@
     "mechanism": "reset_cmd lives on slave 03 (holding). Env writes a fresh nonzero nonce to reset_cmd (any value change triggers); cabinet snaps levels to init_h* and HOLDS while reset_cmd != 0; writing 0 resumes stepping. physics_loop must union regvals across all slaves to see reset_cmd."
   },
   "process": {
-    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. Reservoir is finite (0.3 m2 x 0.5 m, ~150 L max), internal/uninstrumented; the pump draws at T_res and overflow returns to it.",
+    "topology": "tank1 --V-12--> tank2 --V-23--> tank3 --V-33--> reservoir --P-101(VFD)--> tank1; heater E-101 (2kW) in tank1 only. On/off interlock-test solenoids SV-1/SV-2/SV-3 sit parallel to V-12/V-23/V-33 (test instrumentation, normally closed — see test_actuators). Reservoir is finite (0.3 m2 x 0.5 m, ~150 L max), internal/uninstrumented; the pump draws at T_res and overflow returns to it.",
     "q_max_m3s": 0.00111,
     "h_max_m": 0.475,
     "t_supply_c": 25.0,
@@ -520,6 +587,7 @@
     "c_v12": 0.00143,
     "c_v23": 0.00143,
     "c_v33": 0.00143,
+    "c_sv": 0.00143,
     "cp_j_per_kgk": 4180.0,
     "rho_kg_per_m3": 1000.0,
     "q_heat_max_w": 2000.0,
@@ -529,9 +597,10 @@
       "c_v12",
       "c_v23",
       "c_v33",
+      "c_sv",
       "ua_w_per_k"
     ],
-    "_placeholder_note": "c_v* (valve Cv) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.0784 (300x300mm tank, 10mm walls), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
+    "_placeholder_note": "c_v* (valve Cv), c_sv (on/off solenoid Cv — full-port, same line size as the modulating valves) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.0784 (300x300mm tank, 10mm walls), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
     "_drift_warning": "The ODEs live in ONE place: controllers/threetank_dynamics.py (dynamics + compute_flows). mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py all import from it \u2014 edit there and all three follow.",
     "_valve_note": "c_v* scaled 5.6x with the real pump flow (4 m^3/h) to keep the sim balanced; refine with valve datasheet Cv.",
     "reservoir_base_m2": 0.3,

@@ -167,12 +167,13 @@ class ModbusBackend(Backend):
         # live in readable holding registers) — the applied-duty machinery in
         # run_rl/validate_policy/rollout_report reads post-command actuator
         # values from this dict; skipping them zeroed applied_duty across the
-        # whole modbus track (a regression vs main).
+        # whole modbus track (a regression vs main). FC05 coil writes (the DO
+        # module's test solenoids) read back via FC01 the same way.
         groups: dict[tuple, list[dict]] = {}
         for r in self.regs_by_name.values():
-            read_fc = 3 if r["fc"] in (6, 16) else r["fc"]
-            if r["direction"] == "write" and r["fc"] not in (6, 16):
-                continue                      # coil writes have no read-back path here
+            read_fc = {5: 1, 6: 3, 16: 3}.get(r["fc"], r["fc"])
+            if r["direction"] == "write" and r["fc"] not in (5, 6, 16):
+                continue                      # no read-back path for this write family
             groups.setdefault((r["slave_id"], read_fc), []).append(r)
         for (sid, fc), regs in groups.items():
             regs = sorted(regs, key=lambda r: r["address"])
@@ -185,6 +186,9 @@ class ModbusBackend(Backend):
                 raw = rr.registers
             elif fc == 2:
                 rr = self.client.read_discrete_inputs(base, count=count, device_id=sid)
+                raw = rr.bits
+            elif fc == 1:  # coil read-back (DO module)
+                rr = self.client.read_coils(base, count=count, device_id=sid)
                 raw = rr.bits
             else:  # fc == 3
                 rr = self.client.read_holding_registers(base, count=count, device_id=sid)
@@ -345,7 +349,10 @@ class CascadeBridgeEnv(gym.Env):
     observation = the 14 sensors in ia2_config.json order (engineering units):
                   3 levels, 3 temps, 3 flows, 5 digital safety flags.
     action      = 5 actuator fractions in [0,1] in bridge write order
-                  (v_12, v_23, e_101, v_33, vfd).
+                  (v_12, v_23, e_101, v_33, vfd). The on/off interlock-test
+                  solenoids SV-1..3 (config `test_actuators`) are NOT actions:
+                  they are operator/test-harness instrumentation driven via
+                  set_test_valve() / set_test_valves_enabled().
     reward      = -(level + temp tracking error vs setpoints + action cost).
     """
 
@@ -363,6 +370,9 @@ class CascadeBridgeEnv(gym.Env):
         self.reg_by_name = {r["name"]: r for r in self.regs}
         self.sensor_names = list(self.config["sensors"])
         self.actuator_names = list(self.config["actuators"])
+        # on/off interlock-test solenoids (SV-1..3) — see set_test_valve; never
+        # part of the action space (policies + benchmark KPIs unaffected).
+        self.test_actuator_names = list(self.config.get("test_actuators", []))
         self.scales = {r["name"]: float(r["scale"]) for r in self.regs}  # uint16 raw regs only (reset)
         self.setpoints = {k: float(v) for k, v in
                           self.config["control"]["setpoints_m"].items()}
@@ -468,6 +478,39 @@ class CascadeBridgeEnv(gym.Env):
             sp["setpoints_c"]["tank1_temp"] / 100.0,
         ], dtype=np.float32)
 
+    # ---- interlock-test solenoids (operator/test-harness only) ----
+    def set_test_valve(self, name: str, opened: bool) -> None:
+        """Open/close an on/off interlock-test solenoid (SV-1..3 on the DO
+        module, each parallel to V-12/V-23/V-33).
+
+        Test instrumentation, deliberately OUTSIDE the agent action space
+        (config ``test_actuators``, not ``actuators``): the action vector,
+        trained policies, and benchmark KPIs are unaffected while the SVs stay
+        closed. Open one to script a level transient for SAT interlock testing
+        (drive a tank to the LSH overflow / LSL dry-fire trip and verify the
+        response) without touching the control-path valves.
+
+        IA2 track: writes the PLC-internal ``sv_*_req`` var — the POU ANDs it
+        with ``test_sv_en`` (see set_test_valves_enabled) before driving the
+        DO coil. Modbus track: writes the coil directly (no PLC in the loop).
+        """
+        if name not in self.test_actuator_names:
+            raise ValueError(f"'{name}' is not a test actuator "
+                             f"(test_actuators={self.test_actuator_names})")
+        target = name.replace("_cmd", "_req") if self.backend.writes_via_plc else name
+        self.backend.write_register(target, bool(opened))
+
+    def set_test_valves_enabled(self, enabled: bool) -> None:
+        """Master enable for the SV coils (IA2 track only).
+
+        The POU forces every ``sv_*_cmd`` FALSE while ``test_sv_en`` is FALSE
+        (its power-on default), so a stale request cannot hold a test valve
+        open across a harness exit or POU restart. The modbus track has no PLC:
+        the coils themselves are the state, so this is a no-op there.
+        """
+        if self.backend.writes_via_plc:
+            self.backend.write_register("test_sv_en", bool(enabled))
+
     def _reward(self, action, obs) -> tuple[float, dict]:
         sidx = {n: i for i, n in enumerate(self.sensor_names)}
         levels = {n: float(obs[sidx[n]]) for n in self.setpoints}            # level sensors
@@ -497,6 +540,11 @@ class CascadeBridgeEnv(gym.Env):
         super().reset(seed=seed)
         for name in self._write_names:                   # neutral the mode's write vars
             self.backend.write_register(name, 0.0)
+        # close the interlock-test solenoids: they are FIELD state, not process
+        # state, so an SV latched open by an earlier test would silently corrupt
+        # this episode's init-level distribution.
+        for name in self.test_actuator_names:
+            self.set_test_valve(name, False)
         info: dict = {}
         rcfg = self.config.get("reset")
         if rcfg:

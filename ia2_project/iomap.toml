@@ -92,10 +92,28 @@ channel = "di_estop"
 # --- actuators + reset: POU variables -> cabinet holding channels ---
 [[mappings]]
 application = "threetank_inst"
+variable = "sv_1_cmd"
+direction = "output"
+device = "cabinet_do"
+channel = "sv_1_cmd"
+[[mappings]]
+application = "threetank_inst"
 variable = "v_12_cmd"
 direction = "output"
 device = "cabinet_ao"
 channel = "v_12_cmd"
+[[mappings]]
+application = "threetank_inst"
+variable = "sv_2_cmd"
+direction = "output"
+device = "cabinet_do"
+channel = "sv_2_cmd"
+[[mappings]]
+application = "threetank_inst"
+variable = "sv_3_cmd"
+direction = "output"
+device = "cabinet_do"
+channel = "sv_3_cmd"
 [[mappings]]
 application = "threetank_inst"
 variable = "v_23_cmd"

@@ -36,6 +36,10 @@ class ThreeTankModel:
         self.c_v12 = float(p["c_v12"])
         self.c_v23 = float(p["c_v23"])
         self.c_v33 = float(p["c_v33"])
+        # on/off interlock-test solenoids (SV-1..3): the controller never
+        # actuates them (sv_fracs stays closed) — present only so the shared
+        # dynamics' build_params reads the contract value from this model too.
+        self.cv_sv = float(p.get("c_sv", 0.00143))
         self.gravity_drop = float(p.get("gravity_drop_m", 0.0))
         self.pump_static_head = float(p.get("pump_static_head_m", 1.7))
         self.pump_shutoff_head = float(p.get("pump_shutoff_head_m", 10.0))

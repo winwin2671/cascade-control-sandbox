@@ -9,6 +9,9 @@
             supervisor MV: PID holds it open as the free drain, MPC/RL modulate.
 
   Control-mode selector (Manual / PID / MPC / RL) + L5 software shield.
+  On/off interlock-test solenoids SV-1..3 (DO coils, parallel to V-12/V-23/
+  V-33) sit OUTSIDE the mode selector: test instrumentation only, gated by
+  test_sv_en (see the SV section near the end of the body).
 
   Sensor channels are f32 (REAL POU vars, engineering units). Actuator channels
   are u16/FC06 holding registers, raw 0..10000 = 0..100% (MD200-style). So the
@@ -48,6 +51,16 @@ PROGRAM ThreeTank
     v_23_cmd  : UINT;   (* V-23 position, 0..10000 *)
     v_33_cmd  : UINT;   (* V-33 position, 0..10000 (Tank3 -> reservoir) *)
     e_101_cmd : UINT;   (* E-101 heater duty, 0..10000 *)
+    sv_1_cmd  : BOOL;   (* SV-1 on/off solenoid coil (DO slave 07 ch 0), || V-12 *)
+    sv_2_cmd  : BOOL;   (* SV-2 coil (ch 1), || V-23 *)
+    sv_3_cmd  : BOOL;   (* SV-3 coil (ch 2), || V-33 *)
+    (* interlock-test valve requests (PLC-internal, API-written; NOT in any
+       control mode — test instrumentation is deliberately outside the agent
+       action space). test_sv_en defaults FALSE -> coils forced closed. *)
+    sv_1_req  : BOOL;
+    sv_2_req  : BOOL;
+    sv_3_req  : BOOL;
+    test_sv_en: BOOL;
     (* agent requests / manual (PLC-internal, API-written, REAL 0..100%) *)
     vfd_cmd_req   : REAL;
     v_12_cmd_req  : REAL;
@@ -243,6 +256,20 @@ PROGRAM ThreeTank
   IF v12_force THEN v12_dwell := 20; ELSIF v12_dwell > 0 THEN v12_dwell := v12_dwell - 1; END_IF;
   IF v23_force THEN v23_dwell := 20; ELSIF v23_dwell > 0 THEN v23_dwell := v23_dwell - 1; END_IF;
   IF v33_force THEN v33_dwell := 20; ELSIF v33_dwell > 0 THEN v33_dwell := v33_dwell - 1; END_IF;
+
+  (* ---------- On/off interlock-test solenoids SV-1..3 (DO slave 07, FC05 coils).
+     Each is PARALLEL to its modulating valve (SV-1 || V-12, SV-2 || V-23,
+     SV-3 || V-33) so energizing one gives full-bore flow on that path
+     regardless of valve position — the scripted level transient for SAT
+     interlock testing (drive a tank to LSH overflow or LSL dry-fire and watch
+     the hardwired chain + this POU's L5 shield respond). Deliberately OUTSIDE
+     the agent action space: no CASE-mode wiring, no PID/MPC/RL request path —
+     only the supervisor/test harness writes sv_*_req. test_sv_en (default
+     FALSE) gates all three coils so a stale request cannot hold a test valve
+     open after the harness exits or across a POU restart. ---------- *)
+  sv_1_cmd := sv_1_req AND test_sv_en;
+  sv_2_cmd := sv_2_req AND test_sv_en;
+  sv_3_cmd := sv_3_req AND test_sv_en;
 
   scan_count := scan_count + 1;
 END_PROGRAM

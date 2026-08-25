@@ -88,7 +88,7 @@ heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advec
 ### Process & register map
 
 Heated serial cascade with recirculation (topology above). The rig is
-**multi-slave Modbus** behind an RTU-to-TCP gateway at `127.0.0.1:5020` — five
+**multi-slave Modbus** behind an RTU-to-TCP gateway at `127.0.0.1:5020` — seven
 slaves with segregated function codes:
 
 | Slave | Module   | FC             | Type | Channels                                                                                     |
@@ -99,6 +99,17 @@ slaves with segregated function codes:
 | 01    | sim-only | FC06 holding   | u16  | reset_cmd, init_h1–3 (episode reset; a unit id the real gateway doesn't occupy)              |
 | 04    | DI       | FC02 discrete  | bool | dry-fire, overflow, heater/pump contactor, e-stop                                            |
 | 06    | VFD      | FC06 holding   | u16  | vfd_cmd — Inovance MD200 freq ref (addr 0x1000, 0–10000 = 0–100 % of F0-10)                  |
+| 07    | DO       | FC05 coil      | bool | SV-1/2/3 on/off interlock-test solenoids (each parallel to V-12/V-23/V-33)                   |
+
+SV-1..3 are **test instrumentation, not control actuators**: they are excluded
+from the RL action space (config `test_actuators` vs `actuators`) and driven
+only through `env.set_test_valve()` / `env.set_test_valves_enabled()` — on the
+IA2 track the POU ANDs each request with `test_sv_en` (default FALSE) before
+energizing the coil, so stale requests can't hold a test valve open. Opening one
+gives full-bore flow on that path regardless of valve position — the scripted
+level transient for SAT interlock testing (drive a tank to the LSH overflow or
+LSL dry-fire trip and verify the response). FT-10x read the combined
+valve+bypass line, so an open SV is directly observable on the flow sensors.
 
 Analog sensors are 32-bit floats (2 registers, big-endian ABCD); actuator commands
 are uint16 raw 0–10000 (FC06 single-register write, MD200-style); safety statuses
@@ -418,7 +429,7 @@ cascade-control-sandbox/
 │   ├── smoke_env.py           # env reset/step/reward over Modbus
 │   └── run_smoke.sh           # one-command runner (boots + tests + teardown)
 ├── ia2_project/               # IA2 PLC project (IEC 61131-3 ST + device + iomap)
-│   ├── devices/cabinet_*.toml      # AUTO-GENERATED — 5 Modbus devices (one per slave)
+│   ├── devices/cabinet_*.toml      # AUTO-GENERATED — 7 Modbus devices (one per slave)
 │   ├── iomap.toml                  # AUTO-GENERATED — variable ⇄ channel bindings
 │   ├── tasks.toml                  # 50 ms cyclic task
 │   └── pous/

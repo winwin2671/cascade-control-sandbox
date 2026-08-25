@@ -12,6 +12,8 @@ Modbus slaves (one SimDevice per unit_id) with segregated function codes:
                                             the real gateway; kept off the AO card)
     slave 4  DI     FC02 discrete inputs  (5 hardware-safety-status flags)
     slave 6  VFD    FC06 holding, u16     (P-101 duty, 0..10000 = 0..100% of F0-10)
+    slave 7  DO     FC05 coils, bool      (SV-1..3 on/off interlock-test solenoids,
+                                            each parallel to V-12/V-23/V-33)
 
 Process topology — heated serial cascade with recirculation:
 
@@ -65,6 +67,9 @@ DI_ATTR = {"di_dryfire": "di_dryfire", "di_overflow": "di_overflow",
 # Actuator command register names (decoded from their slave holding blocks).
 VFD_CMD, V12_CMD, V23_CMD, V33_CMD, E101_CMD = "vfd_cmd", "v_12_cmd", "v_23_cmd", "v_33_cmd", "e_101_cmd"
 
+# On/off interlock-test solenoid coils (decoded from the DO module's coil block).
+SV1_CMD, SV2_CMD, SV3_CMD = "sv_1_cmd", "sv_2_cmd", "sv_3_cmd"
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else (hi if x > hi else x)
@@ -114,6 +119,7 @@ class Layout:
     by_slave: dict[int, list[dict]]        # slave_id -> its registers (address order)
     holding_by_slave: dict[int, list[dict]]   # slaves the physics loop must READ (cmds/reset)
     publish_by_slave: dict[int, list[dict]]   # slaves the physics loop must WRITE (input/discrete)
+    coil_by_slave: dict[int, list[dict]]      # slaves with FC05 coils (test solenoids)
 
 
 def derive_layout(contract: dict) -> "Layout":
@@ -128,6 +134,11 @@ def derive_layout(contract: dict) -> "Layout":
         for sid, rs in by_slave.items()
     }
     publish_by_slave = {sid: rs for sid, rs in publish_by_slave.items() if rs}
+    coil_by_slave = {
+        sid: sorted([r for r in rs if r["table"] == "coil"], key=lambda r: r["address"])
+        for sid, rs in by_slave.items()
+    }
+    coil_by_slave = {sid: rs for sid, rs in coil_by_slave.items() if rs}
     return Layout(
         regs=regs,
         by_name={r["name"]: r for r in regs},
@@ -136,6 +147,7 @@ def derive_layout(contract: dict) -> "Layout":
         by_slave=by_slave,
         holding_by_slave=holding_by_slave,
         publish_by_slave=publish_by_slave,
+        coil_by_slave=coil_by_slave,
     )
 
 
@@ -150,6 +162,7 @@ class PhysicsParams:
     c_v12: float        # V-12 effective orifice (C_d * area), m^2
     c_v23: float        # V-23 effective orifice, m^2
     c_v33: float        # V-33 effective orifice (Tank3 -> reservoir), m^2
+    cv_sv: float        # SV-1..3 on/off solenoid orifices (test bypasses), m^2
     cp: float           # specific heat capacity, J/(kg.K)
     rho: float          # water density, kg/m^3
     q_heat_max: float   # max electrical heater power (E-101, 2 kW), W
@@ -177,6 +190,7 @@ class PhysicsParams:
             h_max=float(p["h_max_m"]), t_supply=float(p["t_supply_c"]),
             a_tank=float(p["a_tank_m2"]),
             c_v12=float(p["c_v12"]), c_v23=float(p["c_v23"]), c_v33=float(p["c_v33"]),
+            cv_sv=float(p.get("c_sv", 0.00143)),
             cp=float(p["cp_j_per_kgk"]), rho=float(p["rho_kg_per_m3"]),
             q_heat_max=float(p["q_heat_max_w"]), ua=float(p["ua_w_per_k"]),
             t_ambient=float(p["t_ambient_c"]),
@@ -223,8 +237,9 @@ class TankProcess:
     T_res: float = 25.0
 
     def step(self, vfd_cmd: int, v12_cmd: int, v23_cmd: int, v33_cmd: int,
-             e101_cmd: int, dt: float, p: PhysicsParams) -> None:
-        """Advance one Euler step given the 4 actuator commands.
+             e101_cmd: int, dt: float, p: PhysicsParams,
+             sv: tuple = (False, False, False)) -> None:
+        """Advance one Euler step given the 4 actuator commands + SV coil states.
 
         Physics delegates to the shared threetank_dynamics module so the mock,
         MPC model, and NMPC oracle use ONE set of equations — no drift. What stays
@@ -239,6 +254,7 @@ class TankProcess:
                        _clamp(v23_cmd / 10000.0, 0.0, 1.0),
                        _clamp(v33_cmd / 10000.0, 0.0, 1.0)]
         heater_frac = _clamp(e101_cmd / 10000.0, 0.0, 1.0)
+        sv_fracs = [1.0 if s else 0.0 for s in sv]
 
         # flat dynamics params are stable for the cabinet's lifetime; cache them.
         dp = getattr(self, "_dyn_params", None)
@@ -249,8 +265,8 @@ class TankProcess:
             self._dyn_params_id = id(p)
 
         x = [self.h1, self.T1, self.h2, self.T2, self.h3, self.T3, self.h_res, self.T_res]
-        flows = compute_flows(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS)
-        dx = dynamics(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS)
+        flows = compute_flows(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS, sv_fracs)
+        dx = dynamics(x, pump_frac, valve_fracs, heater_frac, dp, NUMERIC_OPS, sv_fracs)
 
         # Euler integration + clamps (levels bounded by tank height; temps by 0..100).
         self.h1 = _clamp(self.h1 + dx[0] * dt, 0.0, p.h_max)
@@ -262,10 +278,13 @@ class TankProcess:
         self.h_res = _clamp(self.h_res + dx[6] * dt, 0.0, p.reservoir_height)
         self.T_res = _clamp(self.T_res + dx[7] * dt, 0.0, 100.0)
 
-        # FT sensors (m^3/s -> L/min) from the shared flows.
-        self.q12_lpm = flows["q_12"] * 60000.0
-        self.q23_lpm = flows["q_23"] * 60000.0
-        self.q3r_lpm = flows["q_3r"] * 60000.0
+        # FT sensors (m^3/s -> L/min) from the shared flows. Each FT reads the
+        # COMBINED inter-tank line (valve + its parallel test solenoid — the SV
+        # bypass tees in upstream of the meter), so opening an SV is directly
+        # observable on FT-10x for interlock-test evidence.
+        self.q12_lpm = (flows["q_12"] + flows["q_sv1"]) * 60000.0
+        self.q23_lpm = (flows["q_23"] + flows["q_sv2"]) * 60000.0
+        self.q3r_lpm = (flows["q_3r"] + flows["q_sv3"]) * 60000.0
 
         # emulated safety flags (real ones are hardwired; mock reflects state).
         self.di_dryfire = 1 if self.h1 < p.low_level_trip else 0
@@ -359,8 +378,10 @@ def _simdata_blocks(regs_on_slave: list[dict], proc: TankProcess, params: Physic
     pymodbus requires ALL FOUR tuple slots to be non-empty (its block checker
     indexes [0]), so empty tables get a 1-value dummy block. Real read tables
     (input/discrete) are seeded with the encoded process state; write tables
-    (holding) start at zero. Note SimData `count` *repeats* the values list, so
-    for a list of N distinct register values we leave count at its default (1).
+    (holding AND coil — the DO module's SV solenoids are written by the
+    controller side and read back by the physics loop) start at zero. Note
+    SimData `count` *repeats* the values list, so for a list of N distinct
+    register values we leave count at its default (1).
     """
     by_table: dict[str, list[dict]] = {}
     for r in regs_on_slave:
@@ -382,7 +403,7 @@ def _simdata_blocks(regs_on_slave: list[dict], proc: TankProcess, params: Physic
             vals[off:off + len(enc)] = enc
         return [SimData(lo, values=vals, datatype=datatype)]  # count defaults to 1
 
-    return (block("coil", DataType.BITS, True),
+    return (block("coil", DataType.BITS, False),
             block("discrete_input", DataType.BITS, True),
             block("holding", DataType.REGISTERS, False),
             block("input", DataType.REGISTERS, True))
@@ -420,6 +441,12 @@ async def physics_loop(
         lo = regs[0]["address"]
         hi = max(r["address"] + int(r["count"]) - 1 for r in regs)
         holding_plan[sid] = (lo, hi - lo + 1, regs)   # gap-aware: read the full span
+    # Coil read plan (DO module test solenoids) — FC01, same union-into-regval.
+    coil_plan = {}
+    for sid, regs in layout.coil_by_slave.items():
+        lo = regs[0]["address"]
+        hi = regs[-1]["address"]
+        coil_plan[sid] = (lo, hi - lo + 1, regs)
 
     while True:
         # --- read all holding (actuator + reset) blocks, union into regval ---
@@ -427,6 +454,10 @@ async def physics_loop(
         for sid, (base, count, regs) in holding_plan.items():
             raw = await server.async_getValues(sid, 3, base, count)
             regval.update(_decode_holding(raw, regs))
+        for sid, (base, count, regs) in coil_plan.items():
+            bits = await server.async_getValues(sid, 1, base, count)
+            for r, b in zip(regs, bits):
+                regval[r["name"]] = bool(b)
 
         # --- episode reset (nonce value-change on reset_cmd, slave 03) ---
         reset_val = int(regval.get(RESET_CMD, 0))
@@ -436,7 +467,9 @@ async def physics_loop(
         if reset_val == 0:
             proc.step(regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
                       regval.get(V23_CMD, 0.0), regval.get(V33_CMD, 0.0),
-                      regval.get(E101_CMD, 0.0), dt, params)
+                      regval.get(E101_CMD, 0.0), dt, params,
+                      sv=(regval.get(SV1_CMD, False), regval.get(SV2_CMD, False),
+                          regval.get(SV3_CMD, False)))
         prev_reset_val = reset_val
 
         # --- publish sensors + DI flags to each slave's read blocks ---
@@ -455,10 +488,15 @@ async def physics_loop(
 
         tick += 1
         if log_every and tick % log_every == 0:
-            LOG.info("vfd=%5.1fHz v12=%5.1f v23=%5.1f v33=%5.1f e101=%5.1f  %s",
+            LOG.info("vfd=%5.1fHz v12=%5.1f v23=%5.1f v33=%5.1f e101=%5.1f "
+                     "sv=%d%d%d  %s",
                      regval.get(VFD_CMD, 0.0), regval.get(V12_CMD, 0.0),
                      regval.get(V23_CMD, 0.0), regval.get(V33_CMD, 0.0),
-                     regval.get(E101_CMD, 0.0), proc.snapshot())
+                     regval.get(E101_CMD, 0.0),
+                     1 if regval.get(SV1_CMD, False) else 0,
+                     1 if regval.get(SV2_CMD, False) else 0,
+                     1 if regval.get(SV3_CMD, False) else 0,
+                     proc.snapshot())
 
         now = asyncio.get_event_loop().time()
         remaining = next_deadline - now

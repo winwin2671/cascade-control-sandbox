@@ -65,6 +65,10 @@ def build_params(model_or_physics):
         "q_max": m.q_max,
         "area": m.a_tank,
         "cv_valves": [m.c_v12, m.c_v23, m.c_v33],
+        # On/off interlock-test solenoids (SV-1..3, parallel to V-12/V-23/V-33).
+        # getattr: the MPC model may predate the field — and with sv_fracs
+        # defaulting closed the coefficient is multiplied by 0 anyway.
+        "cv_sv": getattr(m, "cv_sv", 0.00143),
         "gravity_drop": m.gravity_drop,
         "pump_static_head": m.pump_static_head,
         "pump_shutoff_head": m.pump_shutoff_head,
@@ -81,7 +85,8 @@ def build_params(model_or_physics):
     }
 
 
-def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
+def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops,
+                  sv_fracs=(0.0, 0.0, 0.0)):
     """Single source of the hydraulic + heater flow equations.
 
     Returns the intermediate flows (m^3/s) and heater power (W). Consumed by both
@@ -92,6 +97,11 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
     pump curve (xinji): q = q_max × √((shutoff×u² − static)/(shutoff − static))
     valve flow (xinji): q = cv × frac × √(level + gravity_drop)
     overflow:           q = cv_ovf × √(max(level − overflow_level, floor))
+    test solenoid:      q = cv_sv × sv ∈ {0,1} × √(level + gravity_drop)
+                        (SV-i is the on/off interlock-test bypass PARALLEL to
+                        valve i; sv_fracs defaults closed so MPC/NMPC — which
+                        never actuate test hardware — get bit-identical
+                        dynamics with the default argument)
     """
     _max = ops["max"]
     _sqrt = ops["sqrt"]
@@ -151,6 +161,15 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
     q_23 = cvs[1] * valve_fracs[1] * _sqrt(_max(h2 + g_drop, _SQRT_FLOOR)) * _avail(h2)
     q_3r = cvs[2] * valve_fracs[2] * _sqrt(_max(h3 + g_drop, _SQRT_FLOOR)) * _avail(h3)
 
+    # SV-1..3: on/off interlock-test solenoids, each PARALLEL to its modulating
+    # valve (same line, full-port — same Torricelli form, binary frac). Open one
+    # and you get full-bore flow on that path regardless of valve position: the
+    # scripted level transient for SAT interlock testing (LSH/LSL trips).
+    cv_sv = p.get("cv_sv", 0.00143)
+    q_sv1 = cv_sv * sv_fracs[0] * _sqrt(_max(h1 + g_drop, _SQRT_FLOOR)) * _avail(h1)
+    q_sv2 = cv_sv * sv_fracs[1] * _sqrt(_max(h2 + g_drop, _SQRT_FLOOR)) * _avail(h2)
+    q_sv3 = cv_sv * sv_fracs[2] * _sqrt(_max(h3 + g_drop, _SQRT_FLOOR)) * _avail(h3)
+
     cv_ovf = p["cv_overflow"]
     ovf_level = p["overflow_level"]
     # M1/#6: the availability gate also kills the sub-weir leak — the old
@@ -166,23 +185,26 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops):
 
     return {
         "q_pump": q_pump, "q_12": q_12, "q_23": q_23, "q_3r": q_3r,
+        "q_sv1": q_sv1, "q_sv2": q_sv2, "q_sv3": q_sv3,
         "ovf1": ovf1, "ovf2": ovf2, "ovf3": ovf3,
         "Qh1": heater_frac * p["q_heat_max"],
     }
 
 
-def dynamics(x, pump_frac, valve_fracs, heater_frac, p, ops):
+def dynamics(x, pump_frac, valve_fracs, heater_frac, p, ops,
+             sv_fracs=(0.0, 0.0, 0.0)):
     """8-dim ODE RHS [dh1, dT1, dh2, dT2, dh3, dT3, dh_res, dT_res].
 
     Aligned with xinji's AIO-Gym v0.2 model: orifice valve flow
     (cv × √(level + gravity_drop)), quadratic pump curve, hydraulic overflow,
-    well-mixed thermal, finite reservoir.
+    well-mixed thermal, finite reservoir. sv_fracs are the on/off interlock-test
+    solenoids (parallel to V-12/V-23/V-33); default closed.
 
     x = [h1, T1, h2, T2, h3, T3, h_res, T_res]
     Returns a list (numpy) or MX vector (CasADi — caller wraps in vertcat).
     """
     _max = ops["max"]
-    f = compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops)
+    f = compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops, sv_fracs)
 
     h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
     h_res, T_res = x[6], x[7]
@@ -191,20 +213,27 @@ def dynamics(x, pump_frac, valve_fracs, heater_frac, p, ops):
     rho_cp = p["rho"] * p["cp"]
     h_floor = p["h_floor"]
 
+    # path totals (modulating valve + parallel test solenoid): both legs move
+    # the same water between the same pair of tanks, so every balance below —
+    # mass AND advection — must see the SUM.
+    q12_t = f["q_12"] + f["q_sv1"]
+    q23_t = f["q_23"] + f["q_sv2"]
+    q3r_t = f["q_3r"] + f["q_sv3"]
+
     # ---- mass balance ----
-    dh1 = (f["q_pump"] - f["q_12"] - f["ovf1"]) / area
-    dh2 = (f["q_12"] - f["q_23"] - f["ovf2"]) / area
-    dh3 = (f["q_23"] - f["q_3r"] - f["ovf3"]) / area
+    dh1 = (f["q_pump"] - q12_t - f["ovf1"]) / area
+    dh2 = (q12_t - q23_t - f["ovf2"]) / area
+    dh3 = (q23_t - q3r_t - f["ovf3"]) / area
     # M1/#6: overflow spills RETURN to the reservoir (the rig's weirs drain into
     # it) — the old balance subtracted ovf from the tanks and dropped it, so loop
     # inventory decayed whenever a tank rode the weir.
-    dh_res = (f["q_3r"] + f["ovf1"] + f["ovf2"] + f["ovf3"] - f["q_pump"]) / p["reservoir_base"]
+    dh_res = (q3r_t + f["ovf1"] + f["ovf2"] + f["ovf3"] - f["q_pump"]) / p["reservoir_base"]
 
     # ---- thermal: well-mixed tank energy balance ----
     # dT = (Q_heat − Q_loss) / (rho × area × h × cp) + adv / (area × h)
     adv1 = f["q_pump"] * (T_res - T1)
-    adv2 = f["q_12"] * (T1 - T2)
-    adv3 = f["q_23"] * (T2 - T3)
+    adv2 = q12_t * (T1 - T2)
+    adv3 = q23_t * (T2 - T3)
 
     h1s = _max(h1, h_floor)
     h2s = _max(h2, h_floor)
@@ -222,7 +251,7 @@ def dynamics(x, pump_frac, valve_fracs, heater_frac, p, ops):
     dT2 = (0.0 - p["ua"] * (T2 - t_amb)) / m_cp2 + adv2 / (area * h2s)
     dT3 = (0.0 - p["ua"] * (T3 - t_amb)) / m_cp3 + adv3 / (area * h3s)
 
-    adv_res = (f["q_3r"] * (T3 - T_res) + f["ovf1"] * (T1 - T_res)
+    adv_res = (q3r_t * (T3 - T_res) + f["ovf1"] * (T1 - T_res)
                + f["ovf2"] * (T2 - T_res) + f["ovf3"] * (T3 - T_res))
     dT_res = (0.0 - p["ua"] * (T_res - t_amb)) / m_cp_res + adv_res / (p["reservoir_base"] * h_rs)
 
