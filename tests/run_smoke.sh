@@ -34,7 +34,7 @@ if ! kill -0 "$CAB" 2>/dev/null; then
 fi
 
 rc=0
-for t in smoke_reset smoke_heater smoke_env smoke_sv; do
+for t in smoke_reset smoke_heater smoke_env smoke_sv smoke_disturbance; do
     echo
     echo "===================== $t ====================="
     "$PY" -u "$ROOT/tests/$t.py" || rc=1

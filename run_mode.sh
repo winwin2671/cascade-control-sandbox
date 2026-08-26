@@ -16,6 +16,9 @@
 #   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo>, --train_track <numpy|modbus>, --residual
 #   ./run_mode.sh pid --steps 40 # more steps (all modes; nmpc solves ~1-4 s/step,
 #                                # so long nmpc runs take hours)
+#   ./run_mode.sh pid --disturbance  # any mode + random SV-1..3 valve-fault
+#                                # disturbances (disturbance_sidecar.py; seed is
+#                                # printed+logged — replay with --seed N)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
 # cabinet directly (the fast training path). See README "Control modes".
@@ -34,6 +37,7 @@ fi
 ALGO="sac"
 TRAIN_TRACK="numpy"
 RESIDUAL=false
+DISTURBANCE=false
 STEPS_SET=false
 [ -n "${STEPS:-}" ] && STEPS_SET=true   # STEPS env var counts as user-supplied
 STEPS="${STEPS:-20}"
@@ -62,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       RESIDUAL=true
       shift
       ;;
+    --disturbance)
+      DISTURBANCE=true
+      shift
+      ;;
     --step|--steps)
       need_val "$@"
       STEPS="$2"
@@ -77,7 +85,7 @@ done
 
 case "$MODE" in
   pid|manual|rl|mpc|nmpc|modbus|gui) ;;
-  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--residual] [--steps N]  (got: $MODE)"; exit 2 ;;
+  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--residual] [--disturbance] [--steps N]  (got: $MODE)"; exit 2 ;;
 esac
 
 # #6-re: per-mode rollout default. The mpc/nmpc supervisors' own default is 40
@@ -97,10 +105,15 @@ if [ "$MODE" = "rl" ] && [ "$TRAIN_TRACK" = "modbus" ]; then
   NEEDS_IA2=false
 fi
 
-CAB_PID=""; SRV_PID=""
+CAB_PID=""; SRV_PID=""; DST_PID=""
 cleanup() {
   echo
-  echo "==> tearing down (cabinet + ia2-server)"
+  echo "==> tearing down (disturbance sidecar + cabinet + ia2-server)"
+  if [ -n "$DST_PID" ]; then
+    kill "$DST_PID" 2>/dev/null || true   # TERM -> sidecar closes SVs + clears gate
+    sleep 1.5                             # (its close-writes need a live cabinet)
+    kill -9 "$DST_PID" 2>/dev/null || true
+  fi
   [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
   [ -n "$CAB_PID" ] && kill "$CAB_PID" 2>/dev/null || true
 }
@@ -141,6 +154,26 @@ if [ "$NEEDS_IA2" = true ]; then
   echo "==> opening ia2_project and starting ThreeTank"
   "$IA2/cs" project open "$ROOT/ia2_project"
   "$IA2/cs" run
+fi
+
+if [ "$DISTURBANCE" = true ]; then
+  # Backend follows the track: the PLC owns the SV coils on IA2 modes (the
+  # sidecar writes sv_*_req/test_sv_en through the variable API); only the
+  # PLC-less paths (modbus mode, rl --train_track modbus) may write FC05
+  # coils directly. Extra sidecar args via DISTURBANCE_ARGS (e.g. a --seed).
+  # Exported so the controller's rollout_report suffixes its tag with _dist
+  # (pid_dist_rollout.csv etc.) instead of overwriting the baseline rollout.
+  export DISTURBANCE
+  if [ "$NEEDS_IA2" = true ]; then DST_BACKEND="ia2"; else DST_BACKEND="modbus"; fi
+  echo "==> starting disturbance sidecar (backend=$DST_BACKEND)"
+  # shellcheck disable=SC2086 # word-split pass-through, like $EXTRA below
+  python3 -u "$ROOT/disturbance_sidecar.py" --backend "$DST_BACKEND" ${DISTURBANCE_ARGS:-} &
+  DST_PID=$!
+  sleep 2
+  if ! kill -0 "$DST_PID" 2>/dev/null; then
+    echo "ERROR: disturbance sidecar exited at startup (message above). Aborting."
+    exit 1
+  fi
 fi
 
 echo "==> running mode=$MODE" $([ "$MODE" = gui ] || echo "(steps=$STEPS)")

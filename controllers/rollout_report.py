@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -70,6 +71,11 @@ def report(steps_data: list[dict], tag: str = "rollout",
     """
     out_dir = Path(out_dir or ROOT / "controllers" / "runs")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # --disturbance runs (run_mode.sh exports DISTURBANCE=true when the fault
+    # sidecar is active) suffix the tag, so fault-injection artifacts land in
+    # <tag>_dist_rollout.csv/png instead of overwriting the baseline rollout.
+    if os.environ.get("DISTURBANCE", "").lower() == "true":
+        tag = f"{tag}_dist"
 
     # --- KPI via AIO-Gym's scorer ---
     from controllers.aiogym_register import register_threetank

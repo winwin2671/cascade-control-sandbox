@@ -151,6 +151,7 @@ tears down on exit — one command per mode:
 ./run_mode.sh gui       # interactive tkinter GUI (sliders + live plot + KPI)
 ./run_mode.sh modbus    # direct Modbus (skip IA2; for quick standalone tests)
 ./run_mode.sh pid --steps 40  # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+./run_mode.sh pid --disturbance  # any mode + random SV-1..3 valve-fault disturbances
 ```
 
 ### Control backends
@@ -174,6 +175,37 @@ python3 controllers/manual_gui.py --backend edge:my_edge --control-dt 2.0
 # Example: Validate a policy on the IA2 track, explicitly enforcing the backend
 python3 controllers/validate_policy.py --policy controllers/policies/sac_threetank_numpy.zip --backend ia2
 ```
+
+### Disturbance / interlock testing (`--disturbance`)
+
+Add `--disturbance` to any mode to run [`disturbance_sidecar.py`](disturbance_sidecar.py) in the
+background alongside the controller: each interlock-test solenoid SV-1..3 follows an independent
+random telegraph (random start delay → OPEN for 2–6 s → CLOSED for 10–25 s → repeat), injecting
+valve faults so you can watch how the control model rejects them — levels drift on the bypass
+path, FT-10x see the extra flow, and LSH/LSL trips become reachable.
+
+- **Write path follows the track** (derived from the mode): on IA2 modes the PLC owns the SV
+  coils, so the sidecar writes the PLC-internal `sv_*_req` vars + `test_sv_en` gate through the
+  IA2 variable API; only the PLC-less paths (`modbus`, `rl --train_track modbus`) write the
+  slave-07 FC05 coils directly. Never write the coils directly while the PLC runs — its scan
+  reclaims them.
+- **Reproducible**: the seed is printed and logged; replay a run with `--seed N` (plus the same
+  `--valves` and hold ranges, all captured in the JSONL header). Tune the sidecar via
+  `DISTURBANCE_ARGS` (e.g. `DISTURBANCE_ARGS="--seed 42 --open-min 4" ./run_mode.sh pid --disturbance`)
+  or run it standalone against real hardware: `python3 disturbance_sidecar.py --backend modbus
+  --host <gateway>` (or `--backend ia2 --server <url>`).
+- **Survives resets**: the intended valve state is re-asserted every 0.5 s, so `env.reset()`
+  force-closing the SVs at episode start can't swallow a disturbance — the hold resumes within
+  one heartbeat (episodic RL eval sees faults continue mid-hold).
+- **Cleanup**: on SIGINT/SIGTERM the sidecar closes every SV and clears `test_sv_en` before
+  `run_mode.sh` tears down the cabinet. `kill -9` skips that — coils keep their last state until
+  the next boot. Concurrent sidecars are unsupported (two schedules fight over the coils).
+- **Log**: every run writes `controllers/runs/disturbance_sidecar_YYYYMMDD_HHMMSS.jsonl`
+  (header with seed/params, one record per transition, exit footer) — the record of what a
+  rollout saw; correlate it offline with the rollout CSVs.
+- **Reports**: during `--disturbance` runs the controller's rollout artifacts are tagged
+  `_dist` (`pid_dist_rollout.csv/png`, `rl_dist_rollout.csv`, …) so they never overwrite the
+  baseline `<tag>_rollout` files — diff the pair to see what the faults cost the controller.
 
 For the **RL mode** (`./run_mode.sh rl`), you can specify the following attributes to match how the policy was trained:
 
@@ -402,6 +434,7 @@ cascade-control-sandbox/
 ├── mock_cabinet.py            # multi-slave pymodbus TCP plant on :5020 (--time-scale k)
 ├── aio_bridge_env.py          # Gymnasium env (ia2 / edge / modbus backends; --mode)
 ├── aio_vec_env.py             # vectorized training env (N cabinets, AsyncVectorEnv)
+├── disturbance_sidecar.py     # random SV-1..3 valve-fault injection (--disturbance)
 ├── run_mode.sh                # boot + run one controller + teardown (one command)
 ├── tools/
 │   └── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
@@ -427,6 +460,8 @@ cascade-control-sandbox/
 │   ├── smoke_reset.py         # reset snaps levels to targets
 │   ├── smoke_heater.py        # heater raises temp; cold pump inflow slows it
 │   ├── smoke_env.py           # env reset/step/reward over Modbus
+│   ├── smoke_sv.py            # SV-1 bypass: flow + level shift on command
+│   ├── smoke_disturbance.py   # disturbance sidecar follows its seeded schedule
 │   └── run_smoke.sh           # one-command runner (boots + tests + teardown)
 ├── ia2_project/               # IA2 PLC project (IEC 61131-3 ST + device + iomap)
 │   ├── devices/cabinet_*.toml      # AUTO-GENERATED — 7 Modbus devices (one per slave)
@@ -540,12 +575,15 @@ python3 aio_bridge_env.py --backend ia2 --mode rl  --steps 200
 ### Smoke tests
 
 ```bash
-./tests/run_smoke.sh     # boots the cabinet, runs all three, tears down
+./tests/run_smoke.sh     # boots the cabinet, runs all five, tears down
 ```
 
 - `smoke_reset.py` — reset snaps tank levels to requested targets
 - `smoke_heater.py` — heater raises temp; cold pump inflow slows it (the cascade)
 - `smoke_env.py` — env resets (randomized), steps, and rewards over Modbus
+- `smoke_sv.py` — SV-1 bypass: FT-101 flow + Tank1→Tank2 level shift on command, stops on close
+- `smoke_disturbance.py` — seeded sidecar: coils follow the deterministic schedule (`simulate()`
+  oracle), FT-101 rises while SV-1 is energized, everything closes on exit
 
 ### Shield regression test
 
