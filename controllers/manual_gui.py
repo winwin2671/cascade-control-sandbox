@@ -48,8 +48,14 @@ T_SP = list(CFG["control"]["setpoints_c"].values())
 T_COLD = float(CFG["process"]["t_supply_c"])
 T_AMB = float(CFG["process"]["t_ambient_c"])
 
-# Actuator register names for Manual mode's write targets.
-MANUAL_VARS = ["manual_p1", "manual_p2", "manual_h1", "manual_h2", "manual_h3"]
+# Actuator variables for Manual mode (REAL PLC vars; slider 0..100 -> eng range).
+MANUAL_VARS = ["manual_vfd", "manual_v12", "manual_v23", "manual_v33", "manual_h1"]
+# Minor/#6: manual_vfd is a PERCENT duty (POU REAL 0..100) — the old 50.0 was a
+# Hz leftover that capped the pump at half duty, and with the pump curve's dead
+# band below u≈0.41 only the top ~18% of the slider produced any flow at all.
+MANUAL_MAX = {"manual_vfd": 100.0, "manual_v12": 100.0, "manual_v23": 100.0,
+              "manual_v33": 100.0, "manual_h1": 100.0}
+DI_VARS = ["di_dryfire", "di_overflow", "di_heater_contactor", "di_pump_contactor", "di_estop"]
 
 
 class ManualGUI:
@@ -78,7 +84,7 @@ class ManualGUI:
 
         self.sliders = {}
         self.slider_vars = {}
-        labels = ["Pump 1", "Pump 2", "Heater 1", "Heater 2", "Heater 3"]
+        labels = ["Pump (VFD)", "Valve V-12", "Valve V-23", "Valve V-33", "Heater E-101"]
         for i, label in enumerate(labels):
             row = ttk.Frame(left)
             row.pack(fill=tk.X, pady=2)
@@ -115,6 +121,12 @@ class ManualGUI:
             self.state_labels[f"h{tank}"].pack(side=tk.LEFT)
             self.state_labels[f"T{tank}"] = ttk.Label(row, text="-- °C")
             self.state_labels[f"T{tank}"].pack(side=tk.LEFT)
+
+        # Safety DI readout (5 FC02 hardware-status flags)
+        self.di_frame = ttk.LabelFrame(left, text="Safety (DI)", padding=5)
+        self.di_frame.pack(fill=tk.X, pady=5)
+        self.di_label = ttk.Label(self.di_frame, text="--", font=("TkFixedFont", 9))
+        self.di_label.pack(anchor=tk.W)
 
         # KPI readout
         self.kpi_frame = ttk.LabelFrame(left, text="KPI", padding=5)
@@ -172,17 +184,14 @@ class ManualGUI:
 
     # --- callbacks ---
     def _on_slider(self, idx):
-        """Write the shared variable value (0-100) to the manual_* register (raw 0-10000)."""
+        """Write the slider value (0-100) to the manual_* PLC var in engineering units."""
         try:
             val = self.slider_vars[idx].get()
         except tk.TclError:
-            # Happens if the user temporarily types a non-integer or clears the box
             return
-        
-        # Clamp to safe limits just in case
         val = max(0, min(100, int(val)))
         name = MANUAL_VARS[idx]
-        self.b.write_register(name, int(val * 100))
+        self.b.write_register(name, val / 100.0 * MANUAL_MAX[name])
 
     def _on_reset(self):
         self._reset_nonce = getattr(self, "_reset_nonce", 0) % 65535 + 1  # C2 fix
@@ -213,23 +222,29 @@ class ManualGUI:
         levels = [float(obs[0]), float(obs[2]), float(obs[4])]
         temps = [float(obs[1]), float(obs[3]), float(obs[5])]
 
-        # Read the actual actuator values (post-L5-shield) from the snapshot
-        act_raw = [raw.get(n, 0) for n in ["actuator1", "actuator2",
-                                            "heater1", "heater2", "heater3"]]
-        action = [r * 1e-4 for r in act_raw]  # raw → fraction
-
-        # Update the scorer
-        act_dict = {"pumps": action[:2], "valves": [], "heaters": action[2:]}
-        env_dict = {"t_cold": T_COLD, "t_amb": T_AMB, "extra_outflow": 0.0}
+        # Read the actual actuator values (post-L5-shield) from the snapshot and
+        # convert to the model's pumps/valves/heaters fractions for the KPI.
+        am = self.env._act_max
+        act_dict = {
+            "pumps":   [raw.get("vfd_cmd", 0.0) / am["vfd_cmd"]],
+            "valves":  [raw.get("v_12_cmd", 0.0) / am["v_12_cmd"],
+                        raw.get("v_23_cmd", 0.0) / am["v_23_cmd"],
+                        raw.get("v_33_cmd", 0.0) / am["v_33_cmd"]],
+            "heaters": [raw.get("e_101_cmd", 0.0) / am["e_101_cmd"]],
+        }
+        action = [raw.get(n, 0.0) for n in self.env.actuator_names]
+        env_dict = {"t_cold": T_COLD, "t_amb": T_AMB}
         heat_w = self.model.heater_power(act_dict)
         ideal_w = self.model.ideal_power(levels, temps, T_SP, env_dict, act_dict)
         self.scorer.step_penalty(levels, temps, H_SP, T_SP,
                                   heat_w, ideal_w, False, self.env.control_dt)
 
-        # Collect data
+        # Collect data (no reward key: it's an RL-only concept and the report
+        # gates on its presence — stuffing 0.0 printed a meaningless
+        # "mean reward 0.0000" + zeroed CSV column + flatline panel)
         self.steps_data.append({
             "step": self.k, "levels": levels, "temps": temps,
-            "action": action, "reward": 0.0})
+            "action": action})
         for i in range(3):
             self.hist_h[i].append(levels[i])
             self.hist_t[i].append(temps[i])
@@ -254,6 +269,9 @@ class ManualGUI:
         for i in range(3):
             self.state_labels[f"h{i + 1}"].config(text=f"{levels[i]:.3f} m")
             self.state_labels[f"T{i + 1}"].config(text=f"{temps[i]:.1f} °C")
+        di = [int(bool(raw.get(d, 0))) for d in DI_VARS]
+        self.di_label.config(text=f"dryfire={di[0]} overflow={di[1]} "
+                                  f"HCs={di[2]},{di[3]} estop={1 - di[4]}")
 
         self.k += 1
         self.root.after(int(self.env.control_dt * 1000), self._tick)
@@ -289,7 +307,7 @@ def main():
     # R4b fix: manual mode writes PLC vars (manual_p*, mode, *_sp) which don't exist
     # in the cabinet register space — require the IA2 backend (not modbus).
     if args.backend == "modbus":
-        print("ERROR: manual GUI requires the IA2 backend (writes PLC variables like manual_p1, mode, *_sp). "
+        print("ERROR: manual GUI requires the IA2 backend (writes PLC variables like manual_vfd, mode, *_sp). "
               "Run `./run_mode.sh gui` (boots IA2) or use --backend ia2.")
         sys.exit(1)
     env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode="manual")

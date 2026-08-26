@@ -1,39 +1,30 @@
 #!/usr/bin/env python3
-"""aio_bridge_env.py — Gymnasium env that bridges an RL agent to the 3-tank
-cascade plant via IA2 (and falls back to direct Modbus).
+"""aio_bridge_env.py — Gymnasium env bridging an RL agent to the heated
+serial-cascade + recirculation plant via IA2 (or direct Modbus).
 
-Architecture (matches the project goal flow):
+Architecture:
 
     RL agent  --(Gym API)-->  CascadeBridgeEnv  --(HTTP /api/...)-->  IA2
-        IA2  --(iomap)-->  Modbus TCP 127.0.0.1:5020  -->  mock_cabinet.py (plant)
+        IA2  --(iomap)-->  Modbus TCP gateway 127.0.0.1:5020  -->  mock_cabinet.py (plant)
 
-This is the cascade-control-sandbox counterpart of AIO-Gym's
-``aiogym/env.py`` (AIOGymNativeEnv): same Gymnasium contract — Box
-observation (3 levels + 3 temperatures, engineering units) and Box action
-(pump fractions in [0, 1]) — but the plant is the *external* IA2 +
-mock_cabinet instead of an in-process numpy model.
+Same Gymnasium contract as AIO-Gym's AIOGymNativeEnv, but the plant is the
+external IA2 + mock_cabinet. The cabinet is now MULTI-SLAVE behind an RTU-to-TCP
+gateway with 32-bit float analog channels and FC02 discretes, so the Modbus
+backend dispatches per register: (slave_id, function code, data type) come from
+ia2_config.json — the single contract shared with mock_cabinet.py and the iomap.
 
 Backends (selected via ``backend=`` / ``--backend``):
-  * ``ia2``          — dev server: GET /api/runtime/snapshot (obs) +
-                       POST /api/runtime/variables/{name} (actions).
-  * ``edge[:name]``  — edge runtime (G4): GET /api/edges/{name}/status
-                       (obs via .last_snapshot.vars) + POST
-                       /api/edges/{name}/runtime/write body {name,value}
-                       (the edge's body-addressed write, proxied by the dev
-                       server over SSH).  Needs a registered, deployed edge.
+  * ``ia2``          — dev server snapshot (obs) + variable write (actions).
+  * ``edge[:name]``  — edge runtime via the dev server's SSH proxy.
   * ``modbus``       — talks straight to mock_cabinet.py (no IA2 in the loop).
   * ``auto``         — ``ia2`` when /api/health answers, else ``modbus``.
-
-All register names, addresses, scales, and setpoints come from
-ia2_config.json — the single contract shared with mock_cabinet.py and the
-IA2 iomap — so this env stays in lockstep with them.
 """
-
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import struct
 import time
 import urllib.error
 import urllib.parse
@@ -58,6 +49,32 @@ def load_config(path: str | Path | None = None) -> dict:
 
 def _registers_by_address(config: dict) -> list[dict]:
     return sorted(config["registers"], key=lambda r: r["address"])
+
+
+# --------------------------------------------------------------------------- #
+# 32-bit float register codec (Modbus "ABCD": big-endian bytes, high word first).
+# MUST match mock_cabinet.pack_float_be — the mock decodes writes, the bridge
+# encodes them (and decodes reads). Honors byte_order/word_order so a non-ABCD
+# field module can be supported by swapping word order here only.
+# --------------------------------------------------------------------------- #
+def decode_float(regs, byte_order: str = "big", word_order: str = "big") -> float:
+    """Decode two 16-bit registers to a float (default ABCD big-endian)."""
+    hi, lo = int(regs[0]), int(regs[1])
+    if word_order == "little":
+        hi, lo = lo, hi
+    raw = bytes(((hi >> 8) & 0xFF, hi & 0xFF, (lo >> 8) & 0xFF, lo & 0xFF))
+    if byte_order == "little":
+        raw = raw[::-1]
+    return struct.unpack(">f", raw)[0]
+
+
+def encode_float(v: float, byte_order: str = "big", word_order: str = "big") -> list[int]:
+    """Encode a float to two 16-bit registers (default ABCD big-endian)."""
+    b = struct.pack(">f", float(v))
+    hi, lo = int.from_bytes(b[0:2], "big"), int.from_bytes(b[2:4], "big")
+    if word_order == "little":
+        hi, lo = lo, hi
+    return [hi, lo]
 
 
 # --------------------------------------------------------------------------- #
@@ -86,22 +103,30 @@ def _suffix(name: str) -> str:
     return low.rsplit(".", 1)[-1] if "." in low else low
 
 
-def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict[str, int]:
-    """Shared ``VarSnapshot.vars`` parser used by the IA2 and edge backends.
+def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict:
+    """Shared ``VarSnapshot.vars`` parser for the IA2 / edge backends.
 
-    Returns ``{suffix: int value}`` and fills ``full_names`` (suffix -> the
-    exact name the runtime reported) so writes address what IA2 expects.
-    Values are strings in the snapshot ("3370") -> int here.
+    Returns ``{suffix: value}`` (int or float) and fills ``full_names`` so writes
+    address the exact name the runtime reported. The new plant exposes float
+    (REAL) POU variables, so values are parsed as int first, then float.
     """
-    out: dict[str, int] = {}
+    out: dict = {}
     for v in vars_list:
         full = v["name"]
         suf = _suffix(full)
         full_names[suf] = full
-        try:
-            out[suf] = int(str(v["value"]).strip())
-        except (ValueError, TypeError):
+        s = str(v["value"]).strip()
+        tn = str(v.get("type_name", "")).upper()
+        if tn == "BOOL" or s in ("TRUE", "FALSE", "True", "False"):
+            out[suf] = (s.upper() == "TRUE")
             continue
+        try:
+            out[suf] = int(s)
+        except (ValueError, TypeError):
+            try:
+                out[suf] = float(s)
+            except (ValueError, TypeError):
+                continue
     return out
 
 
@@ -109,42 +134,92 @@ def _parse_vars(vars_list: list[dict], full_names: dict[str, str]) -> dict[str, 
 # Backends
 # --------------------------------------------------------------------------- #
 class Backend:
-    """Read all registers (raw uint16, keyed by register name) and write any
+    """Read all read-registers (keyed by name, engineering units) and write any
     register/variable (actuators, reset_cmd, init_h*) by name."""
 
     writes_via_plc = False  # True for IA2/edge: writes reach actuators through the PLC
 
-    def read_raw(self) -> dict[str, int]: ...
-    def write_register(self, name: str, value: int) -> None: ...
+    def read_raw(self) -> dict: ...
+    def write_register(self, name: str, value) -> None: ...
     def close(self) -> None: ...
 
 
 class ModbusBackend(Backend):
-    """Direct pymodbus client to mock_cabinet.py (no IA2 in the loop)."""
+    """Direct pymodbus client to mock_cabinet.py (no IA2 in the loop).
 
-    def __init__(self, host: str, port: int, unit_id: int,
-                 addr_base: int, addr_names: list[str]):
+    Multi-slave: every register carries its own (slave_id, fc, type, count,
+    byte_order, word_order), so reads dispatch FC04 (input) / FC02 (discrete) /
+    FC03 (holding) to the right slave and decode floats/bools/uint16 per type.
+    Writes encode likewise (float -> 2 regs FC16, uint16 -> FC06, bool -> FC05).
+    """
+
+    def __init__(self, host: str, port: int, regs: list[dict]):
         from pymodbus.client import ModbusTcpClient  # local import
-        self.unit = unit_id
-        self.addr_base = addr_base
-        self.addr_names = addr_names
+        self.regs_by_name = {r["name"]: r for r in regs}
         self.client = ModbusTcpClient(host=host, port=port)
         if not self.client.connect():
             raise RuntimeError(f"cannot connect to cabinet at {host}:{port}")
 
-    def read_raw(self) -> dict[str, int]:
-        r = self.client.read_holding_registers(
-            self.addr_base, count=len(self.addr_names), device_id=self.unit)
-        if r.isError():
-            raise RuntimeError(f"Modbus read error: {r}")
-        return {n: int(v) for n, v in zip(self.addr_names, r.registers)}
+    def read_raw(self) -> dict:
+        out: dict = {}
+        # batch reads by (slave_id, read-fc) — each group is one block.
+        # M2/#6: write-direction registers are read back TOO (FC06/FC16 writes
+        # live in readable holding registers) — the applied-duty machinery in
+        # run_rl/validate_policy/rollout_report reads post-command actuator
+        # values from this dict; skipping them zeroed applied_duty across the
+        # whole modbus track (a regression vs main). FC05 coil writes (the DO
+        # module's test solenoids) read back via FC01 the same way.
+        groups: dict[tuple, list[dict]] = {}
+        for r in self.regs_by_name.values():
+            read_fc = {5: 1, 6: 3, 16: 3}.get(r["fc"], r["fc"])
+            if r["direction"] == "write" and r["fc"] not in (5, 6, 16):
+                continue                      # no read-back path for this write family
+            groups.setdefault((r["slave_id"], read_fc), []).append(r)
+        for (sid, fc), regs in groups.items():
+            regs = sorted(regs, key=lambda r: r["address"])
+            base = regs[0]["address"]
+            # span the address RANGE (the AO value registers sit at odd addresses
+            # 1/3/5/7 — gaps must be covered, not summed)
+            count = regs[-1]["address"] + int(regs[-1]["count"]) - base
+            if fc == 4:
+                rr = self.client.read_input_registers(base, count=count, device_id=sid)
+                raw = rr.registers
+            elif fc == 2:
+                rr = self.client.read_discrete_inputs(base, count=count, device_id=sid)
+                raw = rr.bits
+            elif fc == 1:  # coil read-back (DO module)
+                rr = self.client.read_coils(base, count=count, device_id=sid)
+                raw = rr.bits
+            else:  # fc == 3
+                rr = self.client.read_holding_registers(base, count=count, device_id=sid)
+                raw = rr.registers
+            if rr.isError():
+                raise RuntimeError(f"Modbus read error (slave {sid} fc {fc}): {rr}")
+            for r in regs:
+                off = r["address"] - base
+                cnt = int(r["count"])
+                if r["type"] == "bool":
+                    out[r["name"]] = bool(raw[off])
+                elif r["type"] == "float":
+                    out[r["name"]] = decode_float(raw[off:off + cnt],
+                                                  r.get("byte_order", "big"),
+                                                  r.get("word_order", "big"))
+                else:  # uint16
+                    out[r["name"]] = int(raw[off])
+        return out
 
-    def write_register(self, name: str, value: int) -> None:
-        idx = self.addr_names.index(name)
-        r = self.client.write_registers(self.addr_base + idx, [int(value)],
-                                        device_id=self.unit)
-        if r.isError():
-            raise RuntimeError(f"Modbus write error: {r}")
+    def write_register(self, name: str, value) -> None:
+        r = self.regs_by_name[name]
+        sid, addr = r["slave_id"], r["address"]
+        if r["type"] == "float":
+            regs = encode_float(value, r.get("byte_order", "big"), r.get("word_order", "big"))
+            rr = self.client.write_registers(addr, regs, device_id=sid)         # FC16
+        elif r["type"] == "bool":
+            rr = self.client.write_coil(addr, bool(value), device_id=sid)       # FC05
+        else:  # uint16
+            rr = self.client.write_register(addr, int(value), device_id=sid)    # FC06
+        if rr.isError():
+            raise RuntimeError(f"Modbus write error ({name}): {rr}")
 
     def close(self) -> None:
         self.client.close()
@@ -166,18 +241,33 @@ class _IA2HttpBase(Backend):
     def _hdr(self) -> dict:
         return {"X-IA2-Project": self.project} if self.project else {}
 
-    def write_register(self, name: str, value: int) -> None:
+    def write_register(self, name: str, value) -> None:
         full = self._full_names.get(name, name)
-        self._post_write(full, int(value))
+        self._post_write(full, self._i32_value(value))
+
+    @staticmethod
+    def _i32_value(value) -> int:
+        """IA2 variable-write takes i32. REAL vars take their IEEE-754 bits (the VM
+        slot is f32::to_bits); integer vars (UINT/INT/DINT/BOOL) take the value
+        directly. Floats -> bit-cast, ints/bools -> as-is."""
+        if isinstance(value, bool):
+            return 1 if value else 0
+        # M3/#6: np.float32/np.float64 are NOT Python floats (only float64
+        # subclasses float) — without np.floating they fall through to int(value)
+        # (truncation), which wrote level_sp=0 from float32 setpoint actions and
+        # drained the plant in the setpoint validation gate.
+        if isinstance(value, (float, np.floating)):
+            return struct.unpack("<i", struct.pack("<f", float(value)))[0]
+        return int(value)
 
     def close(self) -> None:
         pass
 
     # subclasses supply the variable-source + write-route specifics:
     def _vars(self) -> list[dict]: ...
-    def _post_write(self, full_name: str, value: int) -> None: ...
+    def _post_write(self, full_name: str, value) -> None: ...
 
-    def read_raw(self) -> dict[str, int]:
+    def read_raw(self) -> dict:
         return _parse_vars(self._vars(), self._full_names)
 
 
@@ -186,7 +276,7 @@ class IA2Backend(_IA2HttpBase):
 
     Observations: GET /api/runtime/snapshot  -> VarSnapshot
         {timestamp_us, scan_count, vars: [{name, type_name, value(str)}]}
-    Actions: POST /api/runtime/variables/{name}  body {"value": <i32>}
+    Actions: POST /api/runtime/variables/{name}  body {"value": <number>}
         (a between-scan variable write; the iomap forwards it to the cabinet).
     """
 
@@ -195,13 +285,7 @@ class IA2Backend(_IA2HttpBase):
         super().__init__(server_url, project)
         self._prev_scan_count = None   # C7: frozen-obs detection
         if probe_runtime:
-            # C17: --backend auto must fall back when the dev server is up
-            # but the program isn't loaded/running. Health alone can't tell
-            # those apart, so do one snapshot read here — it surfaces the
-            # same 409 / empty-snapshot that the mode write would hit later,
-            # but inside _make_backend's try/except so the Modbus fallback
-            # actually fires.
-            self.read_raw()
+            self.read_raw()  # surfaces a 409 / empty-snapshot inside _make_backend's try/except
 
     def _vars(self) -> list[dict]:
         snap = _http_json("GET", f"{self.base}/api/runtime/snapshot",
@@ -212,8 +296,6 @@ class IA2Backend(_IA2HttpBase):
                 f"Start one with `cs run --server {self.base} --program ThreeTank` "
                 "(or just `cs run --program ThreeTank` against the default server)."
             )
-        # C7 fix: detect a frozen scan loop (scan_count not advancing between
-        # steps → the cabinet or IA2 is dead/paused, feeding stale observations).
         sc = snap.get("scan_count")
         if sc is not None:
             sc = int(sc)
@@ -225,29 +307,17 @@ class IA2Backend(_IA2HttpBase):
             self._prev_scan_count = sc
         return snap["vars"]
 
-    def _post_write(self, full_name: str, value: int) -> None:
+    def _post_write(self, full_name: str, value) -> None:
         url = (f"{self.base}/api/runtime/variables/"
                f"{urllib.parse.quote(full_name, safe='')}")
-        _http_json("POST", url, body={"value": value},
-                   headers=self._hdr(), timeout=2.0)
+        _http_json("POST", url, body={"value": value}, headers=self._hdr(), timeout=2.0)
 
 
 class EdgeBackend(_IA2HttpBase):
     """Edge-runtime backend via the dev server's SSH proxy (addresses G4).
 
-    For deployments where the project runs on a remote edge (``ia2-runtime``)
-    rather than the local dev server. The edge runtime exposes a
-    body-addressed write route (vs the dev server's path-addressed one); the
-    dev server proxies it over SSH.
-
     Observations: GET /api/edges/{name}/status -> .last_snapshot.vars
-                  (same VarSnapshot.vars shape as the dev server's snapshot).
     Actions:      POST /api/edges/{name}/runtime/write body {"name", "value"}
-                  (the edge's body-addressed write).
-
-    Cannot be exercised without a registered, deployed edge (``cs edge`` +
-    ``cs deploy``); the route shapes above are verified against the IA2
-    source (crates/server/src/edges.rs, crates/runtime/src/main.rs).
     """
 
     def __init__(self, server_url: str, project: str | None, edge_name: str):
@@ -261,12 +331,10 @@ class EdgeBackend(_IA2HttpBase):
         if not snap or not snap.get("vars"):
             raise RuntimeError(
                 "IA2 runtime snapshot is empty — no program is loaded/running. "
-                f"Start one with `cs run --server {self.base} --program ThreeTank` "
-                "(or just `cs run --program ThreeTank` against the default server)."
-            )
+                f"Start one with `cs run --server {self.base} --program ThreeTank`.")
         return snap["vars"]
 
-    def _post_write(self, full_name: str, value: int) -> None:
+    def _post_write(self, full_name: str, value) -> None:
         _http_json("POST", f"{self.base}/api/edges/{self.edge}/runtime/write",
                    body={"name": full_name, "value": value},
                    headers=self._hdr(), timeout=4.0)
@@ -276,13 +344,16 @@ class EdgeBackend(_IA2HttpBase):
 # Gymnasium environment
 # --------------------------------------------------------------------------- #
 class CascadeBridgeEnv(gym.Env):
-    """3-tank cascade control env over IA2 (or direct Modbus).
+    """Heated serial-cascade control env over IA2 (or direct Modbus).
 
-    observation = sensor registers in engineering units (default order
-                  tank1_level, tank1_temp, tank2_level, tank2_temp,
-                  tank3_level, tank3_temp) — driven by ia2_config.json.
-    action      = actuator fractions in [0, 1] (actuator1, actuator2).
-    reward      = -(level tracking error vs setpoints + small action cost).
+    observation = the 14 sensors in ia2_config.json order (engineering units):
+                  3 levels, 3 temps, 3 flows, 5 digital safety flags.
+    action      = 5 actuator fractions in [0,1] in bridge write order
+                  (v_12, v_23, e_101, v_33, vfd). The on/off interlock-test
+                  solenoids SV-1..3 (config `test_actuators`) are NOT actions:
+                  they are operator/test-harness instrumentation driven via
+                  set_test_valve() / set_test_valves_enabled().
+    reward      = -(level + temp tracking error vs setpoints + action cost).
     """
 
     metadata = {"render_modes": []}
@@ -295,12 +366,14 @@ class CascadeBridgeEnv(gym.Env):
         self.control_dt = float(control_dt)
         self._port_override = port
 
-        regs = _registers_by_address(self.config)
-        self.addr_base = int(regs[0]["address"])
-        self.addr_names = [r["name"] for r in regs]                 # ordered by address
+        self.regs = _registers_by_address(self.config)
+        self.reg_by_name = {r["name"]: r for r in self.regs}
         self.sensor_names = list(self.config["sensors"])
         self.actuator_names = list(self.config["actuators"])
-        self.scales = {r["name"]: float(r["scale"]) for r in regs}
+        # on/off interlock-test solenoids (SV-1..3) — see set_test_valve; never
+        # part of the action space (policies + benchmark KPIs unaffected).
+        self.test_actuator_names = list(self.config.get("test_actuators", []))
+        self.scales = {r["name"]: float(r["scale"]) for r in self.regs}  # uint16 raw regs only (reset)
         self.setpoints = {k: float(v) for k, v in
                           self.config["control"]["setpoints_m"].items()}
         self.temp_setpoints = {k: float(v) for k, v in
@@ -311,28 +384,25 @@ class CascadeBridgeEnv(gym.Env):
             "temp": float(rw.get("temp", 0.0001)),
             "action": float(rw.get("action", 0.01)),
         }
+        # per-actuator engineering max (from the contract register max) for [0,1] -> eng scaling
+        self._act_max = {n: float(self.reg_by_name[n]["max"]) for n in self.actuator_names}
         self._reset_nonce = 0
 
         self.backend: Backend = self._make_backend(backend)
         self.mode = mode.lower()
-        
         valid_modes = {"manual", "pid", "mpc", "rl"}
         if self.mode not in valid_modes:
             raise ValueError(
-                f"Invalid mode '{self.mode}'. Please use one of: {', '.join(sorted(valid_modes))}"
-            )
-            
+                f"Invalid mode '{self.mode}'. Please use one of: {', '.join(sorted(valid_modes))}")
         self._mode_int = {"manual": 0, "pid": 1, "mpc": 2, "rl": 3}[self.mode]
-        # PLC-mode write targets (what the agent writes each step). Modbus backend
-        # has no PLC -> drives the cabinet registers directly (mode ignored).
         self._write_names, self._write_max = self._write_targets()
         if self.backend.writes_via_plc:
             self.backend.write_register("mode", self._mode_int)  # PLC CASE selector
             LOG.info("mode = %s (%d)", self.mode, self._mode_int)
 
-        sreg = {r["name"]: r for r in regs}
-        obs_lo = np.array([sreg[n]["min"] for n in self.sensor_names], dtype=np.float32)
-        obs_hi = np.array([sreg[n]["max"] for n in self.sensor_names], dtype=np.float32)
+        sreg = self.reg_by_name
+        obs_lo = np.array([float(sreg[n]["min"]) for n in self.sensor_names], dtype=np.float32)
+        obs_hi = np.array([float(sreg[n]["max"]) for n in self.sensor_names], dtype=np.float32)
         self.observation_space = spaces.Box(obs_lo, obs_hi, dtype=np.float32)
         self.action_space = spaces.Box(
             np.zeros(len(self.actuator_names), np.float32),
@@ -347,8 +417,7 @@ class CascadeBridgeEnv(gym.Env):
             if not edge_name:
                 raise RuntimeError(
                     "--backend edge requires a name: use 'edge:<name>' or set "
-                    "ia2.edge_name in ia2_config.json"
-                )
+                    "ia2.edge_name in ia2_config.json")
             be = EdgeBackend(ia2["server_url"], ia2.get("project_name"), edge_name)
             LOG.info("backend = Edge (%s, edge=%s)", ia2["server_url"], edge_name)
             return be
@@ -365,53 +434,82 @@ class CascadeBridgeEnv(gym.Env):
                 LOG.warning("IA2 backend unavailable (%s); using Modbus", e)
         m = self.config["modbus"]
         port = int(self._port_override) if self._port_override else int(m["port"])
-        be = ModbusBackend(m["host"], port, int(m["unit_id"]),
-                           self.addr_base, self.addr_names)
-        LOG.info("backend = Modbus (%s:%s)", m["host"], port)
+        be = ModbusBackend(m["host"], port, self.regs)
+        LOG.info("backend = Modbus (%s:%s, multi-slave)", m["host"], port)
         return be
 
     # ---- conversions ----
-    def _decode_obs(self, raw: dict[str, int]) -> np.ndarray:
+    def _decode_obs(self, raw: dict) -> np.ndarray:
+        # raw values are already engineering units (floats decoded by the Modbus
+        # backend or REAL vars from IA2); assemble sensors in config order.
         vals = []
         for name in self.sensor_names:
             if name not in raw:
                 raise RuntimeError(
-                    f"sensor '{name}' missing from backend read; "
-                    f"got keys={list(raw)}"
-                )
-            vals.append(raw[name] * self.scales[name])
+                    f"sensor '{name}' missing from backend read; got keys={list(raw)}")
+            vals.append(float(raw[name]))
         return np.asarray(vals, dtype=np.float32)
 
-    def _write_targets(self) -> tuple[list[str], list[int]]:
-        """Var names + raw maxima the agent writes each step, by mode/backend."""
-        if not self.backend.writes_via_plc:                      # modbus -> direct
-            return list(self.actuator_names), [10000] * len(self.actuator_names)
+    def _write_targets(self) -> tuple[list[str], list[float]]:
+        """Var names + engineering maxima the agent writes each step, by mode/backend."""
+        if not self.backend.writes_via_plc:                      # modbus -> drive cabinet directly
+            return list(self.actuator_names), [self._act_max[n] for n in self.actuator_names]
         if self.mode == "manual":
-            return (["manual_p1", "manual_p2", "manual_h1", "manual_h2", "manual_h3"],
-                    [10000] * 5)
+            return (["manual_vfd", "manual_v12", "manual_v23", "manual_v33", "manual_h1"],
+                    [100.0, 100.0, 100.0, 100.0, 100.0])
         if self.mode == "pid":
-            return (["tank1_level_sp", "tank3_level_sp",
-                     "tank1_temp_sp", "tank2_temp_sp", "tank3_temp_sp"],
-                    [6000, 6000, 10000, 10000, 10000])
+            return (["tank1_level_sp", "tank2_level_sp", "tank3_level_sp", "tank1_temp_sp"],
+                    [0.5, 0.5, 0.5, 100.0])
         return ([f"{n}_req" for n in self.actuator_names],       # mpc / rl
-                [10000] * len(self.actuator_names))
+                [100.0] * len(self.actuator_names))  # _req are REAL % (POU scales x100 -> u16)
 
-    def _action_to_writes(self, action) -> dict[str, int]:
+    def _action_to_writes(self, action) -> dict:
         a = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
-        return {name: max(0, min(int(round(a[i] * mx)), mx))
+        return {name: float(a[i] * mx)
                 for i, (name, mx) in enumerate(zip(self._write_names, self._write_max))}
 
     def setpoint_action(self) -> np.ndarray:
-        """Config setpoints as a normalized [0,1] action (for the PID-mode demo)."""
+        """Config setpoints as a normalized [0,1] action (PID-mode demo)."""
         sp = self.config["control"]
-        h_max = float(self.config["process"]["h_max_m"])
         return np.array([
-            sp["setpoints_m"]["tank1_level"] / h_max,
-            sp["setpoints_m"]["tank3_level"] / h_max,
+            sp["setpoints_m"]["tank1_level"] / 0.5,
+            sp["setpoints_m"]["tank2_level"] / 0.5,
+            sp["setpoints_m"]["tank3_level"] / 0.5,
             sp["setpoints_c"]["tank1_temp"] / 100.0,
-            sp["setpoints_c"]["tank2_temp"] / 100.0,
-            sp["setpoints_c"]["tank3_temp"] / 100.0,
         ], dtype=np.float32)
+
+    # ---- interlock-test solenoids (operator/test-harness only) ----
+    def set_test_valve(self, name: str, opened: bool) -> None:
+        """Open/close an on/off interlock-test solenoid (SV-1..3 on the DO
+        module, each parallel to V-12/V-23/V-33).
+
+        Test instrumentation, deliberately OUTSIDE the agent action space
+        (config ``test_actuators``, not ``actuators``): the action vector,
+        trained policies, and benchmark KPIs are unaffected while the SVs stay
+        closed. Open one to script a level transient for SAT interlock testing
+        (drive a tank to the LSH overflow / LSL dry-fire trip and verify the
+        response) without touching the control-path valves.
+
+        IA2 track: writes the PLC-internal ``sv_*_req`` var — the POU ANDs it
+        with ``test_sv_en`` (see set_test_valves_enabled) before driving the
+        DO coil. Modbus track: writes the coil directly (no PLC in the loop).
+        """
+        if name not in self.test_actuator_names:
+            raise ValueError(f"'{name}' is not a test actuator "
+                             f"(test_actuators={self.test_actuator_names})")
+        target = name.replace("_cmd", "_req") if self.backend.writes_via_plc else name
+        self.backend.write_register(target, bool(opened))
+
+    def set_test_valves_enabled(self, enabled: bool) -> None:
+        """Master enable for the SV coils (IA2 track only).
+
+        The POU forces every ``sv_*_cmd`` FALSE while ``test_sv_en`` is FALSE
+        (its power-on default), so a stale request cannot hold a test valve
+        open across a harness exit or POU restart. The modbus track has no PLC:
+        the coils themselves are the state, so this is a no-op there.
+        """
+        if self.backend.writes_via_plc:
+            self.backend.write_register("test_sv_en", bool(enabled))
 
     def _reward(self, action, obs) -> tuple[float, dict]:
         sidx = {n: i for i, n in enumerate(self.sensor_names)}
@@ -420,15 +518,12 @@ class CascadeBridgeEnv(gym.Env):
         w = self.reward_weights
         track_l = sum((levels[n] - self.setpoints[n]) ** 2 for n in levels)
         track_t = sum((temps[n] - self.temp_setpoints[n]) ** 2 for n in temps)
-        # C6 fix: action cost on the CLIPPED action (not the pre-clip raw)
         clipped = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
         action_cost = w["action"] * float(np.sum(clipped))
         reward = float(-(w["level"] * track_l + w["temp"] * track_t + action_cost))
         info = {
-            "levels_m": levels,
-            "temps_c": temps,
-            "track_level_mse": track_l,
-            "track_temp_mse": track_t,
+            "levels_m": levels, "temps_c": temps,
+            "track_level_mse": track_l, "track_temp_mse": track_t,
             "action": np.asarray(action, dtype=np.float32).tolist(),
         }
         return reward, info
@@ -437,33 +532,37 @@ class CascadeBridgeEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         """Reset the plant to a sampled initial state (RL init-state distribution).
 
-        Writes sampled initial levels to the init_h* registers, then pulses
-        reset_cmd (rising edge). The cabinet snaps to init_h* and HOLDS while
-        reset_cmd is asserted, so the obs read here are exactly the init levels.
-        Releasing reset_cmd (-> 0) lets the cabinet resume stepping for step().
+        Writes sampled initial levels to the init_h* registers (raw uint16 via
+        scale), then pulses reset_cmd (slave 03). The cabinet snaps to init_h*
+        and HOLDS while reset_cmd is asserted, so the obs read here are exactly
+        the init levels. Releasing reset_cmd (-> 0) lets the cabinet resume.
         """
         super().reset(seed=seed)
         for name in self._write_names:                   # neutral the mode's write vars
-            self.backend.write_register(name, 0)
+            self.backend.write_register(name, 0.0)
+        # close the interlock-test solenoids: they are FIELD state, not process
+        # state, so an SV latched open by an earlier test would silently corrupt
+        # this episode's init-level distribution.
+        for name in self.test_actuator_names:
+            self.set_test_valve(name, False)
         info: dict = {}
         rcfg = self.config.get("reset")
         if rcfg:
-            lo, hi = rcfg.get("init_level_range_m", [0.10, 0.50])
+            lo, hi = rcfg.get("init_level_range_m", [0.10, 0.40])
             init_levels: dict[str, float] = {}
             for name in rcfg.get("init_levels", []):
                 level = float(self.np_random.uniform(lo, hi))
-                mx = round(1.0 / self.scales[name])
                 init_levels[name] = level
-                self.backend.write_register(
-                    name, max(0, min(int(round(level / self.scales[name])), mx)))
+                raw = int(round(level / self.scales[name]))   # uint16 raw for init_h*
+                self.backend.write_register(name, raw)
             info["init_levels_m"] = init_levels
             cmd = rcfg.get("command_register")
             if cmd:
-                self._reset_nonce = self._reset_nonce % 65535 + 1  # C2 fix: never wraps to 0
+                self._reset_nonce = self._reset_nonce % 65535 + 1  # never wraps to 0
                 self.backend.write_register(cmd, self._reset_nonce)  # fresh nonce -> snap + hold
                 time.sleep(self.control_dt)
                 obs = self._decode_obs(self.backend.read_raw())
-                self.backend.write_register(cmd, 0)                   # release -> resume
+                self.backend.write_register(cmd, 0)                # release -> resume
                 return obs, info
         time.sleep(self.control_dt)
         return self._decode_obs(self.backend.read_raw()), info
@@ -472,11 +571,11 @@ class CascadeBridgeEnv(gym.Env):
         for name, value in self._action_to_writes(action).items():
             self.backend.write_register(name, value)
         time.sleep(self.control_dt)
-        raw = self.backend.read_raw()       # R1 fix: stash for detect_interlock
-        self.last_raw = raw               #   (no second read needed)
+        raw = self.backend.read_raw()
+        self.last_raw = raw
         obs = self._decode_obs(raw)
         reward, info = self._reward(action, obs)
-        info["raw"] = raw                 #   also in info for callers
+        info["raw"] = raw
         return obs, reward, False, False, info
 
     def close(self):
@@ -490,6 +589,9 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
     env = CascadeBridgeEnv(backend=backend, control_dt=control_dt, mode=mode)
     obs, info = env.reset()
     LOG.info("reset obs = %s  mode=%s", np.round(obs, 3), mode)
+    # reward is an RL concept — only the rl demo reports it (pid/manual/modbus
+    # controllers don't optimize one, so printing it there is misleading)
+    log_reward = mode == "rl"
     rewards = []
     steps_data = []
     pid_act = env.setpoint_action() if mode == "pid" else None
@@ -497,31 +599,32 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
         action = pid_act if pid_act is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
-        # Energy KPI uses the *applied* duty (post-L5-shield registers), not the
-        # raw action: in pid mode `action` holds setpoints, so feeding it to
-        # heater_power() would give a meaningless excess_kwh (same fix as
-        # run_rl.py + validate_policy.py). info["raw"] is stashed by step().
-        applied_duty = [info["raw"].get(n, 0) * 1e-4
-                        for n in ("actuator1", "actuator2", "heater1", "heater2", "heater3")]
-        steps_data.append({
-            "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
+        sd = {
+            "step": k,
+            "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in action], "applied_duty": applied_duty,
-            "reward": reward})
+            "flows": [float(obs[6]), float(obs[7]), float(obs[8])],
+            "action": [float(x) for x in action],
+            "applied_duty": [float(info["raw"].get(n, 0.0)) / env._act_max[n]
+                              for n in env.actuator_names]}
+        if log_reward:
+            sd["reward"] = reward
+        steps_data.append(sd)
         if k % 4 == 0 or k == steps - 1:
-            lv = info["levels_m"]
-            tp = info.get("temps_c", {})
+            lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  "
-                     "temps(C)=%.1f/%.1f/%.1f  r=%.4f",
+                     "temps(C)=%.1f/%.1f/%.1f%s",
                      k, np.round(action, 2),
-                     lv.get("tank1_level", float("nan")),
-                     lv.get("tank2_level", float("nan")),
+                     lv.get("tank1_level", float("nan")), lv.get("tank2_level", float("nan")),
                      lv.get("tank3_level", float("nan")),
-                     tp.get("tank1_temp", float("nan")),
-                     tp.get("tank2_temp", float("nan")),
-                     tp.get("tank3_temp", float("nan")), reward)
+                     tp.get("tank1_temp", float("nan")), tp.get("tank2_temp", float("nan")),
+                     tp.get("tank3_temp", float("nan")),
+                     f"  r={reward:.4f}" if log_reward else "")
     env.close()
-    LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), steps)
+    if log_reward:
+        LOG.info("rollout done — mean reward = %.4f over %d steps", float(np.mean(rewards)), steps)
+    else:
+        LOG.info("rollout done — %d steps", steps)
     try:
         from controllers.rollout_report import report
         report(steps_data, tag=mode)
@@ -530,7 +633,7 @@ def _demo(backend: str, steps: int, control_dt: float, mode: str):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="AIO bridge Gym env (3-tank cascade).")
+    ap = argparse.ArgumentParser(description="AIO bridge Gym env (heated serial cascade).")
     ap.add_argument("--backend", default="auto",
                     help="auto | ia2 | modbus | edge | edge:<name> (default: auto)")
     ap.add_argument("--steps", type=int, default=20)

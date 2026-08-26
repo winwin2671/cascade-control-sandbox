@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -68,31 +69,59 @@ def run(agent, env, episodes, seed):
 
 
 class RLAgent:
-    """Trained RL policy (SB3 SAC/PPO) wrapped as an agent for evaluate()."""
-    def __init__(self, model_path):
-        from stable_baselines3 import SAC, PPO
-        import json as _json
-        # Read algo from metadata sidecar; fall back to trying SAC then PPO
-        algo = "sac"
-        sidecar = model_path.replace(".zip", ".json")
-        if Path(sidecar).exists():
-            algo = _json.load(open(sidecar)).get("algo", "sac")
-        try:
-            self.model = (SAC if algo == "sac" else PPO).load(model_path)
-        except Exception:
-            self.model = PPO.load(model_path)
-        self.name = f"RL-{type(self.model).__name__}"
+    """Trained RL policy (SB3 SAC/PPO) wrapped as an agent for evaluate().
+
+    Direct policies read the env's NATIVE observation (env._obs()) so they see exactly
+    what they trained on — including the ∫(sp−meas)dt terms when trained with
+    integral_obs (20-D) or the plain 14-D obs otherwise.
+
+    Residual policies (2-D action) get the SAME ResidualEnvWrapper used in training:
+    compute() builds the wrapper's 23-D obs (17-D base + integrals), predicts the 2-D residual, and resolves
+    it to the full 5-D physical action (feedforward + PID + residual) before returning."""
+    def __init__(self, plant, model, env, wrapper=None):
+        self.plant = plant                       # for actuator_counts() + controlled_levels()
+        self.model = model
+        self.env = env                           # native obs source (matches training exactly)
+        self.wrapper = wrapper                   # ResidualEnvWrapper or None (direct policy)
+        self.name = f"RL-{type(self.model).__name__}" + ("-res" if wrapper else "")
 
     def reset(self):
-        pass
+        if self.wrapper is not None:
+            # benchmark resets the raw env itself; re-sync the wrapper's episodic state
+            # (mirrors ResidualEnvWrapper.reset without re-resetting the env)
+            from controllers.residual_rl import tracking_steady_state_action
+            self.wrapper._reset_episodic_state()
+            self.wrapper._model_optimal = tracking_steady_state_action(
+                self.wrapper.model, self.wrapper.reference)
+            # Minor/#6: the first obs after reset must NOT accumulate the integral
+            # (wrapper.reset() passes accumulate=False; training never integrates
+            # the reset state). Direct-driving _make_obs with its default would
+            # add one extra ∫err step the policy never saw in training.
+            self._first_obs = True
 
     def compute(self, meas, sp, dt):
-        ctrl = [0, 2]   # controlled_levels
-        obs = (meas["levels"] + meas["temps"] + list(sp["t_sp"])
-               + [sp["h_sp"][i] for i in ctrl] + [meas["t_cold"], meas["t_amb"]])
-        action, _ = self.model.predict(np.array(obs, dtype=np.float32), deterministic=True)
+        if self.wrapper is not None:             # residual paradigm: 23-D obs (17 base + 6 integral), 2-D action
+            acc = not getattr(self, "_first_obs", False)
+            self._first_obs = False
+            obs = self.wrapper._make_obs(self.env._obs(), accumulate=acc)
+            action, _ = self.model.predict(np.asarray(obs, dtype=np.float32), deterministic=True)
+            action = np.clip(np.asarray(action, dtype=np.float64).flatten(), -1.0, 1.0)
+            physical = self.wrapper._resolve_action(action)   # canonical [pump,v12,v23,v33,heater]
+            # keep the wrapper's prev-action obs in sync — wrapper.step() does this in
+            # training/validation; skipping it froze prev_action at 0 and shifted the
+            # policy's obs distribution (h3 overfilled, runaway ~89% of steps)
+            self.wrapper._prev_physical = physical
+            nP, nV, nH = self.plant.actuator_counts()
+            return {"pumps": list(physical[:nP]),
+                    "valves": list(physical[nP:nP + nV]),
+                    "heaters": list(physical[nP + nV:])}
+        obs = np.asarray(self.env._obs(), dtype=np.float32)
+        action, _ = self.model.predict(obs, deterministic=True)
         action = np.clip(np.asarray(action, dtype=np.float64).flatten(), 0.0, 1.0)
-        return {"pumps": list(action[:2]), "valves": [], "heaters": list(action[2:])}
+        nP, nV, nH = self.plant.actuator_counts()
+        return {"pumps": list(action[:nP]),
+                "valves": list(action[nP:nP + nV]),
+                "heaters": list(action[nP + nV:])}
 
 
 def main():
@@ -105,19 +134,76 @@ def main():
     args = ap.parse_args()
 
     env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
-                          action_mode="actuator", episode_steps=args.episode_steps)
+                          action_mode="actuator", episode_steps=args.episode_steps,
+                          randomize_setpoints=False,   # M5/#6: fixed-reference rows
+                          dynamic=False)               # must not be scored against
+                                  # setpoints they cannot see. dynamic=False too
+                                  # (M5 re-review): the env default is True and its
+                                  # disturbance kind 3 is a mid-episode SETPOINT
+                                  # MOVE (h_sp/t_sp mutated in place) — 12/20 episodes
+                                  # moved the scored setpoints while the residual
+                                  # wrapper's reference stayed frozen.
     pairs = [(FixedAgent(env.model), env), (PIDAgent(env.model), env), (MPCAgent(env.model), env)]
     if args.nmpc:
         from controllers.nmpc_oracle import OracleAgent
         pairs.append((OracleAgent(), env))
     if args.rl:
-        # RL trained in setpoint mode (picks targets, PID tracks) -> evaluate on
-        # a setpoint-mode env so its output is interpreted correctly. PID/MPC
-        # stay on the actuator-mode env. The KPI scores are comparable (same
-        # plant + scorer + reward mode).
+        # Load the policy once and configure the eval env to match how it was trained:
+        # obs shape 20 -> integral_obs was on; 14 -> off. RLAgent then reads the env's
+        # native obs, so it always matches the training observation exactly.
+        from stable_baselines3 import SAC, PPO
+        sidecar = args.rl.replace(".zip", ".json")
+        meta = json.load(open(sidecar)) if Path(sidecar).exists() else {}
+        algo = meta.get("algo", "sac")
+        try:
+            rl_model = (SAC if algo == "sac" else PPO).load(args.rl)
+        except Exception:
+            rl_model = PPO.load(args.rl)
+        # Modbus-trained DIRECT policies (EnrichedObs, 22-D) can't be benchmarked
+        # here: their obs includes bridge-only sensors (3 flows + 5 DI flags) the
+        # numpy env doesn't produce — reconstructing them would synthesize sensor
+        # values and silently skew the row. Evaluate those on the bridge instead
+        # (run_rl.py / validate_policy.py both reconstruct EnrichedObs there).
+        is_modbus_direct = (meta.get("action_mode", "actuator") != "residual"
+                            and rl_model.observation_space.shape == (22,))
+        if is_modbus_direct:
+            print(f"ERROR: {args.rl} is a modbus-track direct policy (EnrichedObs 22-D — "
+                  "includes flow/DI sensors absent from the numpy env). Benchmark a "
+                  "numpy-trained policy, or evaluate this one on the bridge: "
+                  f"python3 controllers/run_rl.py --policy {args.rl} --backend ia2")
+            sys.exit(1)
+        # M6/#6: setpoint-mode policies output SUPERVISORY setpoints, not duties —
+        # this benchmark applies the raw action as actuator fractions, which turns
+        # temperature setpoints into pump/valve duties and silently slices the 6th
+        # dim. (train_sb3's default is setpoint, so this is easy to hit.)
+        if meta.get("action_mode") == "setpoint":
+            print(f"ERROR: {args.rl} is a setpoint-mode policy (6-D supervisory output). "
+                  "The benchmark evaluates direct duties only — retrain with "
+                  "--action-mode actuator (or --residual), or validate this policy on "
+                  f"the bridge: python3 controllers/run_rl.py --policy {args.rl} "
+                  "--action-mode setpoint --backend ia2")
+            sys.exit(1)
         rl_env = AIOGymNativeEnv("threetank", reward_mode=args.reward_mode,
-                                  action_mode="setpoint", episode_steps=args.episode_steps)
-        pairs.append((RLAgent(args.rl), rl_env))
+                                 action_mode="actuator", episode_steps=args.episode_steps,
+                                 randomize_setpoints=False,          # M5/#6: match the base env
+                                 dynamic=False,                      # M5 re-review: ditto
+                                 integral_obs=(rl_model.observation_space.shape == (20,)))
+        # residual policy (2-D action): attach the SAME wrapper used in training
+        # (numpy env -> grouped obs indices + canonical action order) so the 2-D
+        # residual expands to the full 5-D physical action before env.step().
+        # Obs shape 23 = integral_obs on (current), 17 = legacy — match the policy.
+        wrapper = None
+        if meta.get("action_mode") == "residual" or rl_model.observation_space.shape in ((17,), (23,)):
+            from controllers.residual_rl import ResidualEnvWrapper
+            from controllers.threetank_model import ThreeTankModel
+            _m = ThreeTankModel()
+            _hsp, _tsp = _m.default_setpoints()
+            _ref = [_hsp[0], _hsp[1], _hsp[2], _tsp[0], _tsp[1], _tsp[2]]
+            wrapper = ResidualEnvWrapper(rl_env, _m, _ref,
+                                         level_idx=(0, 1, 2), temp_idx=(3, 4, 5),
+                                         act_idx=(0, 1, 2, 3, 4),
+                                         integral_obs=(rl_model.observation_space.shape == (23,)))
+        pairs.append((RLAgent(env.model, rl_model, rl_env, wrapper=wrapper), rl_env))
 
     results = sorted((run(a, e, args.episodes, 0) for a, e in pairs),
                      key=lambda r: r["kpi"], reverse=True)

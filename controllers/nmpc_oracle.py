@@ -12,6 +12,8 @@ with our ThreeTankModel, and `_DYN` extended with `_f_threetank`.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 try:
@@ -22,55 +24,26 @@ except Exception:                       # pragma: no cover
 
 from controllers.threetank_model import ThreeTankModel
 
+LOG = logging.getLogger("nmpc_oracle")
+
 RHO_CP = 1000.0 * 4186.0
 
 
 # ----------------------------------------------------------------------------
 # Symbolic continuous dynamics dx/dt = f(x, u, d, p) — mirror mock_cabinet.py.
-# x = [h1, T1, h2, T2, h3, T3]; u = [p1, p2, heater1, heater2, heater3] in [0,1];
+# x = [h1, T1, h2, T2, h3, T3]; u = [pump, V-12, V-23, V-33, heater] in [0,1];
 # d = [t_cold, t_amb]; p = ThreeTankModel.p.
 # ----------------------------------------------------------------------------
-def _flow_sym(h_from, h_to, coeff, p):
-    """Smooth Torricelli flow + its forward/backward parts (well-mixed advection).
-
-    q = coeff*S_PIPE*sqrt(2g)*sign(dh)*sqrt(|dh|), split into forward (dh>0) and
-    backward (dh<0) via ca.fmax so the advection term carries the upstream temp.
-    """
-    dh = h_from - h_to
-    k = coeff * p["S_PIPE"] * ca.sqrt(2 * p["G"])
-    # floor the sqrt argument at 1e-9 (NOT 0): sqrt(0) has an infinite derivative
-    # -> NaN in IPOPT's constraint Jacobian. (Same trick as AIO-Gym's _f_cascade.)
-    fwd = k * ca.sqrt(ca.fmax(dh, 1e-9))
-    bwd = k * ca.sqrt(ca.fmax(-dh, 1e-9))
-    return fwd - bwd, fwd, bwd
-
-
-def _dT_sym(T, h, q_heat, adv, t_amb, p):
-    h = ca.fmax(h, p["h_floor"])
-    m_cp = p["rho"] * p["A_TANK"] * h * p["cp"]
-    q_loss = p["ua"] * (T - t_amb)
-    return (q_heat - q_loss) / m_cp + adv / (p["A_TANK"] * h)
-
+# Minor/#6: the pre-consolidation _valve_flow_sym/_dT_sym mirrors were removed —
+# _f_threetank delegates to the shared threetank_dynamics module.
 
 def _f_threetank(x, u, d, p):
-    t_cold, t_amb = d[0], d[1]
-    h1, T1, h2, T2, h3, T3 = x[0], x[1], x[2], x[3], x[4], x[5]
-    q1 = u[0] * p["q_max"]
-    q2 = u[1] * p["q_max"]
-    q_12, f12, b12 = _flow_sym(h1, h2, p["A1"], p)
-    q_32, f32, b32 = _flow_sym(h3, h2, p["A3"], p)
-    q_drain, _, _ = _flow_sym(h2, 0.0, p["A2"], p)
-    dh1 = (q1 - q_12) / p["A_TANK"]
-    dh3 = (q2 - q_32) / p["A_TANK"]
-    dh2 = (q_12 + q_32 - q_drain) / p["A_TANK"]
-    Qh = [u[2 + i] * p["q_heat_max"] for i in range(3)]
-    adv1 = q1 * (t_cold - T1) + b12 * (T2 - T1)
-    adv2 = f12 * (T1 - T2) + f32 * (T3 - T2)
-    adv3 = q2 * (t_cold - T3) + b32 * (T2 - T3)
-    dT1 = _dT_sym(T1, h1, Qh[0], adv1, t_amb, p)
-    dT2 = _dT_sym(T2, h2, Qh[1], adv2, t_amb, p)
-    dT3 = _dT_sym(T3, h3, Qh[2], adv3, t_amb, p)
-    return ca.vertcat(dh1, dT1, dh2, dT2, dh3, dT3)
+    """CasADi dynamics — delegates to the shared threetank_dynamics module."""
+    from controllers.threetank_dynamics import dynamics, casadi_ops
+    t_amb = d[1]
+    p["t_ambient"] = t_amb
+    dx = dynamics(x, u[0], [u[1], u[2], u[3]], u[4], p, casadi_ops(ca))
+    return ca.vertcat(*dx)
 
 
 _DYN = {"threetank": _f_threetank}
@@ -80,7 +53,7 @@ class NMPCOracle:
     """CasADi + IPOPT nonlinear MPC (multiple-shooting, RK4, tracking mode)."""
 
     def __init__(self, horizon=20, control_dt=0.5, du_max=0.4,
-                 q_temp=1.0, q_level=50.0, r_move=0.05):
+                 q_temp=0.04, q_level=400.0, r_move=0.05):
         if not _HAVE_CASADI:
             raise RuntimeError("casadi not installed — pip install casadi")
         self.scenario = "threetank"
@@ -94,12 +67,24 @@ class NMPCOracle:
         self.nu = nP + nV + nH
         self.nx = len(self.model.initial_state())
         self.q_temp, self.q_level, self.r_move = q_temp, q_level, r_move
+        # B2-weights/#6-re: normalized-quadratic weights — each term is ~1 at a
+        # "significant deviation" for its quantity (temp 5 K -> 0.04; level
+        # 0.05 m -> 400). The old q_temp=1/q_level=50 made the irreducible temp
+        # error (~1200/stage at 20 K, since 45 degC is unreachable in-horizon)
+        # dwarf the level term (~1/stage), so the genuine optimum shut the pump
+        # and let Tank1 drain to 0.143 m against its own 0.30 m setpoint — cold
+        # inflow hurt the dominant cost. With 0.04/400 the terms are the same
+        # order (16 vs 10 per stage at those errors), so level tracking is no
+        # longer traded away.
         self.t_safe = 70.0          # match the L5 shield's high-temp cutoff
         self.u_prev = np.full(self.nu, 0.5)
+        self.solve_fails = 0
+        from controllers.threetank_dynamics import build_params
+        self._dyn_params = build_params(self.model)
         self._build()
 
     def _rk4(self, x, u, d):
-        f = lambda xx: _DYN[self.scenario](xx, u, d, self.p)
+        f = lambda xx: _DYN[self.scenario](xx, u, d, self._dyn_params)
         nsub = max(1, min(6, int(round(self.dt / self.model.dt_micro))))
         h = self.dt / nsub
         for _ in range(nsub):
@@ -133,6 +118,13 @@ class NMPCOracle:
               "h_sp": [hsp[i] for i in range(self.model.n)]}
         J = 0
         opti.subject_to(X[:, 0] == x0)
+        # B2/#6: physical envelope on X — without it the solver iterates into
+        # h = −gravity_drop (the sqrt-floor kink) and negative levels, which is
+        # where the max-iter stalls came from. Levels [0, h_max]; temps sane.
+        for i in range(self.model.n):
+            opti.subject_to(opti.bounded(0.0, X[2 * i, :], self.model.h_max))
+            opti.subject_to(opti.bounded(5.0, X[2 * i + 1, :], 90.0))
+        opti.subject_to(opti.bounded(0.0, X[6, :], 0.5))               # h_res
         slack = opti.variable(1, N)                                    # soft cap slack
         opti.subject_to(slack >= 0)
         for k in range(N):
@@ -152,6 +144,7 @@ class NMPCOracle:
 
     def reset(self):
         self.u_prev = np.full(self.nu, 0.5)
+        self.solve_fails = 0                               # B2/#6: surfaced, not silent
 
     def solve(self, x, t_cold, t_amb, t_sp, h_sp):
         o = self.opti
@@ -166,7 +159,14 @@ class NMPCOracle:
             o.set_initial(self.X, np.tile(np.asarray(x, float).reshape(-1, 1), (1, self.N + 1)))
             sol = o.solve()
             u = np.clip(sol.value(self.U)[:, 0], 0.0, 1.0)
-        except Exception:
+        except Exception as e:
+            # B2/#6: a dead oracle must not masquerade as a working one — log the
+            # failure (first few verbosely, then a running count) instead of the
+            # old bare except that returned u_prev forever with no signal.
+            self.solve_fails += 1
+            if self.solve_fails <= 3 or self.solve_fails % 50 == 0:
+                LOG.warning("IPOPT solve failed (%d total): %s — holding u_prev",
+                            self.solve_fails, str(e).strip().splitlines()[-1][:120])
             u = self.u_prev                                # keep last on solver failure
         self.u_prev = np.asarray(u, float).reshape(-1)
         return {"pumps": list(self.u_prev[:self.nP]),
@@ -189,6 +189,8 @@ class OracleAgent:
         x = []                                             # interleave h, T
         for i in range(self.model.n):
             x += [meas["levels"][i], meas["temps"][i]]
+        # finite reservoir (unmeasured — nominal estimate)
+        x += [0.30, meas.get("t_cold", 25.0)]  # h_res, T_res
         return x
 
     def compute(self, meas, sp, dt):

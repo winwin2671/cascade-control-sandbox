@@ -21,8 +21,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -41,6 +39,9 @@ def main():
     ap = argparse.ArgumentParser(description="NMPC supervisor — drives the live plant.")
     ap.add_argument("--backend", default="ia2",
                     help="Backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
+    ap.add_argument("--steps", type=int, default=40,
+                    help="rollout length (default 40 — IPOPT solves ~1-4 s/step, so "
+                         "long runs are hours; wired from run_mode.sh --steps)")
     args = ap.parse_args()
 
     env = CascadeBridgeEnv(backend=args.backend, control_dt=0.5, mode="mpc")
@@ -59,36 +60,37 @@ def main():
 
     obs, _ = env.reset()
     LOG.info("NMPC supervisor start — sp levels=%s m, temps=%s degC", sp["h_sp"], sp["t_sp"])
-    rewards = []
     steps_data = []
 
-    for k in range(40):
+    for k in range(args.steps):
         meas = {"levels": [float(obs[0]), float(obs[2]), float(obs[4])],
                 "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
                 "t_cold": m.t_supply, "t_amb": m.t_ambient}
         t0 = time.time()
         act = agent.compute(meas, sp, env.control_dt)
         solve_s = time.time() - t0
-        a = list(act["pumps"]) + list(act["valves"]) + list(act["heaters"])
-        obs, reward, _, _, info = env.step(a)
-        if k % 4 == 0 or k == 39:
+        by_name = {"vfd_cmd": act["pumps"][0], "v_12_cmd": act["valves"][0],
+                   "v_23_cmd": act["valves"][1], "v_33_cmd": act["valves"][2],
+                   "e_101_cmd": act["heaters"][0]}
+        a = [float(by_name[n]) for n in env.actuator_names]
+        obs, _, _, _, info = env.step(a)
+        if k % 4 == 0 or k == args.steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %2d  solve=%.2fs  act=%s  levels(m)=%.3f/%.3f/%.3f  "
-                     "temps(C)=%.1f/%.1f/%.1f  r=%.3f",
+                     "temps(C)=%.1f/%.1f/%.1f",
                      k, solve_s, [round(float(x), 2) for x in a],
                      lv.get("tank1_level", float("nan")),
                      lv.get("tank2_level", float("nan")),
                      lv.get("tank3_level", float("nan")),
                      tp.get("tank1_temp", float("nan")),
                      tp.get("tank2_temp", float("nan")),
-                     tp.get("tank3_temp", float("nan")), reward)
-        rewards.append(reward)
+                     tp.get("tank3_temp", float("nan")))
         steps_data.append({
             "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
             "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in a], "reward": reward})
+            "action": [float(x) for x in a]})
     env.close()
-    LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), len(rewards))
+    LOG.info("rollout done — %d steps", len(steps_data))
     report(steps_data, tag="nmpc")
 
 

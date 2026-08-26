@@ -13,8 +13,9 @@
 #   ./run_mode.sh nmpc           # CasADi+IPOPT NMPC supervisor (slow; ~1-4 s/step)
 #   ./run_mode.sh modbus         # direct Modbus backend (no IA2; cabinet only)
 #   ./run_mode.sh gui            # interactive manual control GUI (tkinter sliders + live plot)
-#   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo> and --train_track <numpy|modbus>
-#   ./run_mode.sh pid --steps 40 # more steps (pid/manual/rl/modbus; mpc/nmpc run 40)
+#   ./run_mode.sh rl [options]   # RL mode supports --algo <sac|ppo>, --train_track <numpy|modbus>, --residual
+#   ./run_mode.sh pid --steps 40 # more steps (all modes; nmpc solves ~1-4 s/step,
+#                                # so long nmpc runs take hours)
 #
 # pid/manual/mpc/nmpc/rl go through IA2 + the L5 shield; modbus talks to the
 # cabinet directly (the fast training path). See README "Control modes".
@@ -32,21 +33,39 @@ fi
 # Default RL attributes and Steps (fallback to STEPS env var if set)
 ALGO="sac"
 TRAIN_TRACK="numpy"
+RESIDUAL=false
+STEPS_SET=false
+[ -n "${STEPS:-}" ] && STEPS_SET=true   # STEPS env var counts as user-supplied
 STEPS="${STEPS:-20}"
 
-# Parse optional flags
+# Parse optional flags (Minor/#6: missing values get a clear message instead of a
+# silent set -e death or a raw unbound-variable abort)
+need_val() {
+  if [ $# -lt 2 ]; then
+    echo "ERROR: option $1 needs a value." >&2
+    exit 2
+  fi
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --algo)
-      ALGO="${2:-sac}"
+      need_val "$@"
+      ALGO="$2"
       shift 2
       ;;
     --train_track)
-      TRAIN_TRACK="${2:-numpy}"
+      need_val "$@"
+      TRAIN_TRACK="$2"
       shift 2
       ;;
+    --residual)
+      RESIDUAL=true
+      shift
+      ;;
     --step|--steps)
+      need_val "$@"
       STEPS="$2"
+      STEPS_SET=true
       shift 2
       ;;
     *)
@@ -58,8 +77,16 @@ done
 
 case "$MODE" in
   pid|manual|rl|mpc|nmpc|modbus|gui) ;;
-  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--steps N]  (got: $MODE)"; exit 2 ;;
+  *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--residual] [--steps N]  (got: $MODE)"; exit 2 ;;
 esac
+
+# #6-re: per-mode rollout default. The mpc/nmpc supervisors' own default is 40
+# steps; wiring the global 20 through --steps silently halved their KPI window
+# (transient-dominated: MPC avg level err 5.7 cm at 40 steps vs 1.77 at 200),
+# making reports incomparable. Only a user-supplied --steps / $STEPS overrides.
+if [ "$STEPS_SET" != true ] && { [ "$MODE" = "mpc" ] || [ "$MODE" = "nmpc" ]; }; then
+  STEPS=40
+fi
 
 # Determine if we need the IA2 server running
 NEEDS_IA2=true
@@ -89,6 +116,12 @@ if ! kill -0 "$CAB_PID" 2>/dev/null; then
 fi
 
 if [ "$NEEDS_IA2" = true ]; then
+  # Minor/#6: distinguish "binary not built" from "port busy" up front
+  if [ ! -x "$IA2/server" ]; then
+    echo "ERROR: $IA2/server not found or not executable — the vendored IA2 engine"
+    echo "       is gitignored and must be built first (cargo build --release in ia2/)."
+    exit 1
+  fi
   echo "==> starting ia2-server (:3001)"
   "$IA2/server" --bind 127.0.0.1:3001 &
   SRV_PID=$!
@@ -110,36 +143,47 @@ if [ "$NEEDS_IA2" = true ]; then
   "$IA2/cs" run
 fi
 
-echo "==> running mode=$MODE" $([ "$MODE" = mpc ] || [ "$MODE" = nmpc ] || [ "$MODE" = gui ] || echo "(steps=$STEPS)")
+echo "==> running mode=$MODE" $([ "$MODE" = gui ] || echo "(steps=$STEPS)")
 case "$MODE" in
   modbus)
     python3 -u "$ROOT/aio_bridge_env.py" --backend modbus --steps "$STEPS" ;;
   pid|manual)
     python3 -u "$ROOT/aio_bridge_env.py" --backend ia2 --mode "$MODE" --steps "$STEPS" ;;
   rl)
-    # Determine policy path and backend based on train_track and algo
+    # Policy path + backend come from train_track / residual. The action mode is
+    # auto-detected from the policy's .json sidecar by run_rl.py — only force it
+    # for residual, or if the user overrides via RL_ACTION_MODE (setpoint/actuator).
+    if [ "$RESIDUAL" = true ]; then
+      POLICY="$ROOT/controllers/policies/${ALGO}_residual_${TRAIN_TRACK}.zip"
+      ACTION_MODE="residual"
+    elif [ "$TRAIN_TRACK" = "modbus" ]; then
+      POLICY="$ROOT/controllers/policies/${ALGO}_threetank_modbus.zip"
+      ACTION_MODE="${RL_ACTION_MODE:-}"
+    else
+      POLICY="$ROOT/controllers/policies/${ALGO}_threetank_numpy.zip"
+      ACTION_MODE="${RL_ACTION_MODE:-}"
+    fi
     if [ "$TRAIN_TRACK" = "modbus" ]; then
-      POLICY="$ROOT/controllers/policies/${ALGO}_cascade.zip"
       BACKEND="modbus"
     else
-      POLICY="$ROOT/controllers/policies/${ALGO}_threetank.zip"
       BACKEND="ia2"
     fi
 
-    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, policy=$POLICY, backend=$BACKEND"
+    EXTRA=""
+    [ -n "$ACTION_MODE" ] && EXTRA="--action-mode $ACTION_MODE"
+    echo "==> RL config: algo=$ALGO, train_track=$TRAIN_TRACK, residual=$RESIDUAL, policy=$POLICY, backend=$BACKEND${ACTION_MODE:+, action_mode=$ACTION_MODE (else sidecar auto-detect)}"
     if [ -f "$POLICY" ]; then
       python3 -u "$ROOT/controllers/run_rl.py" --policy "$POLICY" \
-        --backend "$BACKEND" \
-        --action-mode "${RL_ACTION_MODE:-setpoint}" --steps "${STEPS:-40}"
+        --backend "$BACKEND" $EXTRA --steps "${STEPS:-40}"
     else
       echo "(no trained policy at $POLICY; running random RL demo)"
       python3 -u "$ROOT/aio_bridge_env.py" --backend "$BACKEND" --mode rl --steps "$STEPS"
     fi
     ;;
   mpc)
-    python3 -u "$ROOT/controllers/run_mpc.py" ;;
+    python3 -u "$ROOT/controllers/run_mpc.py" --steps "$STEPS" ;;
   nmpc)
-    python3 -u "$ROOT/controllers/run_nmpc.py" ;;
+    python3 -u "$ROOT/controllers/run_nmpc.py" --steps "$STEPS" ;;
   gui)
     python3 -u "$ROOT/controllers/manual_gui.py" ;;
 esac

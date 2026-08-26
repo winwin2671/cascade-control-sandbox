@@ -1,28 +1,31 @@
 """RL supervisor — drives the live plant with a trained SAC/PPO policy.
 
-Like run_mpc.py / run_nmpc.py but the controller is a trained RL policy. Loads
-the .zip, runs it through the IA2 track or directly via Modbus, reports
+Like run_mpc.py / run_nmpc.py but the controller is a trained RL policy. Loads the
+.zip, runs it through the IA2 track or directly via Modbus, reports
 levels/temps/reward per step.
 
-Handles BOTH action modes:
-  --action-mode actuator: policy outputs [p1,p2,h1,h2,h3] -> writes actuator*_req
-                           (PLC mode=3 RL, direct). Matches old training default.
-  --action-mode setpoint:  policy outputs 5 setpoints (3 temp + 2 level, SUPERVISORY
-                           order) -> writes *_sp vars with range mapping (PLC mode=1
-                           PID, supervisory RL-on-PID). Matches AIO-Gym's default.
+Handles THREE action modes:
+  --action-mode actuator (default): policy outputs the 5 MVs in contract order
+      [v_12, v_23, e_101, v_33, vfd] -> env.step writes them directly (PLC mode=rl).
+  --action-mode setpoint: policy outputs supervisory setpoints (numpy-track setpoint
+      policy) -> writes the PID *_sp vars (PLC mode=pid), PID tracks. Requires a
+      PLC backend (ia2/edge).
+  --action-mode residual: policy outputs a 2D residual [-1,1] (V-33 + heater). The
+      eval env is wrapped with ResidualEnvWrapper so the 2D action expands to the
+      full 5D physical action (model feedforward + inline PID + residual) before
+      stepping the bridge. Works on ia2 or modbus backends (the wrapper's 23D obs
+      is backend-agnostic, so a numpy-trained residual policy validates on either).
+
+The obs the policy expects depends on the training track (EnrichedObs 22-dim,
+raw 14-dim, or numpy 14-dim reconstruction).
 
 Usage:
-    python3 controllers/run_rl.py --policy controllers/policies/sac_threetank.zip --action-mode setpoint --backend ia2
-    python3 controllers/run_rl.py --action-mode actuator --backend modbus --policy controllers/policies/sac_cascade.zip
+    python3 controllers/run_rl.py --policy controllers/policies/sac_threetank_numpy.zip --backend modbus
+    python3 controllers/run_rl.py --backend ia2 --action-mode setpoint
 
 Requires either:
     1) IA2 chain up: mock_cabinet.py + ia2-server + `cs project open` + `cs run`
     2) Modbus track: mock_cabinet.py (direct control, no PLC logic)
-
-Note on edge backend: If using `--backend edge:<name>`, be aware that each
-step requires an SSH round-trip proxied through the dev server (~6 handshakes
-per 0.5 s step). For edge deployments, increase `--control-dt` to accommodate
-the network latency.
 """
 from __future__ import annotations
 
@@ -46,20 +49,25 @@ LOG = logging.getLogger("rl_supervisor")
 
 def main():
     ap = argparse.ArgumentParser(description="RL supervisor — trained policy on the IA2 or Modbus track.")
-    ap.add_argument("--policy", default=str(ROOT / "controllers" / "policies" / "sac_threetank.zip"))
+    ap.add_argument("--policy", default=str(ROOT / "controllers" / "policies" / "sac_threetank_numpy.zip"))
     ap.add_argument("--backend", default="ia2",
                     help="Communication backend: auto | ia2 | modbus | edge:<name> (default: ia2)")
-    ap.add_argument("--action-mode", default="setpoint", choices=["actuator", "setpoint"])
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--control-dt", type=float, default=0.5)
+    ap.add_argument("--action-mode", default=None, choices=["actuator", "setpoint", "residual"],
+                    help="Override the policy action mode (otherwise read from the .json sidecar).")
     args = ap.parse_args()
 
-    # B2 fix: auto-detect action mode from the metadata sidecar (saved by train_sb3.py)
+    # Resolve action mode: --action-mode flag > metadata sidecar > default actuator.
     meta_path = args.policy.replace(".zip", ".json")
-    if Path(meta_path).exists():
-        meta = json.load(open(meta_path))
-        if "action_mode" in meta:
-            args.action_mode = meta["action_mode"]
+    meta = json.load(open(meta_path)) if Path(meta_path).exists() else {}
+    if args.action_mode is not None:
+        action_mode = args.action_mode
+    else:
+        action_mode = meta.get("action_mode", "actuator")
+        if action_mode not in ("actuator", "setpoint", "residual"):
+            action_mode = "actuator"
+    track = meta.get("track", "numpy")
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -70,7 +78,8 @@ def main():
         model = SAC.load(args.policy)
     except Exception:
         model = PPO.load(args.policy)
-    LOG.info("loaded policy: %s  action_mode: %s  backend: %s", args.policy, args.action_mode, args.backend)
+    LOG.info("loaded policy: %s  action_mode: %s  backend: %s",
+             args.policy, action_mode, args.backend)
 
     cfg = json.load(open(ROOT / "ia2_config.json"))
     hsp = cfg["control"]["setpoints_m"]
@@ -78,92 +87,125 @@ def main():
     t_cold = float(cfg["process"]["t_supply_c"])
     t_amb = float(cfg["process"]["t_ambient_c"])
 
-    # Build the env. For actuator mode, use mode="rl" (writes actuator*_req).
-    # For setpoint mode, use mode="pid" (PLC PID active) but write *_sp directly
-    # (bypassing env.step's write, which uses the wrong range mapping).
-    env = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt,
-                            mode=("rl" if args.action_mode == "actuator" else "pid"))
-    b = env.backend
+    plc_mode = "pid" if action_mode == "setpoint" else "rl"
+    bridge = CascadeBridgeEnv(backend=args.backend, control_dt=args.control_dt, mode=plc_mode)
+    b = bridge.backend
+    if action_mode == "setpoint" and not b.writes_via_plc:
+        LOG.error("setpoint-mode policy requires a PLC backend (ia2/edge); the %s backend has "
+                  "no *_sp registers. Use --backend ia2, or an actuator-mode policy on modbus.",
+                  args.backend)
+        sys.exit(1)
+    env = bridge
+    if action_mode == "residual":
+        # wrap so the 2D policy action expands to the full 5D physical action
+        # (model feedforward + inline PID + V-33/heater residual) before stepping
+        # the bridge. bridge obs is interleaved; bridge action order is
+        # [V-12, V-23, E-101, V-33, VFD].
+        from controllers.residual_rl import ResidualEnvWrapper
+        from controllers.threetank_model import ThreeTankModel
+        _m = ThreeTankModel()
+        _ref = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"], *tsp]
+        # match the policy's obs: 23-D = integral terms on, 17-D = legacy policy
+        env = ResidualEnvWrapper(bridge, _m, _ref, act_idx=(4, 0, 1, 3, 2),
+                                 integral_obs=(model.observation_space.shape[0] == 23))
 
     obs, _ = env.reset()
-    LOG.info("RL supervisor start — action_mode=%s", args.action_mode)
-    rewards = []
-    steps_data = []
-
-    # Determine expected observation dimensionality from the loaded model
+    LOG.info("RL supervisor start — action_mode=%s", action_mode)
+    rewards, steps_data = [], []
     expected_shape = model.observation_space.shape
+    n_raw = bridge.observation_space.shape[0]                    # 14 bridge sensors
+    ctx_enriched = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"],
+                    *tsp, t_cold, t_amb]                         # 8 context (EnrichedObs)
+    h_sp_all = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"]]
+
+    # integral-of-error observation (numpy policies trained with integral_obs, 20-D).
+    # Replicates aiogym's _accumulate_integral: forward-Euler ∫(sp−meas)dt clamped to
+    # ±I_TEMP_MAX (300) / ±I_LEVEL_MAX (8), appended as [∫temp/300...] + [∫level/8...].
+    # Accumulated AFTER each step from the post-step state (matches aiogym's timing).
+    use_integral = (expected_shape[0] - n_raw == 6)
+    itemp = [0.0, 0.0, 0.0]
+    ilevel = [0.0, 0.0, 0.0]
+    _I_TEMP_MAX, _I_LEVEL_MAX, _idt = 300.0, 8.0, args.control_dt
+
+    def numpy_obs():
+        levels = [float(obs[0]), float(obs[2]), float(obs[4])]
+        temps = [float(obs[1]), float(obs[3]), float(obs[5])]
+        base = levels + temps + list(tsp) + h_sp_all + [t_cold, t_amb]
+        if use_integral:
+            base = base + [v / _I_TEMP_MAX for v in itemp] + [v / _I_LEVEL_MAX for v in ilevel]
+        return np.array(base, dtype=np.float32)
 
     for k in range(args.steps):
-        if expected_shape == (13,):
-            # Original AIO-Gym 13-dim obs
-            levels_list = [float(obs[0]), float(obs[2]), float(obs[4])]
-            temps_list = [float(obs[1]), float(obs[3]), float(obs[5])]
-            model_obs = np.array(
-                levels_list + temps_list + tsp + [hsp["tank1_level"], hsp["tank3_level"]] + [t_cold, t_amb],
-                dtype=np.float32)
-        else:
-            # Native 6-dim obs (used by direct Modbus/Cascade training)
-            model_obs = np.asarray(obs, dtype=np.float32)
-
+        # ---- build the observation the policy was trained on ----
+        if action_mode == "residual":
+            model_obs = np.asarray(obs, dtype=np.float32)       # wrapper returns the policy's obs (23D w/ integrals, 17D legacy)
+        elif expected_shape == (n_raw + len(ctx_enriched),):      # EnrichedObs (train_rl modbus, 22-D)
+            model_obs = np.concatenate([obs, np.array(ctx_enriched, dtype=np.float32)])
+        else:                                                   # numpy-track 14-D obs: the bridge's
+            model_obs = numpy_obs()                             # interleaved obs must be rebuilt as the
+                                                                # grouped [levels,temps,t_sp,h_sp,...] the
+                                                                # numpy policy trained on
         action, _ = model.predict(model_obs, deterministic=True)
-        action = np.clip(np.asarray(action, dtype=np.float64).flatten(), 0.0, 1.0)
+        lo, hi = (-1.0, 1.0) if action_mode == "residual" else (0.0, 1.0)
+        action = np.clip(np.asarray(action, dtype=np.float64).flatten(), lo, hi)
 
-        if args.action_mode == "actuator":
-            # action = [p1, p2, h1, h2, h3] -> env.step writes actuator*_req.
-            obs, reward, _, _, info = env.step(action)
-            raw_vars = info["raw"]  # R1 fix: use stashed read (no second read_raw)
-        else:
-            # action = [t_sp0, t_sp1, t_sp2, h_sp0, h_sp2] (SUPERVISORY order).
-            # Map to engineering ranges + write *_sp vars directly.
-            t0 = 20.0 + action[0] * 60.0   # 20-80 degC
-            t1 = 20.0 + action[1] * 60.0
-            t2 = 20.0 + action[2] * 60.0
-            h0 = 0.15 + action[3] * 0.40   # 0.15-0.55 m
-            h2 = 0.15 + action[4] * 0.40
-            b.write_register("tank1_temp_sp", int(round(t0 / 0.01)))
-            b.write_register("tank2_temp_sp", int(round(t1 / 0.01)))
-            b.write_register("tank3_temp_sp", int(round(t2 / 0.01)))
-            b.write_register("tank1_level_sp", int(round(h0 / 0.0001)))
-            b.write_register("tank3_level_sp", int(round(h2 / 0.0001)))
+        if action_mode == "setpoint":
+            # numpy setpoint policy: action = [t_sp0,t_sp1,t_sp2, h_sp0,h_sp1,h_sp2].
+            for i, name in enumerate(("tank1_level_sp", "tank2_level_sp", "tank3_level_sp")):
+                b.write_register(name, 0.15 + action[3 + i] * 0.30)
+            b.write_register("tank1_temp_sp", 20.0 + action[0] * 60.0)
             time.sleep(args.control_dt)
             raw_vars = b.read_raw()
-            obs = env._decode_obs(raw_vars)
-            sidx = {n: i for i, n in enumerate(env.sensor_names)}
-            levels = {n: float(obs[sidx[n]]) for n in env.setpoints}
-            temps = {n: float(obs[sidx[n]]) for n in env.temp_setpoints}
-            track_l = sum((levels[n] - env.setpoints[n]) ** 2 for n in env.setpoints)
-            track_t = sum((temps[n] - env.temp_setpoints[n]) ** 2 for n in env.temp_setpoints)
-            w = env.reward_weights
+            obs = bridge._decode_obs(raw_vars)
+            sidx = {n: i for i, n in enumerate(bridge.sensor_names)}
+            levels = {n: float(obs[sidx[n]]) for n in bridge.setpoints}
+            temps = {n: float(obs[sidx[n]]) for n in bridge.temp_setpoints}
+            track_l = sum((levels[n] - bridge.setpoints[n]) ** 2 for n in bridge.setpoints)
+            track_t = sum((temps[n] - bridge.temp_setpoints[n]) ** 2 for n in bridge.temp_setpoints)
+            w = bridge.reward_weights
             reward = float(-(w["level"] * track_l + w["temp"] * track_t))
-            info = {"levels_m": levels, "temps_c": temps}
-
+            info = {"levels_m": levels, "temps_c": temps, "raw": raw_vars}
+        else:
+            # actuator (5D, [0,1]) or residual (2D, [-1,1] -> wrapper expands to 5D).
+            # numpy-trained actuator policies output TRAINING order
+            # [pump, V-12, V-23, V-33, heater]; the bridge's actuator order is
+            # CONTRACT order [V-12, V-23, E-101, V-33, VFD]. Remap or the pump
+            # command lands on V-12, the heater command on the VFD, etc.
+            # (modbus-trained policies already speak contract order; residual is
+            # mapped inside ResidualEnvWrapper._to_env_action.)
+            if action_mode == "actuator" and track == "numpy":
+                env_action = np.array([action[1], action[2], action[4], action[3], action[0]])
+            else:
+                env_action = action
+            obs, reward, _, _, info = env.step(env_action)
+            raw_vars = info["raw"]
         rewards.append(reward)
-        # Applied duty for the energy KPI: read back the post-L5-shield
-        # actuator*/heater* registers (raw 0..10000 = 0..1). In setpoint mode the
-        # logged `action` holds setpoints, not duties, so report() must use this
-        # instead — feeding `action` to heater_power() would produce a meaningless
-        # excess_kwh (same fix as validate_policy.py:153-158).
-        applied_duty = [raw_vars.get(n, 0) * 1e-4
-                        for n in ("actuator1", "actuator2", "heater1", "heater2", "heater3")]
+        lv, tp = info["levels_m"], info.get("temps_c", {})
+        if use_integral:                                      # accumulate ∫(sp−meas)dt for next obs
+            _lv = [lv["tank1_level"], lv["tank2_level"], lv["tank3_level"]]
+            _tp = [tp.get("tank1_temp", 0.0), tp.get("tank2_temp", 0.0), tp.get("tank3_temp", 0.0)]
+            itemp = [float(np.clip(itemp[i] + (tsp[i] - _tp[i]) * _idt, -_I_TEMP_MAX, _I_TEMP_MAX))
+                     for i in range(3)]
+            ilevel = [float(np.clip(ilevel[j] + (h_sp_all[i] - _lv[i]) * _idt,
+                                   -_I_LEVEL_MAX, _I_LEVEL_MAX)) for j, i in enumerate((0, 1, 2))]
+        applied = [float(raw_vars.get(n, 0.0)) / bridge._act_max[n] for n in bridge.actuator_names]
         steps_data.append({
-            "step": k, "levels": [float(obs[0]), float(obs[2]), float(obs[4])],
-            "temps": [float(obs[1]), float(obs[3]), float(obs[5])],
-            "action": [float(x) for x in action], "applied_duty": applied_duty,
+            "step": k,
+            "levels": [lv["tank1_level"], lv["tank2_level"], lv["tank3_level"]],
+            "temps": [tp.get("tank1_temp", 0.0), tp.get("tank2_temp", 0.0), tp.get("tank3_temp", 0.0)],
+            "action": [float(x) for x in action], "applied_duty": applied,
             "reward": reward, "interlock": detect_interlock(raw_vars)})
         if k % 4 == 0 or k == args.steps - 1:
-            lv = info.get("levels_m", {}); tp = info.get("temps_c", {})
+            lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %3d  act=%s  levels(m)=%.3f/%.3f/%.3f  temps(C)=%.1f/%.1f/%.1f  r=%.3f",
                      k, [round(float(x), 2) for x in action],
-                     lv.get("tank1_level", float("nan")),
-                     lv.get("tank2_level", float("nan")),
-                     lv.get("tank3_level", float("nan")),
-                     tp.get("tank1_temp", float("nan")),
-                     tp.get("tank2_temp", float("nan")),
-                     tp.get("tank3_temp", float("nan")), reward)
+                     lv.get("tank1_level", float("nan")), lv.get("tank2_level", float("nan")),
+                     lv.get("tank3_level", float("nan")), tp.get("tank1_temp", float("nan")),
+                     tp.get("tank2_temp", float("nan")), tp.get("tank3_temp", float("nan")), reward)
 
-    env.close()
-    LOG.info("rollout done — mean reward = %.4f over %d steps", np.mean(rewards), args.steps)
-    model_tag = Path(args.policy).stem  # e.g. sac_threetank, ppo_cascade
+    bridge.close()
+    LOG.info("rollout done — mean reward = %.4f over %d steps", float(np.mean(rewards)), args.steps)
+    model_tag = Path(args.policy).stem
     report(steps_data, tag=f"rl_{model_tag}")
 
 

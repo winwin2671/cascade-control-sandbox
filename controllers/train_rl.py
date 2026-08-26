@@ -27,36 +27,33 @@ from aio_bridge_env import CascadeBridgeEnv  # noqa: E402
 LOG = logging.getLogger("train_rl")
 
 
-def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb):
-    """C5 fix: wrap CascadeBridgeEnv to produce the same 13-dim obs as AIO-Gym.
+def _make_enriched_env(port, control_dt, hsp, tsp, t_cold, t_amb, episode_steps=4000):
+    """Wrap CascadeBridgeEnv to append setpoint + ambient context to the raw obs.
 
-    AIO-Gym's obs = [levels(3), temps(3), t_sp(3), h_sp_ctrl(2), t_cold, t_amb].
-    The raw CascadeBridgeEnv returns 6-dim [h1,T1,h2,T2,h3,T3]. This wrapper
-    reorders to [h1,h2,h3, T1,T2,T3] and appends the 7 context values so the
-    policy trained on the Modbus track sees the same obs as the numpy track."""
+    The raw bridge obs is 14-dim (3 levels + 3 temps + 3 flows + 5 DI). We append
+    the 3 level setpoints, 3 temp setpoints, and the supply/ambient temperatures
+    (8 values) so the policy sees its targets and the heat-sink temperatures."""
     import gymnasium as gym
     from gymnasium.wrappers import TimeLimit
 
     base = CascadeBridgeEnv(backend="modbus", port=port, control_dt=control_dt)
+    n_base = base.observation_space.shape[0]
+    ctx = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"],
+           *tsp, t_cold, t_amb]
 
     class EnrichedObs(gym.ObservationWrapper):
         def __init__(self, env):
             super().__init__(env)
-            import numpy as np
             from gymnasium import spaces
-            lo = np.full(13, -np.inf, dtype=np.float32)
-            hi = np.full(13, np.inf, dtype=np.float32)
-            self.observation_space = spaces.Box(lo, hi, dtype=np.float32)
+            n = n_base + len(ctx)
+            self.observation_space = spaces.Box(
+                np.full(n, -np.inf, dtype=np.float32),
+                np.full(n, np.inf, dtype=np.float32), dtype=np.float32)
 
         def observation(self, obs):
-            # obs = [h1, T1, h2, T2, h3, T3] → [h1,h2,h3, T1,T2,T3, t_sp×3, h_sp×2, tc, ta]
-            levels = [obs[0], obs[2], obs[4]]
-            temps = [obs[1], obs[3], obs[5]]
-            h_sp_ctrl = [hsp["tank1_level"], hsp["tank3_level"]]
-            return np.array(levels + temps + list(tsp) + h_sp_ctrl + [t_cold, t_amb],
-                           dtype=np.float32)
+            return np.concatenate([obs, np.array(ctx, dtype=np.float32)])
 
-    return TimeLimit(EnrichedObs(base), max_episode_steps=200)
+    return TimeLimit(EnrichedObs(base), max_episode_steps=episode_steps)
 
 
 def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
@@ -74,7 +71,8 @@ def run_random(env, n_envs: int, steps: int, plant_dt: float) -> int:
 
 
 def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
-            plant_dt: float, total_timesteps: int, device: str = "auto") -> int:
+            plant_dt: float, total_timesteps: int, device: str = "auto",
+            residual: bool = False, episode_steps: int = 4000) -> int:
     """Train SAC or PPO on the Modbus track using SB3's own vec env (B1 fix).
 
     SB3 cannot accept gymnasium AsyncVectorEnv — it needs its own VecEnv.
@@ -99,8 +97,24 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
     # policy sees setpoints + t_cold/t_amb, not just the raw 6-dim sensors.
     # R3 fix: SubprocVecEnv (not DummyVecEnv) — each env steps in its own process,
     # so the per-step sleeps overlap (restoring the 0.5 s control period + N× throughput).
-    venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
-        base_port + i, wall_dt, hsp, tsp, t_cold, t_amb) for i in range(n_envs)])
+    if residual:
+        from controllers.residual_rl import ResidualEnvWrapper
+        from controllers.threetank_model import ThreeTankModel
+        from gymnasium.wrappers import TimeLimit
+        _model = ThreeTankModel()
+        _ref = [hsp["tank1_level"], hsp["tank2_level"], hsp["tank3_level"], *tsp]
+        # bridge obs is interleaved (contract sensor order) → default level/temp idx OK.
+        # bridge action order is [V-12, V-23, E-101, V-33, VFD]; canonical physical is
+        # [pump, V-12, V-23, V-33, heater], so map each canonical slot to its env slot.
+        venv = SubprocVecEnv([lambda i=i: TimeLimit(
+            ResidualEnvWrapper(
+                CascadeBridgeEnv(backend="modbus", port=base_port + i, control_dt=wall_dt),
+                _model, _ref, act_idx=(4, 0, 1, 3, 2)), max_episode_steps=episode_steps)
+            for i in range(n_envs)])
+    else:
+        venv = SubprocVecEnv([lambda i=i: _make_enriched_env(
+            base_port + i, wall_dt, hsp, tsp, t_cold, t_amb, episode_steps)
+            for i in range(n_envs)])
 
     if algo == "sac":
         model = SAC("MlpPolicy", venv, device=device, verbose=1, learning_starts=2000,
@@ -111,13 +125,16 @@ def run_sb3(algo: str, pool, n_envs: int, base_port: int, time_scale: float,
                     policy_kwargs=dict(net_arch=[256, 256]))
 
     model.learn(total_timesteps=total_timesteps)
-    out = str(ROOT / "controllers" / "policies" / f"{algo}_cascade")
+    # suffix carries the track so modbus policies never collide with the numpy
+    # ones (train_sb3.py writes _threetank_numpy / _residual_numpy)
+    suffix = "residual_modbus" if residual else "threetank_modbus"
+    out = str(ROOT / "controllers" / "policies" / f"{algo}_{suffix}")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
     import json
     with open(out + ".json", "w") as f:
-        json.dump({"action_mode": "actuator", "reward_mode": "track",
-                   "algo": algo, "track": "modbus"}, f)
+        json.dump({"action_mode": "residual" if residual else "actuator",
+                   "reward_mode": "track", "algo": algo, "track": "modbus"}, f)
     print(f"{algo.upper()} trained for {total_timesteps} steps; saved to {out}.zip")
     print("(validate it in the IA2 track: load the policy + run it via the RL mode.)")
     return 0
@@ -131,8 +148,20 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=200, help="vec-steps (random policy)")
     ap.add_argument("--algo", default="random", choices=["random", "ppo", "sac"])
     ap.add_argument("--total-timesteps", type=int, default=20000, help="PPO total timesteps")
+    ap.add_argument("--episode-steps", type=int, default=4000,
+                    help="steps per episode (4000 = 2000 s plant time; the thermal loop "
+                         "needs >=4000 for the temperature term to be learnable — at 200 "
+                         "steps temp rises ~2 C and the policy learns nothing about heat)")
     ap.add_argument("--device", default="auto", help="cuda | cpu | mps (default: auto)")
+    ap.add_argument("--residual", action="store_true",
+                    help="use xinji's residual RL (2D action: V-33 + heater on top of model feedforward)")
     args = ap.parse_args()
+
+    # footgun guard: --algo defaults to "random" (throughput check). Someone
+    # passing --residual / --episode-steps almost certainly meant to train.
+    if args.algo == "random" and (args.residual or args.episode_steps != ap.get_default("episode_steps")):
+        ap.error("--residual/--episode-steps require --algo sac|ppo (default algo is 'random', "
+                 "which only runs the throughput check)")
 
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -143,7 +172,8 @@ def main() -> None:
         pool = CabinetPool(args.n_envs, args.time_scale).start()
         try:
             rc = run_sb3(args.algo, pool, args.n_envs, 5200, args.time_scale,
-                         args.plant_dt, args.total_timesteps, device=args.device)
+                         args.plant_dt, args.total_timesteps, device=args.device,
+                         residual=args.residual, episode_steps=args.episode_steps)
         finally:
             pool.close()
     else:
