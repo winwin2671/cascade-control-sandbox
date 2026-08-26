@@ -73,7 +73,7 @@ def main():
                    "v_23_cmd": act["valves"][1], "v_33_cmd": act["valves"][2],
                    "e_101_cmd": act["heaters"][0]}
         a = [float(by_name[n]) for n in env.actuator_names]
-        obs, reward, _, _, info = env.step(a)
+        obs, _, _, _, info = env.step(a)
         if k % 4 == 0 or k == args.steps - 1:
             lv, tp = info["levels_m"], info.get("temps_c", {})
             LOG.info("step %2d  solve=%.2fs  act=%s  levels(m)=%.3f/%.3f/%.3f  "

@@ -34,6 +34,8 @@ fi
 ALGO="sac"
 TRAIN_TRACK="numpy"
 RESIDUAL=false
+STEPS_SET=false
+[ -n "${STEPS:-}" ] && STEPS_SET=true   # STEPS env var counts as user-supplied
 STEPS="${STEPS:-20}"
 
 # Parse optional flags (Minor/#6: missing values get a clear message instead of a
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --step|--steps)
       need_val "$@"
       STEPS="$2"
+      STEPS_SET=true
       shift 2
       ;;
     *)
@@ -76,6 +79,14 @@ case "$MODE" in
   pid|manual|rl|mpc|nmpc|modbus|gui) ;;
   *) echo "usage: $0 [pid|manual|rl|mpc|nmpc|modbus|gui] [--algo sac|ppo] [--train_track numpy|modbus] [--residual] [--steps N]  (got: $MODE)"; exit 2 ;;
 esac
+
+# #6-re: per-mode rollout default. The mpc/nmpc supervisors' own default is 40
+# steps; wiring the global 20 through --steps silently halved their KPI window
+# (transient-dominated: MPC avg level err 5.7 cm at 40 steps vs 1.77 at 200),
+# making reports incomparable. Only a user-supplied --steps / $STEPS overrides.
+if [ "$STEPS_SET" != true ] && { [ "$MODE" = "mpc" ] || [ "$MODE" = "nmpc" ]; }; then
+  STEPS=40
+fi
 
 # Determine if we need the IA2 server running
 NEEDS_IA2=true

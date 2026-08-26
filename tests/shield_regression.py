@@ -15,6 +15,12 @@ outputs), asserting the shield's response each time:
   S2  dry-fire              — heater cut, pump NOT cut (the refill path survives)
   S3  e-stop (forced DI)    — pressing (di_estop=0 via cs force) latches all
                               three trips; releasing recovers
+  S4  SV enable gate        — sv_*_cmd := sv_*_req AND test_sv_en: a request
+                              with the gate closed must NOT energize the coil;
+                              enabling passes it through; clearing the gate
+                              drops it (#6-re: smoke_sv drives coils over
+                              Modbus with no PLC, so this is the gate's only
+                              automated coverage)
 
 Exit code 1 on any assertion failure. Slow-ish (~2-3 min): it runs the real PLC
 scan loop against real physics (4x time-scale).
@@ -232,6 +238,30 @@ def main() -> int:
         print(f"  S3 e-stop (forced DI): press cuts pump+heater, release recovers "
               f"{'OK' if not s3_bad else 'FAIL'}")
 
+        # ---- S4: SV enable gate (sv_*_cmd := sv_*_req AND test_sv_en) -------
+        # reset() closes the SVs; test_sv_en is FALSE from the POU power-on
+        # default (nothing in S0-S3 writes it), so the request below must be
+        # gated OFF the coil until the master enable is set.
+        env.reset()
+        env.set_test_valve("sv_1_cmd", True)
+        rr4 = sraw(step([0.5, 0.5, 0.4, 0.5, 0.6], n=4))
+        s4_bad = []
+        if bool(rr4.get("sv_1_cmd", False)):
+            s4_bad.append("sv_1_cmd energized with test_sv_en=FALSE (gate broken)")
+        env.set_test_valves_enabled(True)
+        rr4 = sraw(step([0.5, 0.5, 0.4, 0.5, 0.6], n=4))
+        if not bool(rr4.get("sv_1_cmd", False)):
+            s4_bad.append("sv_1_cmd NOT energized after test_sv_en=TRUE "
+                          "(iomap coil output or gate broken)")
+        env.set_test_valves_enabled(False)
+        rr4 = sraw(step([0.5, 0.5, 0.4, 0.5, 0.6], n=4))
+        if bool(rr4.get("sv_1_cmd", False)):
+            s4_bad.append("sv_1_cmd stayed ON after test_sv_en cleared")
+        env.set_test_valve("sv_1_cmd", False)   # leave the plant clean
+        fails.extend(f"S4: {m}" for m in s4_bad)
+        print(f"  S4 SV enable gate: gated off -> enabled on -> gate-clear off "
+              f"{'OK' if not s4_bad else 'FAIL'}")
+
         env.close()
     except Exception as e:
         fails.append(f"harness: {e}")
@@ -241,8 +271,8 @@ def main() -> int:
     if fails:
         print(f"\n{RED}{BOLD}FAIL{RESET}: " + "; ".join(fails))
         return 1
-    print(f"\n{GREEN}{BOLD}PASS{RESET}: shield regression S0-S3 — ST safety layer verified "
-          f"through the real PLC scan loop.")
+    print(f"\n{GREEN}{BOLD}PASS{RESET}: shield regression S0-S4 — ST safety layer + SV gate "
+          f"verified through the real PLC scan loop.")
     return 0
 
 

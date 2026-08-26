@@ -25,10 +25,11 @@ _SQRT_FLOOR = 1e-9
 # flowing at level 0) and the pump cannot draw from an empty reservoir.
 _LEVEL_EPS = 0.02
 # P1/#6-re: pump gate ramp width in net head (dimensionless, nh spans [-0.2, 1]).
-# 0.01 spans duty u* -> u*+0.003 (~0.3% of the action box) where the true curve
-# delivers <= 7 L/min on a 67 L/min pump. Narrower (5e-4) left curvature ~1/eps
-# that stalled IPOPT on high-level starts; wider is curve-fidelity loss for
-# nothing. See compute_flows.
+# 0.01 spans duty u* -> u*+0.010 (~1.0% of the action box; dnh/du = 20u/8.3
+# ≈ 0.994 at u*) where the true curve delivers <= 6.7 L/min on a 67 L/min
+# pump. Narrower (5e-4) left curvature ~1/eps that stalled IPOPT on high-level
+# starts; wider is curve-fidelity loss for nothing. See compute_flows.
+# (#6-re: the old "~0.3% of the action box" note was wrong — re-derived.)
 _PUMP_GATE_EPS = 0.01
 # P1/#6-re: the weir gates get their own, much narrower ramp. The tank-drain
 # _LEVEL_EPS (0.02 m) is wider than the entire reachable weir band
@@ -147,10 +148,12 @@ def compute_flows(x, pump_frac, valve_fracs, heater_frac, p, ops,
     # and the NMPC's drain-regime optimum sits exactly on that corner — IPOPT
     # cannot close the RK4 defects across it (measured: constraint-violation
     # flutter at ~4e-4 out to max-iter, 40 s per stalled solve, on high-level
-    # starts). The C1 gate's price is a ~1e-5 L/min residue at duty 0.0 (2e-7 of
-    # q_max; idle drift < 0.002 cm/day, 10^6x below the phantom it kills) — so
-    # the mock's contactor DI is keyed on the pump COMMAND instead, which is the
-    # physical contactor anyway (it stays closed at sub-deadband speed with zero
+    # starts). The C1 gate's price is a 9e-6 L/min residue at duty 0.0 (1.4e-7
+    # of q_max; idle drift 0.0165 cm/day — still ~8300x below the 0.074 L/min
+    # phantom it kills; #6-re re-measured: the old "<0.002 cm/day" was 8x low)
+    # — so the mock's contactor DI is keyed on the pump COMMAND instead, which
+    # is the physical contactor anyway (it stays closed at sub-deadband speed
+    # with zero
     # flow). Above the 0.01-wide ramp the curve is unbiased to ~1e-7 rel, and no
     # constant-floor subtraction bias exists.
     # M1/#6: gated on the reservoir level — no pumping from an empty reservoir.

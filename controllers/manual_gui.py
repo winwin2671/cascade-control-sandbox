@@ -239,10 +239,12 @@ class ManualGUI:
         self.scorer.step_penalty(levels, temps, H_SP, T_SP,
                                   heat_w, ideal_w, False, self.env.control_dt)
 
-        # Collect data
+        # Collect data (no reward key: it's an RL-only concept and the report
+        # gates on its presence — stuffing 0.0 printed a meaningless
+        # "mean reward 0.0000" + zeroed CSV column + flatline panel)
         self.steps_data.append({
             "step": self.k, "levels": levels, "temps": temps,
-            "action": action, "reward": 0.0})
+            "action": action})
         for i in range(3):
             self.hist_h[i].append(levels[i])
             self.hist_t[i].append(temps[i])

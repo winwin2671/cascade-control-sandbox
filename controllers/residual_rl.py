@@ -25,6 +25,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+from controllers.threetank_dynamics import _PUMP_GATE_EPS  # C1 gate width (shared physics)
+
 
 # ---- Constants (from xinji's TANK3_INTERNAL_CONTROL + definition.py) ----
 _PUMP_KP = 0.08           # pump PID gain (Tank1 level tracking)
@@ -106,7 +108,8 @@ def tracking_steady_state_action(model, y_sp):
 
     Steady-state assumptions: q_pump = q_12 = q_23 = q_3r = q (mass balance).
     Thermal: RHO_CP × q × (T_upstream − T_downstream) = UA × (T_downstream − T_amb).
-    Pump curve: q = q_max × √((shutoff×u² − static)/(shutoff − static)).
+    Pump curve: the GATED q_max × √nh × min(1, nh/_PUMP_GATE_EPS) — the nominal
+    operating point sits inside the C1 ramp, where q = q_max·nh^(3/2)/eps.
     Valve flow: q = cv × u × √(level + gravity_drop).
     """
     levels = [float(v) for v in y_sp[:3]]
@@ -134,11 +137,25 @@ def tracking_steady_state_action(model, y_sp):
         # that holds the per-stage drop at ~0.5 C instead.
         q = model.ua * (temps[0] - t_amb) / (rho_cp * 0.5) if temps[0] > t_amb else model.q_max * 0.2
 
-    pump = math.sqrt(
-        (model.pump_static_head
-         + (model.pump_shutoff_head - model.pump_static_head) * (q / model.q_max) ** 2)
-        / model.pump_shutoff_head
-    )
+    # #6-re: invert the GATED pump curve, not the bare quadratic. The C1 gate
+    # (threetank_dynamics._PUMP_GATE_EPS = 0.01 on net head) attenuates flow
+    # inside its ramp: q = q_max·nh^(3/2)/eps below nh = eps, q_max·√nh above.
+    # The nominal operating point lands INSIDE the ramp (shipped setpoints need
+    # ~2.3 L/min → nh ≈ 0.005), where the old ungated inversion returned a duty
+    # that pumped 0.34 L/min against the 2.30 target — an 85% shortfall that
+    # silently skewed the feedforward and model_optimal's reward anchor.
+    if q <= 0.0:
+        pump = 0.0
+    else:
+        if q < model.q_max * math.sqrt(_PUMP_GATE_EPS):
+            nh = (q * _PUMP_GATE_EPS / model.q_max) ** (2.0 / 3.0)  # ramp branch
+        else:
+            nh = (q / model.q_max) ** 2                              # true curve
+        pump = math.sqrt(
+            (model.pump_static_head
+             + (model.pump_shutoff_head - model.pump_static_head) * nh)
+            / model.pump_shutoff_head
+        )
 
     cvs = [model.c_v12, model.c_v23, model.c_v33]
     valves = []

@@ -12,6 +12,12 @@
   On/off interlock-test solenoids SV-1..3 (DO coils, parallel to V-12/V-23/
   V-33) sit OUTSIDE the mode selector: test instrumentation only, gated by
   test_sv_en (see the SV section near the end of the body).
+  History: the manstations run balance := FALSE. The earlier balance :=
+  (mode <= 1) (the C9 fix, #2 cycle) was safe on the old plant ONLY because
+  every station's auto request came from a tracking PID, which bounds the
+  flip-edge corr to ~one PID increment — V-33 (constant open-loop 100)
+  violated that condition and deadlocked. If balance ever returns, "every
+  auto request tracks its actuator" must hold for every station.
 
   Sensor channels are f32 (REAL POU vars, engineering units). Actuator channels
   are u16/FC06 holding registers, raw 0..10000 = 0..100% (MD200-style). So the
