@@ -90,21 +90,23 @@ def build_rows(proc: dict, table: list) -> list[dict]:
     return rows
 
 
-def render(rows: list[dict], placeholders: set[str], notes: dict[str, str]) -> str:
-    def cell(v):
-        if isinstance(v, list):
-            return "[" + ", ".join(_fmt(x) for x in v) + "]"
-        return _fmt(v)
+def _cell(v) -> str:
+    if isinstance(v, list):
+        return "[" + ", ".join(_fmt(x) for x in v) + "]"
+    return _fmt(v)
 
+
+def render_rows(rows: list[dict], placeholders: set[str], notes: dict[str, str],
+                w_name: int, w_val: int) -> str:
+    """Data rows only (no header) — both sections share one column width and
+    one header, printed once above the core table."""
     marked = [r | {"star": any(k in placeholders for k in r["keys"])} for r in rows]
-    w_name = max(len(r["name"]) for r in marked)
-    w_val = max(len(cell(r["value"])) for r in marked)
-    # last column stays unpadded (no trailing spaces) — the * / note trail it
-    lines = [f"{'NAME':<{w_name}}  {'VALUE':<{w_val}}  UNIT"]
+    lines = []
     for r in sorted(marked, key=lambda r: r["name"]):
         star = " *" if r["star"] else ""
         note = f"  # {notes[r['name']]}" if r["name"] in notes else ""
-        lines.append((f"{r['name']:<{w_name}}  {cell(r['value']):<{w_val}}  "
+        # last column stays unpadded (no trailing spaces) — the * / note trail it
+        lines.append((f"{r['name']:<{w_name}}  {_cell(r['value']):<{w_val}}  "
                       f"{r['unit']}{star}{note}").rstrip())
     return "\n".join(lines)
 
@@ -130,10 +132,15 @@ def main(argv: list[str]) -> int:
         }, indent=1))
         return 0
 
+    # one header + one shared column width across both sections
+    w_name = max(len(r["name"]) for r in core + ext)
+    w_val = max(len(_cell(r["value"])) for r in core + ext)
     print("tank-system parameters (scenario 'threetank', heated cascade)")
-    print(render(core, placeholders, {"level_sensor_range": LEVEL_SENSOR_NOTE}))
-    print("\nheated-cascade additions (not present in xinji's three_tank)")
-    print(render(ext, placeholders, {}))
+    print(f"{'NAME':<{w_name}}  {'VALUE':<{w_val}}  UNIT")
+    print(render_rows(core, placeholders, {"level_sensor_range": LEVEL_SENSOR_NOTE},
+                      w_name, w_val))
+    
+    print(render_rows(ext, placeholders, {}, w_name, w_val))
     if placeholders:
         print("\n*  physics-derived estimate — pending bench SAT measurement "
               "(config process._placeholders)")
