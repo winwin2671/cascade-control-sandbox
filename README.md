@@ -442,7 +442,8 @@ cascade-control-sandbox/
 ├── disturbance_sidecar.py     # random SV-1..3 valve-fault injection (--disturbance)
 ├── run_mode.sh                # boot + run one controller + teardown (one command)
 ├── tools/
-│   └── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
+│   ├── gen_ia2_artifacts.py   # contract → device/iomap TOMLs (+ ST VAR check)
+│   └── list_params.py         # physical-parameter table (xinji 'list parameters' shape)
 ├── controllers/
 │   ├── threetank_model.py     # numpy heated serial-cascade plant (AIO-Gym model interface)
 │   ├── threetank_dynamics.py  # shared 8-dim ODE (numpy + CasADi ops) — one physics source
@@ -505,6 +506,11 @@ cd ia2 && cargo build --release && cd ..
 
 # regenerate the IA2 device/iomap TOMLs from the contract
 python3 tools/gen_ia2_artifacts.py
+
+# list the tank-system physical parameters (AIO-Gym 'list parameters' shape,
+# xinji-compatible names — ready to diff against three_tank or the measured
+# rig once physical parameters are final; `*` rows are SAT-pending estimates)
+python3 tools/list_params.py [--json]
 ```
 
 **RL training (optional — heavy deps):**
