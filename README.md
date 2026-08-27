@@ -179,10 +179,15 @@ python3 controllers/validate_policy.py --policy controllers/policies/sac_threeta
 ### Disturbance / interlock testing (`--disturbance`)
 
 Add `--disturbance` to any mode to run [`disturbance_sidecar.py`](disturbance_sidecar.py) in the
-background alongside the controller: each interlock-test solenoid SV-1..3 follows an independent
-random telegraph (random start delay → OPEN for 2–6 s → CLOSED for 10–25 s → repeat), injecting
-valve faults so you can watch how the control model rejects them — levels drift on the bypass
-path, FT-10x see the extra flow, and LSH/LSL trips become reachable.
+background alongside the controller. The schedule mirrors AIO-Gym's auto-events (`_autoTick`):
+a single event clock fires every 10–32 s; each event closes every SV then either opens **one**
+valve (uniform among the chosen set — the fault persists until the *next* event clears it) or
+declares a **quiet period** (~30% of events) so the plant gets recovery time. One fault at a
+time, never overlapping — like real process control, where an equipment fault latches until
+cleared. Levels drift on the bypass path, FT-10x see the extra flow, and LSH/LSL trips become
+reachable. At the default cadence a 60-step (30 s) run sees only ~1 event — for controller
+comparisons either lengthen the run or compress the clock, e.g.
+`DISTURBANCE_ARGS="--event-min 4 --event-max 10" ./run_mode.sh mpc --steps 200 --disturbance`.
 
 - **Write path follows the track** (derived from the mode): on IA2 modes the PLC owns the SV
   coils, so the sidecar writes the PLC-internal `sv_*_req` vars + `test_sv_en` gate through the
@@ -190,8 +195,8 @@ path, FT-10x see the extra flow, and LSH/LSL trips become reachable.
   slave-07 FC05 coils directly. Never write the coils directly while the PLC runs — its scan
   reclaims them.
 - **Reproducible**: the seed is printed and logged; replay a run with `--seed N` (plus the same
-  `--valves` and hold ranges, all captured in the JSONL header). Tune the sidecar via
-  `DISTURBANCE_ARGS` (e.g. `DISTURBANCE_ARGS="--seed 42 --open-min 4" ./run_mode.sh pid --disturbance`)
+  `--valves`, `--event-min/max`, and `--quiet-prob`, all captured in the JSONL header). Tune the
+  sidecar via `DISTURBANCE_ARGS` (e.g. `DISTURBANCE_ARGS="--seed 42 --event-min 4" ./run_mode.sh pid --disturbance`)
   or run it standalone against real hardware: `python3 disturbance_sidecar.py --backend modbus
   --host <gateway>` (or `--backend ia2 --server <url>`).
 - **Survives resets**: the intended valve state is re-asserted every 0.5 s, so `env.reset()`

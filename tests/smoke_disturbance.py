@@ -2,12 +2,12 @@
 """Smoke test: the disturbance sidecar drives the SV coils on schedule.
 
 Cabinet-only (modbus track). Launches disturbance_sidecar.py as a subprocess
-with a fixed seed and fast holds, then asserts:
+with a fixed seed and a fast event clock, then asserts:
   1. determinism — the JSONL event sequence is identical to the pure
      simulate() oracle for the same seed/params/valves (the replay contract);
-  2. command-following — coil read-back matches the schedule at every
-     observer sample (guard band around each transition), and sv_2 stays
-     closed throughout (--valves subset honored);
+  2. command-following — coil read-back matches the event schedule at every
+     observer sample (guard band around each event), including quiet periods,
+     and sv_2 stays closed throughout (--valves subset honored);
   3. the disturbance moves the plant — FT-101 >= 5 L/min while SV-1's coil
      is energized (same threshold smoke_sv proves on this reset state);
   4. cleanup — after the --duration exit every coil reads False.
@@ -27,17 +27,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from aio_bridge_env import ModbusBackend, load_config  # noqa: E402
-from disturbance_sidecar import TelegraphParams, simulate  # noqa: E402
+from disturbance_sidecar import DisturbParams, simulate  # noqa: E402
 
 GREEN, RED, BOLD, RESET = "\033[32m", "\033[31m", "\033[1m", "\033[0m"
 
-SEED = 7
-PARAMS = TelegraphParams(seed=SEED, valves=("sv_1", "sv_3"),
-                         start_min=0.2, start_max=0.4,
-                         open_min=1.0, open_max=1.2,
-                         closed_min=1.0, closed_max=1.2)
-DURATION_S = 5.0
-GUARD_S = 0.4          # samples this close to a transition are not asserted
+SEED = 42
+PARAMS = DisturbParams(seed=SEED, valves=("sv_1", "sv_3"),
+                       event_min=0.8, event_max=1.4, quiet_prob=0.25)
+DURATION_S = 7.0
+GUARD_S = 0.3          # samples this close to an event are not asserted
 
 
 def main() -> int:
@@ -83,9 +81,8 @@ def main() -> int:
         cmd = [sys.executable, "-u", str(ROOT / "disturbance_sidecar.py"),
                "--backend", "modbus", "--host", host, "--port", str(port),
                "--seed", str(SEED), "--valves", "1,3",
-               "--start-min", "0.2", "--start-max", "0.4",
-               "--open-min", "1.0", "--open-max", "1.2",
-               "--closed-min", "1.0", "--closed-max", "1.2",
+               "--event-min", "0.8", "--event-max", "1.4",
+               "--quiet-prob", "0.25",
                "--duration", str(DURATION_S), "--heartbeat", "0.2",
                "--log", str(log)]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -119,21 +116,23 @@ def main() -> int:
         fails.append(f"{len(events)} JSONL events vs {len(expected)} oracle events")
     else:
         for got, want in zip(events, expected):
-            if (got["valve"], got["state"] == "open") != (want.valve, want.opened) \
+            want_state = "open" if want.valve else "quiet"
+            if (got["valve"], got["state"]) != (want.valve, want_state) \
                     or abs(got["t"] - want.t) > 1e-3:
                 fails.append(f"event mismatch: JSONL {got} vs oracle {want}")
                 break
 
     # ---- 2. command-following against the schedule ----
     t0 = header["t0_epoch"]
-    boundaries = [tr.t for tr in expected] + [DURATION_S]   # duration end = shutdown edge
+    boundaries = [ev.t for ev in expected] + [DURATION_S]   # duration end = shutdown edge
 
     def intended(valve: str, rel: float) -> bool:
-        state = False
-        for tr in expected:
-            if tr.valve == valve and tr.t <= rel:
-                state = tr.opened
-        return state
+        # the last event at/before rel decides: its valve is open until the next
+        active = None
+        for ev in expected:
+            if ev.t <= rel:
+                active = ev.valve
+        return active == valve
 
     checked = 0
     ft101_open_max = 0.0
@@ -171,11 +170,11 @@ def main() -> int:
         if raw[n]:
             fails.append(f"{n} still energized after sidecar exit")
 
-    print(f"  schedule: {len(expected)} transitions, {checked}/{len(samples)} "
+    print(f"  schedule: {len(expected)} events, {checked}/{len(samples)} "
           f"samples asserted (rest inside the ±{GUARD_S}s guard)")
-    for tr in expected:
-        print(f"    t=+{tr.t:.3f}s {tr.valve.replace('sv_', 'SV-').upper()} "
-              f"{'OPEN' if tr.opened else 'CLOSED'} (hold {tr.next_hold:.2f}s)")
+    for ev in expected:
+        what = (ev.valve.replace("sv_", "SV-").upper() + " OPEN") if ev.valve else "quiet"
+        print(f"    t=+{ev.t:.3f}s EVENT {what} (next in {ev.next_in:.2f}s)")
     print(f"  FT-101 while SV-1 energized: max {ft101_open_max:.2f} L/min")
 
     if fails:

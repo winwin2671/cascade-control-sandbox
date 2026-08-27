@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Disturbance sidecar: random valve-fault injection through SV-1..3.
 
-Runs each interlock-test solenoid as an independent random telegraph —
-random start delay -> OPEN -> random hold -> CLOSED -> random hold -> repeat
-— to simulate on/off valve faults while a controller runs, so the control
-model's fault response can be observed (levels drift, FT-10x see the bypass
-flow, LSH/LSL trips become reachable). Designed to run in the background
-next to run_mode.sh's foreground controller (`--disturbance`), but is a
-plain standalone script: point --host/--port at a real cabinet or --server
-at a real IA2/edge runtime for hardware testing.
+AIO-Gym-style auto-disturbance events (mirrors its _autoTick semantics): a
+single event clock fires every 10-32 s (tunable); each event closes every SV
+then either opens ONE valve — uniform among --valves, persisting until the
+NEXT event — or declares a quiet period (default 30% of events) so the plant
+gets recovery time. One fault at a time, never overlapping — closer to real
+process control than per-valve telegraphs: equipment faults latch until
+cleared, and quiet stretches let the controller settle between them. Levels
+drift on the bypass path, FT-10x see the extra flow, LSH/LSL trips become
+reachable. Designed to run in the background next to run_mode.sh's
+foreground controller (`--disturbance`), but is a plain standalone script:
+point --host/--port at a real cabinet or --server at a real IA2/edge runtime
+for hardware testing.
 
 Write paths (pick with --backend; run_mode.sh derives it from the mode):
   ia2    PLC owns the coils — threetank.st drives `sv_*_cmd := sv_*_req AND
@@ -62,72 +66,65 @@ MAX_CONSEC_FAILURES = 3    # failed writes in a row -> give up loudly
 # Schedule core — pure, shared by the runtime loop and the smoke-test oracle.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class TelegraphParams:
+class DisturbParams:
     seed: int
     valves: tuple[str, ...]                # participating valves, canonical order
-    start_min: float
-    start_max: float
-    open_min: float                        # hold range while OPEN (fault duration)
-    open_max: float
-    closed_min: float                      # hold range while CLOSED (recovery time)
-    closed_max: float
+    event_min: float                       # inter-event interval range (s) — the
+    event_max: float                       # fault duration AND recovery ceiling
+    quiet_prob: float                      # P(event is a quiet period, no fault)
 
 
 @dataclass(frozen=True)
-class Transition:
+class DisturbEvent:
     t: float          # scheduled time (s since arm; the write lands <=0.1 s later)
-    valve: str
-    opened: bool
-    next_hold: float  # hold drawn for the state this transition entered
+    valve: str | None # opened valve, or None for a quiet period (all closed)
+    next_in: float    # interval drawn from this event to the next one
 
 
-class TelegraphPlan:
-    """N independent random telegraphs over one random.Random(seed).
+class EventPlan:
+    """One global event clock over one random.Random(seed).
 
-    Draws are taken lazily in a fixed sequence — earliest deadline first,
-    ties broken by valve index — so wall-clock jitter changes WHEN draws
-    happen but never their order: `--seed` replay is exact. Both the runtime
-    loop (poll with a monotonic clock) and simulate() (virtual clock stepping
-    event-to-event) drive the same _fire(), consuming identical draws.
+    AIO-Gym _autoTick semantics: every event clears all SVs, then either
+    opens ONE valve (uniform among params.valves — the fault persists until
+    the NEXT event clears it) or is a quiet period. Draws are taken lazily
+    in a fixed sequence — quiet-coin, valve pick, next interval — so
+    wall-clock jitter changes WHEN draws happen but never their order:
+    `--seed` replay is exact. The runtime loop (monotonic clock) and
+    simulate() (virtual clock) drive the same _fire(), identical draws.
     """
 
-    def __init__(self, params: TelegraphParams):
+    def __init__(self, params: DisturbParams):
         self.params = params
         self.rng = random.Random(params.seed)
-        self.opened = {v: False for v in params.valves}
-        self.deadline = {v: self._draw(params.start_min, params.start_max)
-                         for v in params.valves}  # start delays, valve order
+        self._next = self.rng.uniform(params.event_min, params.event_max)
 
-    def _draw(self, lo: float, hi: float) -> float:
-        return self.rng.uniform(lo, hi)
+    def poll(self, now: float) -> list[DisturbEvent]:
+        """Fire the event due at/ before `now` (at most one per poll)."""
+        if self._next > now:
+            return []
+        return [self._fire()]
 
-    def _fire(self, valve: str) -> Transition:
-        """Flip `valve` at its (due) deadline and draw the next hold."""
+    def _fire(self) -> DisturbEvent:
         p = self.params
-        t = self.deadline[valve]
-        self.opened[valve] = not self.opened[valve]
-        lo, hi = (p.open_min, p.open_max) if self.opened[valve] else (p.closed_min, p.closed_max)
-        hold = self._draw(lo, hi)
-        self.deadline[valve] = t + hold
-        return Transition(t=t, valve=valve, opened=self.opened[valve], next_hold=hold)
-
-    def poll(self, now: float) -> list[Transition]:
-        """Fire every valve whose deadline is due, in canonical valve order."""
-        return [self._fire(v) for v in self.params.valves if self.deadline[v] <= now]
+        t = self._next
+        quiet = self.rng.random() < p.quiet_prob
+        valve = None if quiet else p.valves[int(self.rng.random() * len(p.valves))]
+        self._next = t + self.rng.uniform(p.event_min, p.event_max)
+        return DisturbEvent(t=t, valve=valve, next_in=self._next - t)
 
     def next_deadline(self) -> float:
-        return min(self.deadline.values())
+        return self._next
 
 
-def simulate(params: TelegraphParams, duration: float) -> list[Transition]:
-    """Materialize the schedule up to `duration` — the replay oracle.
+def simulate(params: DisturbParams, duration: float) -> list[DisturbEvent]:
+    """Materialize the event schedule up to `duration` — the replay oracle.
 
-    Walks a virtual clock event-to-event (same earliest-deadline/index rule
-    as the runtime loop), so its transitions are bit-identical to what a run
-    with the same seed/params/valves produces.
+    Walks a virtual clock event-to-event (same draw sequence as the runtime
+    loop), so its events are bit-identical to what a run with the same
+    seed/params/valves produces.
     """
-    plan = TelegraphPlan(params)
-    out: list[Transition] = []
+    plan = EventPlan(params)
+    out: list[DisturbEvent] = []
     while plan.next_deadline() < duration:
         out.extend(plan.poll(plan.next_deadline()))
     return out
@@ -216,15 +213,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="participating valves, e.g. 1,3 or sv_1,sv_3. Default all.")
     p.add_argument("--seed", type=int, default=None,
                    help="schedule seed (default: random, printed + logged for replay).")
-    p.add_argument("--start-min", type=float, default=3.0,
-                   help="min start delay per valve, s (default %(default)s).")
-    p.add_argument("--start-max", type=float, default=8.0)
-    p.add_argument("--open-min", type=float, default=2.0,
-                   help="min OPEN hold, s (default %(default)s).")
-    p.add_argument("--open-max", type=float, default=6.0)
-    p.add_argument("--closed-min", type=float, default=10.0,
-                   help="min CLOSED hold, s (default %(default)s).")
-    p.add_argument("--closed-max", type=float, default=25.0)
+    p.add_argument("--event-min", type=float, default=10.0,
+                   help="min inter-event interval, s (default %(default)s). The "
+                        "interval is both the fault duration and the recovery "
+                        "ceiling — a fault persists until the next event.")
+    p.add_argument("--event-max", type=float, default=32.0,
+                   help="max inter-event interval, s (default %(default)s).")
+    p.add_argument("--quiet-prob", type=float, default=0.3,
+                   help="P(an event is a quiet period — all SVs closed, no fault), "
+                        "default %(default)s. Recovery time between faults.")
     p.add_argument("--heartbeat", type=float, default=0.5,
                    help="intended-state re-assert period, s (default %(default)s). "
                         "Survives env.reset() closing the SVs at episode start.")
@@ -237,12 +234,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="also log heartbeat re-asserts.")
     args = p.parse_args(argv)
 
-    for lo, hi, what in ((args.start_min, args.start_max, "start"),
-                         (args.open_min, args.open_max, "open"),
-                         (args.closed_min, args.closed_max, "closed")):
-        if not (0.0 < lo <= hi):
-            p.error(f"--{what}-min/--{what}-max must satisfy 0 < min <= max "
-                    f"(got {lo}/{hi})")
+    if not (0.0 < args.event_min <= args.event_max):
+        p.error(f"--event-min/--event-max must satisfy 0 < min <= max "
+                f"(got {args.event_min}/{args.event_max})")
+    if not (0.0 <= args.quiet_prob < 1.0):
+        p.error(f"--quiet-prob must be in [0, 1) (got {args.quiet_prob})")
     if args.heartbeat <= 0.0:
         p.error("--heartbeat must be > 0")
     if args.duration is not None and args.duration <= 0.0:
@@ -275,7 +271,7 @@ class Stopper:
         signal.signal(signal.SIGTERM, _handler)
 
 
-def verify_closed(writer: DisturbanceWriter, params: TelegraphParams) -> None:
+def verify_closed(writer: DisturbanceWriter, params: DisturbParams) -> None:
     """Confirm the arm writes reached the plant (read-back, with retry).
 
     On ia2 the POU needs one 50 ms scan for sv_*_req/test_sv_en to show up,
@@ -308,11 +304,10 @@ def run(argv: list[str]) -> int:
     resolve_targets(args, cfg)
 
     seed = args.seed if args.seed is not None else secrets.randbits(31)
-    params = TelegraphParams(
+    params = DisturbParams(
         seed=seed, valves=tuple(args.valves),
-        start_min=args.start_min, start_max=args.start_max,
-        open_min=args.open_min, open_max=args.open_max,
-        closed_min=args.closed_min, closed_max=args.closed_max)
+        event_min=args.event_min, event_max=args.event_max,
+        quiet_prob=args.quiet_prob)
 
     log_path = Path(args.log) if args.log else DEFAULT_LOG_DIR / (
         "disturbance_sidecar_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".jsonl")
@@ -320,10 +315,9 @@ def run(argv: list[str]) -> int:
 
     print(f"==> [disturbance] seed={seed} backend={args.backend} "
           f"valves={','.join(params.valves)} "
-          f"start={args.start_min:.0f}-{args.start_max:.0f}s "
-          f"open={args.open_min:.0f}-{args.open_max:.0f}s "
-          f"closed={args.closed_min:.0f}-{args.closed_max:.0f}s "
-          f"(replay: --seed {seed} + same valves/ranges)", flush=True)
+          f"event={args.event_min:.0f}-{args.event_max:.0f}s "
+          f"quiet={args.quiet_prob:.0%} "
+          f"(replay: --seed {seed} + same valves/event range)", flush=True)
     print(f"==> [disturbance] log: {log_path}", flush=True)
 
     try:
@@ -344,8 +338,9 @@ def run(argv: list[str]) -> int:
         verify_closed(writer, params)
 
         intended = {v: False for v in VALVES}   # non-participants stay closed
-        plan = TelegraphPlan(params)
-        counts = {"transitions": 0, "heartbeats": 0, "write_failures": 0}
+        plan = EventPlan(params)
+        counts = {"events": 0, "faults": 0, "quiets": 0,
+                  "heartbeats": 0, "write_failures": 0}
         failures = 0
 
         def guarded(fn, *a) -> None:
@@ -384,17 +379,27 @@ def run(argv: list[str]) -> int:
                 rel = time.monotonic() - t0
                 if args.duration is not None and rel >= args.duration:
                     break
-                for tr in plan.poll(rel):
-                    guarded(writer.write_valve, tr.valve, tr.opened)
-                    intended[tr.valve] = tr.opened
-                    counts["transitions"] += 1
-                    state = "OPEN" if tr.opened else "CLOSED"
-                    rec({"type": "event", "t": round(tr.t, 3),
-                         "epoch": t0_epoch + tr.t, "valve": tr.valve,
-                         "state": state.lower(), "next_hold_s": round(tr.next_hold, 3)})
-                    print(f"[disturbance] t=+{tr.t:.2f}s "
-                          f"{tr.valve.replace('sv_', 'SV-').upper()} {state} "
-                          f"(hold {tr.next_hold:.2f}s)", flush=True)
+                for ev in plan.poll(rel):
+                    counts["events"] += 1
+                    # atomic clear+set: one write per valve to its target — a
+                    # fault continuing into the next event never sees a close pulse
+                    for v in VALVES:
+                        intended[v] = (ev.valve == v)
+                    for v in VALVES:
+                        guarded(writer.write_valve, v, intended[v])
+                    if ev.valve:
+                        counts["faults"] += 1
+                        what = (ev.valve.replace("sv_", "SV-").upper()
+                                + " OPEN (fault until next event)")
+                    else:
+                        counts["quiets"] += 1
+                        what = "quiet — all SVs closed"
+                    rec({"type": "event", "t": round(ev.t, 3),
+                         "epoch": t0_epoch + ev.t, "valve": ev.valve,
+                         "state": "open" if ev.valve else "quiet",
+                         "next_in_s": round(ev.next_in, 3)})
+                    print(f"[disturbance] t=+{ev.t:.2f}s EVENT {what} "
+                          f"(next in {ev.next_in:.1f}s)", flush=True)
                 if rel >= next_hb:      # idempotent re-assert (survives env.reset)
                     for v, opened in intended.items():
                         guarded(writer.write_valve, v, opened)
