@@ -77,7 +77,8 @@ heater (E-101) in Tank1 only — Tank2/Tank3 warm via downstream hot-water advec
 > **Simulation status:** `mock_cabinet.py` models the heated serial-cascade rig
 > from the approved electrical BOM (the BOM document itself is kept offline —
 > not committed to the repo).
-> Tank geometry (37.24 L, 0.0784 m²), pump flow (4 m³/h, quadratic pump curve),
+> Tank geometry (45 L nominal, 0.09 m²; 42.75 L at the 0.475 m fill height), pump
+> flow (4 m³/h, quadratic pump curve),
 > heat-loss (4.0 W/K estimate), gravity_drop (0.3 m), and safety trips are set.
 > Valve Cv is an interim estimate pending datasheets. Physics equations are
 > aligned with the AIO-Gym v0.2 three_tank model (orifice valve flow, pump

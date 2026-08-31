@@ -582,7 +582,7 @@
     "q_max_m3s": 0.00111,
     "h_max_m": 0.475,
     "t_supply_c": 25.0,
-    "a_tank_m2": 0.0784,
+    "a_tank_m2": 0.09,
     "vfd_max_hz": 50.0,
     "c_v12": 0.00143,
     "c_v23": 0.00143,
@@ -600,7 +600,7 @@
       "c_sv",
       "ua_w_per_k"
     ],
-    "_placeholder_note": "c_v* (valve Cv), c_sv (on/off solenoid Cv — full-port, same line size as the modulating valves) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.0784 (300x300mm tank, 10mm walls), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
+    "_placeholder_note": "c_v* (valve Cv), c_sv (on/off solenoid Cv — full-port, same line size as the modulating valves) and ua_w_per_k (heat loss) are physics-derived estimates pending bench SAT measurement. The hard numbers are set from the BOM + datasheets: a_tank_m2=0.09 (45 L nominal plan tanks, 0.09 m^2 x 0.5 m), q_max_m3s=0.00111 (4 m^3/h pump), pump curve static_head=1.7m / shutoff_head=10.0m / power=370W, q_heat_max_w=2000 (real 2kW heater), h_max_m=0.475 (tank fill height).",
     "_drift_warning": "The ODEs live in ONE place: controllers/threetank_dynamics.py (dynamics + compute_flows). mock_cabinet.py, controllers/threetank_model.py, and controllers/nmpc_oracle.py all import from it \u2014 edit there and all three follow.",
     "_valve_note": "c_v* scaled 5.6x with the real pump flow (4 m^3/h) to keep the sim balanced; refine with valve datasheet Cv.",
     "reservoir_base_m2": 0.3,
